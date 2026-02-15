@@ -883,32 +883,36 @@ plt.show()
 
 # %%
 # === Save checkpoint to HuggingFace Hub ===
-import pickle
+save_checkpoint = False  # @param {type:"boolean"}
 
-CHECKPOINT_DIR = '/content/checkpoint'
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+if save_checkpoint:
+    import pickle
+    import json
 
-# Save params as pickle (simple, works for raw JAX arrays)
-# Convert to numpy for serialization
-params_np = jax.tree.map(lambda x: np.array(x) if isinstance(x, jax.Array) else x,
-                          params)
-with open(os.path.join(CHECKPOINT_DIR, 'params.pkl'), 'wb') as f:
-    pickle.dump(params_np, f)
-print(f'Saved params to {CHECKPOINT_DIR}/params.pkl')
+    CHECKPOINT_DIR = '/content/checkpoint'
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# Save config
-import json
-config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith('_')}
-with open(os.path.join(CHECKPOINT_DIR, 'config.json'), 'w') as f:
-    json.dump(config_dict, f, indent=2, default=str)
+    # Save params as pickle (convert JAX arrays to numpy)
+    params_np = jax.tree.map(lambda x: np.array(x) if isinstance(x, jax.Array) else x,
+                              params)
+    with open(os.path.join(CHECKPOINT_DIR, 'params.pkl'), 'wb') as f:
+        pickle.dump(params_np, f)
+    print(f'Saved params to {CHECKPOINT_DIR}/params.pkl')
 
-# Upload to HF Hub
-api = HfApi()
-api.create_repo(config.hf_repo_id, repo_type='model', exist_ok=True)
-api.upload_folder(
-    folder_path=CHECKPOINT_DIR,
-    repo_id=config.hf_repo_id,
-    path_in_repo=f'checkpoint_d{config.depth}',
-    commit_message=f'Upload checkpoint (depth={config.depth}, {num_iterations} steps)',
-)
-print(f'\nUploaded to https://huggingface.co/{config.hf_repo_id}/tree/main/checkpoint_d{config.depth}')
+    # Save config
+    config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith('_')}
+    with open(os.path.join(CHECKPOINT_DIR, 'config.json'), 'w') as f:
+        json.dump(config_dict, f, indent=2, default=str)
+
+    # Upload to HF Hub
+    api = HfApi()
+    api.create_repo(config.hf_repo_id, repo_type='model', exist_ok=True)
+    api.upload_folder(
+        folder_path=CHECKPOINT_DIR,
+        repo_id=config.hf_repo_id,
+        path_in_repo=f'checkpoint_d{config.depth}',
+        commit_message=f'Upload checkpoint (depth={config.depth}, {num_iterations} steps)',
+    )
+    print(f'\nUploaded to https://huggingface.co/{config.hf_repo_id}/tree/main/checkpoint_d{config.depth}')
+else:
+    print('Skipping checkpoint save. Set save_checkpoint=True to upload.')
