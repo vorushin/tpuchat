@@ -578,10 +578,8 @@ def compute_grads(config: Config, params: dot_dict,
 
     def loss_fn(trainable_params):
         full_params = merge_params(trainable_params, static)
-        logits = model_apply(config, full_params, x)
-        loss = jnp.mean(
-            jax.vmap(jax.vmap(lambda logit, target: -jax.nn.log_softmax(logit)[target]))(logits, y)
-        )
+        # Fused cross entropy loss (more efficient on TPU than manual log_softmax + indexing)
+        loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(trainable)
@@ -784,9 +782,7 @@ for step in range(num_iterations + 1):
             def val_loss_fn(tp):
                 full_p = merge_params(tp, static)
                 logits = model_apply(config, full_p, vx)
-                return jnp.mean(
-                    jax.vmap(jax.vmap(lambda l, t: -jax.nn.log_softmax(l)[t]))(logits, vy)
-                )
+                return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, vy))
             vl = val_loss_fn(trainable)
             val_losses.append(float(vl))
         avg_val_loss = sum(val_losses) / len(val_losses)
