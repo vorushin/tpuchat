@@ -50,9 +50,9 @@ class Config:
     num_shards: int = 50
     hf_repo_id: str = 'vorushin/tpuchat'
 
-    # Model architecture
-    depth: int = 12
-    aspect_ratio: int = 85
+    # Model architecture — n_head is the primary scaling knob
+    n_head: int = 8
+    aspect_ratio: int = 64
     head_dim: int = 128
     vocab_size: int = 32768
     seq_len: int = 2048
@@ -86,15 +86,14 @@ class Config:
     # Seed
     param_seed: int = 42
 
-    # Derived (computed in __post_init__)
+    # Derived
     @property
     def n_embd(self):
-        base_dim = self.depth * self.aspect_ratio
-        return ((base_dim + self.head_dim - 1) // self.head_dim) * self.head_dim
+        return self.n_head * self.head_dim
 
     @property
-    def n_head(self):
-        return self.n_embd // self.head_dim
+    def depth(self):
+        return self.n_embd // self.aspect_ratio
 
     @property
     def n_kv_head(self):
@@ -755,15 +754,6 @@ class PrefetchDataLoader:
         self.stop_event.set()
 
 
-# %%
-# === View Profiling Results ===
-# Run this cell to load TensorBoard and view the trace captured in steps 15-20.
-# Reload this cell after training to see updated profiles.
-# - If you see large gaps between "Device Execution", you are INPUT BOUND.
-# - If "Device Execution" blocks are packed tightly, you are COMPUTE BOUND (good!).
-
-%load_ext tensorboard
-%tensorboard --logdir log_dir
 
 # %%
 # === Training loop ===
@@ -870,6 +860,15 @@ for step in range(num_iterations + 1):
 
 print(f'\nTraining complete. Total time: {total_training_time/60:.1f}m')
 print(f'Best val loss: {best_val_loss:.4f}')
+
+# %%
+# === View Profiling Results ===
+# Run this cell to load TensorBoard and view the trace captured in steps 15-20.
+# - If you see large gaps between "Device Execution", you are INPUT BOUND.
+# - If "Device Execution" blocks are packed tightly, you are COMPUTE BOUND (good!).
+
+%load_ext tensorboard
+%tensorboard --logdir log_dir
 
 # %%
 # === Plot training curves ===
