@@ -41,6 +41,8 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+import tiktoken
 
 @jax.tree_util.register_static
 @dataclass(kw_only=True, frozen=True)
