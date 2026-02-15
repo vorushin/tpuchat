@@ -658,6 +658,7 @@ def generate(config, params, enc, prompt, max_new_tokens=100,
         
         # We need the logits at the last valid token position
         logits = predict_step(config, params, x)
+        logits.block_until_ready()  # Wait for computation (fix for Colab debugger exception)
         next_logits = logits[0, len(context) - 1, :]  # (vocab_size,)
         next_logits = next_logits.astype(jnp.float32)
 
