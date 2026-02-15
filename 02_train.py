@@ -580,6 +580,7 @@ def compute_grads(config: Config, params: dot_dict,
 
     def loss_fn(trainable_params):
         full_params = merge_params(trainable_params, static)
+        logits = model_apply(config, full_params, x)
         # Fused cross entropy loss (more efficient on TPU than manual log_softmax + indexing)
         loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
         return loss
