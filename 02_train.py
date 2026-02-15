@@ -56,7 +56,7 @@ class Config:
     softcap: float = 15.0
 
     # Training
-    num_iterations: int = -1  # -1 = auto from target_param_data_ratio
+    num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
     target_param_data_ratio: float = 10.5
     device_batch_size: int = 8
     total_batch_size: int = -1  # -1 = auto
@@ -73,11 +73,11 @@ class Config:
     final_lr_frac: float = 0.0
 
     # Eval / Logging
-    eval_every: int = 250
+    eval_every: int = 100
     eval_steps: int = 10
     log_every: int = 10
     save_every: int = -1  # -1 = only at end
-    sample_every: int = 500
+    sample_every: int = 250
 
     # Seed
     param_seed: int = 42
@@ -476,26 +476,24 @@ def init_adam_state(param: jax.Array) -> dot_dict:
     )
 
 
-def adamw_update(config: Config, lr_mult: float, param: jax.Array,
-                 grad: jax.Array, state: dot_dict) -> jax.Array:
-    """AdamW update step. Returns updated param."""
-    state.count = state.count + 1
-    state.mu = config.beta1 * state.mu + (1 - config.beta1) * grad
-    state.nu = config.beta2 * state.nu + (1 - config.beta2) * grad ** 2
+def adamw_step(config, lr_mult, param, grad, state):
+    """AdamW update. Returns (new_param, new_state)."""
+    new_count = state.count + 1
+    new_mu = config.beta1 * state.mu + (1 - config.beta1) * grad
+    new_nu = config.beta2 * state.nu + (1 - config.beta2) * grad ** 2
 
-    mu_hat = state.mu / (1 - config.beta1 ** state.count)
-    nu_hat = state.nu / (1 - config.beta2 ** state.count)
+    mu_hat = new_mu / (1 - config.beta1 ** new_count)
+    nu_hat = new_nu / (1 - config.beta2 ** new_count)
 
     lr = config.learning_rate * lr_mult
     update = mu_hat / (jnp.sqrt(nu_hat) + config.eps)
 
-    # Weight decay (applied to param directly, not through gradient)
-    # Don't apply to 1D params (biases, scalars, embeddings per convention)
-    if param.ndim >= 2:
-        param = param - lr * config.weight_decay * param
+    # Weight decay for 2D+ params
+    wd = jnp.where(param.ndim >= 2, config.weight_decay, 0.0)
+    new_param = param - lr * (update + wd * param)
 
-    param = param - lr * update
-    return param
+    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
+    return new_param, new_state
 
 
 def get_lr_multiplier(step, num_iterations, config: Config):
@@ -574,56 +572,6 @@ def merge_params(trainable, static):
 @jax.jit
 def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
                x: jax.Array, y: jax.Array, lr_mult: jax.Array):
-    """Single training step: forward, loss, backward, update."""
-    trainable, static = split_trainable(params)
-
-    def loss_fn(trainable_params):
-        full_params = merge_params(trainable_params, static)
-        logits = model_apply(config, full_params, x)
-        # Cross-entropy loss
-        loss = jnp.mean(
-            jax.vmap(jax.vmap(lambda logit, target: -jax.nn.log_softmax(logit)[target]))(logits, y)
-        )
-        return loss
-
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
-
-    # Update each parameter with AdamW
-    def update_fn(param, grad, state):
-        return adamw_update(config, lr_mult, param, grad, state)
-
-    new_trainable = jax.tree.map(update_fn, trainable, grads, opt_state)
-    new_opt_state = opt_state  # state is updated in-place within adamw_update... wait, JAX is functional
-
-    # Actually we need to handle this differently in pure JAX
-    # Let's restructure: adamw returns (new_param, new_state)
-    return loss, merge_params(new_trainable, static), opt_state
-
-
-# Re-define adamw to return both new param and new state
-def adamw_step(config, lr_mult, param, grad, state):
-    """AdamW update. Returns (new_param, new_state)."""
-    new_count = state.count + 1
-    new_mu = config.beta1 * state.mu + (1 - config.beta1) * grad
-    new_nu = config.beta2 * state.nu + (1 - config.beta2) * grad ** 2
-
-    mu_hat = new_mu / (1 - config.beta1 ** new_count)
-    nu_hat = new_nu / (1 - config.beta2 ** new_count)
-
-    lr = config.learning_rate * lr_mult
-    update = mu_hat / (jnp.sqrt(nu_hat) + config.eps)
-
-    # Weight decay for 2D+ params
-    wd = jnp.where(param.ndim >= 2, config.weight_decay, 0.0)
-    new_param = param - lr * (update + wd * param)
-
-    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
-    return new_param, new_state
-
-
-@jax.jit
-def train_step_v2(config: Config, params: dot_dict, opt_state: dot_dict,
-                  x: jax.Array, y: jax.Array, lr_mult: jax.Array):
     """Single training step with proper functional updates."""
     trainable, static = split_trainable(params)
 
@@ -660,6 +608,10 @@ print(f'Trainable param arrays: {len(jax.tree.leaves(trainable_params))}')
 train_loader = tokenize_shards(train_shard_indices, config.device_batch_size, config.seq_len)
 val_loader_fn = lambda: tokenize_shards(val_shard_indices, config.device_batch_size, config.seq_len)
 
+# History for plotting
+train_loss_history = []  # (step, smoothed_loss)
+val_loss_history = []    # (step, val_loss)
+
 smooth_loss = 0.0
 total_training_time = 0.0
 best_val_loss = float('inf')
@@ -688,6 +640,7 @@ for step in range(num_iterations + 1):
         avg_val_loss = sum(val_losses) / len(val_losses)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+        val_loss_history.append((step, avg_val_loss))
         print(f'Step {step:05d} | Val loss: {avg_val_loss:.4f} (best: {best_val_loss:.4f})')
 
     # === Sample ===
@@ -714,7 +667,7 @@ for step in range(num_iterations + 1):
     lr_mult = jnp.array(get_lr_multiplier(step, num_iterations, config), dtype=jnp.float32)
 
     t0 = time.time()
-    loss, params, opt_state = train_step_v2(config, params, opt_state, x_batch, y_batch, lr_mult)
+    loss, params, opt_state = train_step(config, params, opt_state, x_batch, y_batch, lr_mult)
     jax.block_until_ready(loss)
     dt = time.time() - t0
 
@@ -725,6 +678,9 @@ for step in range(num_iterations + 1):
     ema_beta = 0.9
     smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_val
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
+
+    # Record every step
+    train_loss_history.append((step, debiased_loss))
 
     if step % config.log_every == 0:
         tok_per_sec = int(total_batch_size / dt) if dt > 0 else 0
@@ -740,6 +696,31 @@ for step in range(num_iterations + 1):
 
 print(f'\nTraining complete. Total time: {total_training_time/60:.1f}m')
 print(f'Best val loss: {best_val_loss:.4f}')
+
+# %%
+# === Plot training curves ===
+# Re-run this cell anytime to see the latest curves
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+
+# Train loss
+if train_loss_history:
+    steps, losses = zip(*train_loss_history)
+    ax.plot(steps, losses, label='Train loss (smoothed)', alpha=0.8, linewidth=1)
+
+# Val loss
+if val_loss_history:
+    steps, losses = zip(*val_loss_history)
+    ax.plot(steps, losses, 'ro-', label='Val loss', markersize=5)
+
+ax.set_xlabel('Step')
+ax.set_ylabel('Loss')
+ax.set_title(f'Training curves — depth={config.depth}, batch={total_batch_size:,} tok/step')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
 
 # %%
 # === Save checkpoint to HuggingFace Hub ===
