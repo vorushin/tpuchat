@@ -52,7 +52,7 @@ class Config:
 
     # Model architecture
     depth: int = 12
-    aspect_ratio: int = 64
+    aspect_ratio: int = 85
     head_dim: int = 128
     vocab_size: int = 32768
     seq_len: int = 2048

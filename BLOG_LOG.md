@@ -25,3 +25,21 @@ Roman: Switched from free TPU v5e-1 to Colab Pro+ TPU v6e (32GB HBM). batch_size
 Agent: Holistic cleanup of 02_train.py (-125 lines). Removed gradient accumulation, consolidated compute_grads + apply_optimizer + train_step_accum into a single @jax.jit train_step. Fixed several bugs: undefined avg_loss variable, missing import optax, accidentally deleted train_step function. Moved TensorBoard cell above training loop for easy profile reload. device_batch_size=8, total_batch_size=16384 tokens/step.
 
 Roman: v6e1, random data
+step 00010/01000 (1.0%) | loss: 10.0966 | lr_mult: 0.550 | dt: 153ms | tok/s: 107,322
+Profiling started...
+Profiling stopped. Trace saved to 'log_dir'.
+step 00020/01000 (2.0%) | loss: 9.1600 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,406 | eta: 2.5m
+step 00030/01000 (3.0%) | loss: 7.6790 | lr_mult: 1.000 | dt: 152ms | tok/s: 107,783 | eta: 2.5m
+step 00040/01000 (4.0%) | loss: 6.0094 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,235 | eta: 2.4m
+step 00050/01000 (5.0%) | loss: 4.3529 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,039 | eta: 2.4m
+
+real data:
+step 00020/01000 (2.0%) | loss: 9.4643 | lr_mult: 1.000 | dt: 152ms | tok/s: 107,623 | eta: 2.5m
+step 00030/01000 (3.0%) | loss: 8.4961 | lr_mult: 1.000 | dt: 153ms | tok/s: 106,876 | eta: 2.5m
+step 00040/01000 (4.0%) | loss: 8.0154 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,076 | eta: 2.4m
+step 00050/01000 (5.0%) | loss: 7.8481 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,004 | eta: 2.4m
+step 00060/01000 (6.0%) | loss: 7.7605 | lr_mult: 1.000 | dt: 153ms | tok/s: 106,966 | eta: 2.4m
+step 00070/01000 (7.0%) | loss: 7.7359 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,054 | eta: 2.4m
+step 00080/01000 (8.0%) | loss: 7.7449 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,271 | eta: 2.3m
+
+The data loading is clearly not a bottleneck.
