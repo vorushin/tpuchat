@@ -374,9 +374,10 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     sin = params.rope_sin[:T][None, :, None, :]
 
     # Token embedding + norm
-    x = params.wte[tokens]  # (B, T, n_embd)
-    x = rms_norm(x)
-    x0 = x  # save for x0 residual connection
+    with jax.named_scope('embedding'):
+        x = params.wte[tokens]  # (B, T, n_embd)
+        x = rms_norm(x)
+        x0 = x  # save for x0 residual connection
 
     for i in range(n_layer):
         layer = params.layers[i]
@@ -384,77 +385,76 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
         # Pre-norm
         h = rms_norm(x)
 
-        # === Attention ===
-        q = jnp.einsum('btd,dh->bth', h, layer.c_q)  # (B, T, n_head*head_dim)
-        k = jnp.einsum('btd,dh->bth', h, layer.c_k)  # (B, T, n_kv*head_dim)
-        v = jnp.einsum('btd,dh->bth', h, layer.c_v)
+        with jax.named_scope(f'layer_{i}/attention'):
+            # === Attention ===
+            q = jnp.einsum('btd,dh->bth', h, layer.c_q)  # (B, T, n_head*head_dim)
+            k = jnp.einsum('btd,dh->bth', h, layer.c_k)  # (B, T, n_kv*head_dim)
+            v = jnp.einsum('btd,dh->bth', h, layer.c_v)
 
-        # Reshape to (B, T, H, D)
-        q = q.reshape(B, T, n_head, head_dim)
-        k = k.reshape(B, T, n_kv_head, head_dim)
-        v = v.reshape(B, T, n_kv_head, head_dim)
+            # Reshape to (B, T, H, D)
+            q = q.reshape(B, T, n_head, head_dim)
+            k = k.reshape(B, T, n_kv_head, head_dim)
+            v = v.reshape(B, T, n_kv_head, head_dim)
 
-        # Value embedding (ResFormer-style)
-        if has_ve(i, n_layer):
-            ve = layer.ve_embed[tokens]  # (B, T, kv_dim)
-            ve = ve.reshape(B, T, n_kv_head, head_dim)
-            # Gate: input-dependent, per head
-            gate = 2.0 * jax.nn.sigmoid(jnp.einsum('btd,dh->bth', h[:, :, :32], layer.ve_gate))
-            v = v + gate[:, :, :, None] * ve
+            # Value embedding (ResFormer-style)
+            if has_ve(i, n_layer):
+                ve = layer.ve_embed[tokens]  # (B, T, kv_dim)
+                ve = ve.reshape(B, T, n_kv_head, head_dim)
+                # Gate: input-dependent, per head
+                gate = 2.0 * jax.nn.sigmoid(jnp.einsum('btd,dh->bth', h[:, :, :32], layer.ve_gate))
+                v = v + gate[:, :, :, None] * ve
 
-        # Apply RoPE
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+            # Apply RoPE
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
 
-        # QK-norm
-        q = rms_norm(q)
-        k = rms_norm(k)
+            # QK-norm
+            q = rms_norm(q)
+            k = rms_norm(k)
 
-        # Attention via jax.nn.dot_product_attention
-        # JAX expects (B, T, H, D) — no transpose needed
+            # GQA: repeat k,v heads if needed
+            if n_kv_head < n_head:
+                repeats = n_head // n_kv_head
+                k = jnp.repeat(k, repeats, axis=2)
+                v = jnp.repeat(v, repeats, axis=2)
 
-        # GQA: repeat k,v heads if needed
-        if n_kv_head < n_head:
-            repeats = n_head // n_kv_head
-            k = jnp.repeat(k, repeats, axis=2)
-            v = jnp.repeat(v, repeats, axis=2)
+            # Sliding window: create mask if window < seq_len
+            w = window_sizes[i]
+            if w < T:
+                rows = jnp.arange(T)[:, None]
+                cols = jnp.arange(T)[None, :]
+                mask = (cols <= rows) & (cols >= rows - w + 1)
+                attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
+            else:
+                attn_out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
-        # Sliding window: create mask if window < seq_len
-        w = window_sizes[i]
-        if w < T:
-            # Create sliding window causal mask: (T, T)
-            rows = jnp.arange(T)[:, None]
-            cols = jnp.arange(T)[None, :]
-            mask = (cols <= rows) & (cols >= rows - w + 1)
-            attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
-        else:
-            attn_out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+            # Already (B, T, H, D), reshape to (B, T, n_head*head_dim)
+            attn_out = attn_out.reshape(B, T, -1)
 
-        # Already (B, T, H, D), reshape to (B, T, n_head*head_dim)
-        attn_out = attn_out.reshape(B, T, -1)
-
-        # Output projection
-        attn_out = jnp.einsum('btd,de->bte', attn_out, layer.c_proj)
+            # Output projection
+            attn_out = jnp.einsum('btd,de->bte', attn_out, layer.c_proj)
 
         # Residual with per-layer scaling
         x = params.resid_lambdas[i] * x + params.x0_lambdas[i] * x0
         x = x + attn_out
 
-        # === MLP ===
-        h2 = rms_norm(x)
-        mlp_out = jnp.einsum('btd,dh->bth', h2, layer.c_fc)
-        mlp_out = jax.nn.relu(mlp_out) ** 2  # ReLU^2
-        mlp_out = jnp.einsum('bth,hd->btd', mlp_out, layer.mlp_proj)
+        with jax.named_scope(f'layer_{i}/mlp'):
+            # === MLP ===
+            h2 = rms_norm(x)
+            mlp_out = jnp.einsum('btd,dh->bth', h2, layer.c_fc)
+            mlp_out = jax.nn.relu(mlp_out) ** 2  # ReLU^2
+            mlp_out = jnp.einsum('bth,hd->btd', mlp_out, layer.mlp_proj)
         x = x + mlp_out
 
     # Final norm + lm_head
-    x = rms_norm(x)
-    logits = jnp.einsum('btd,dv->btv', x, params.lm_head)
-    logits = logits[:, :, :config.vocab_size]  # remove padding
+    with jax.named_scope('lm_head'):
+        x = rms_norm(x)
+        logits = jnp.einsum('btd,dv->btv', x, params.lm_head)
+        logits = logits[:, :, :config.vocab_size]  # remove padding
 
-    # Logit softcap
-    logits = logits.astype(jnp.float32)
-    logits = config.softcap * jnp.tanh(logits / config.softcap)
+        # Logit softcap
+        logits = logits.astype(jnp.float32)
+        logits = config.softcap * jnp.tanh(logits / config.softcap)
 
     return logits
 
@@ -582,23 +582,25 @@ def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
         loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
         return loss
 
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    with jax.named_scope('forward_backward'):
+        loss, grads = jax.value_and_grad(loss_fn)(trainable)
 
     # Apply AdamW update
-    is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
-    t_leaves, t_treedef = jax.tree.flatten(trainable)
-    g_leaves, _ = jax.tree.flatten(grads)
-    o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
+    with jax.named_scope('optimizer'):
+        is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
+        t_leaves, t_treedef = jax.tree.flatten(trainable)
+        g_leaves, _ = jax.tree.flatten(grads)
+        o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
 
-    new_t_leaves, new_o_leaves = [], []
-    for p, g, s in zip(t_leaves, g_leaves, o_leaves):
-        new_p, new_s = adamw_step(config, lr_mult, p, g, s)
-        new_t_leaves.append(new_p)
-        new_o_leaves.append(new_s)
+        new_t_leaves, new_o_leaves = [], []
+        for p, g, s in zip(t_leaves, g_leaves, o_leaves):
+            new_p, new_s = adamw_step(config, lr_mult, p, g, s)
+            new_t_leaves.append(new_p)
+            new_o_leaves.append(new_s)
 
-    new_trainable = t_treedef.unflatten(new_t_leaves)
-    new_opt_state = o_treedef.unflatten(new_o_leaves)
-    new_params = merge_params(new_trainable, static)
+        new_trainable = t_treedef.unflatten(new_t_leaves)
+        new_opt_state = o_treedef.unflatten(new_o_leaves)
+        new_params = merge_params(new_trainable, static)
 
     return loss, new_params, new_opt_state
 
@@ -759,10 +761,23 @@ class PrefetchDataLoader:
 
 # %%
 # === Training loop ===
+use_random_data = False  # @param {type:"boolean"}
 
 raw_train_loader = tokenize_shards(train_shard_indices, config.device_batch_size, config.seq_len)
 train_loader = PrefetchDataLoader(raw_train_loader, capacity=4)
 val_loader_fn = lambda: tokenize_shards(val_shard_indices, config.device_batch_size, config.seq_len)
+
+# Pre-generate random data on HBM for profiling (excludes data loading time)
+if use_random_data:
+    rng_data = jax.random.key(0)
+    random_x = jax.random.randint(rng_data, (config.device_batch_size, config.seq_len),
+                                   0, config.vocab_size, dtype=jnp.int32)
+    random_y = jax.random.randint(rng_data, (config.device_batch_size, config.seq_len),
+                                   0, config.vocab_size, dtype=jnp.int32)
+    # Force to device
+    random_x.block_until_ready()
+    random_y.block_until_ready()
+    print(f'Using random data on HBM: x={random_x.shape}, y={random_y.shape}')
 
 # History for plotting
 train_loss_history = []  # (step, smoothed_loss)
@@ -820,9 +835,12 @@ for step in range(num_iterations + 1):
     lr_mult = jnp.array(get_lr_multiplier(step, num_iterations, config), dtype=jnp.float32)
     t0 = time.time()
 
-    x_batch, y_batch = next(train_loader)
-    x_batch = jnp.array(x_batch)
-    y_batch = jnp.array(y_batch)
+    if use_random_data:
+        x_batch, y_batch = random_x, random_y
+    else:
+        x_batch, y_batch = next(train_loader)
+        x_batch = jnp.array(x_batch)
+        y_batch = jnp.array(y_batch)
 
     loss, params, opt_state = train_step(config, params, opt_state, x_batch, y_batch, lr_mult)
     loss.block_until_ready()
