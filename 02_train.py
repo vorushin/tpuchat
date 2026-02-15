@@ -58,8 +58,9 @@ class Config:
     # Training
     num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
     target_param_data_ratio: float = 10.5
-    device_batch_size: int = 8
-    total_batch_size: int = -1  # -1 = auto
+    device_batch_size: int = 2
+    grad_accum_steps: int = 8  # accumulate grads over N micro-batches
+    total_batch_size: int = -1  # -1 = auto (device_batch_size * grad_accum_steps * seq_len)
     max_chars_per_doc: int = 10_000
 
     # Optimizer (AdamW)
@@ -524,11 +525,12 @@ def count_matrix_params(params):
 scaling_params = count_matrix_params(params)
 target_tokens = int(config.target_param_data_ratio * scaling_params)
 
-# Batch size
+# Batch size (accounts for gradient accumulation)
 total_batch_size = config.total_batch_size
 if total_batch_size == -1:
-    total_batch_size = config.device_batch_size * config.seq_len
-    print(f'Total batch size: {total_batch_size:,} tokens/step')
+    total_batch_size = config.device_batch_size * config.grad_accum_steps * config.seq_len
+    print(f'Total batch size: {total_batch_size:,} tokens/step '
+          f'({config.device_batch_size}×{config.grad_accum_steps}×{config.seq_len})')
 
 # Number of iterations
 if config.num_iterations > 0:
@@ -566,9 +568,9 @@ def merge_params(trainable, static):
 
 
 @jax.jit
-def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
-               x: jax.Array, y: jax.Array, lr_mult: jax.Array):
-    """Single training step with proper functional updates."""
+def compute_grads(config: Config, params: dot_dict,
+                 x: jax.Array, y: jax.Array):
+    """Forward + backward only. Returns loss and grads."""
     trainable, static = split_trainable(params)
 
     def loss_fn(trainable_params):
@@ -580,10 +582,14 @@ def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    return loss, grads
 
-    # Flatten trees to apply optimizer per-leaf
-    # (can't use jax.tree.map because adamw_step returns a tuple,
-    #  and tuples are pytree nodes that JAX would try to traverse)
+
+def apply_optimizer(config: Config, params: dot_dict, opt_state: dot_dict,
+                    grads: dot_dict, lr_mult: jax.Array):
+    """Apply AdamW update given accumulated gradients."""
+    trainable, static = split_trainable(params)
+
     is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
     t_leaves, t_treedef = jax.tree.flatten(trainable)
     g_leaves, _ = jax.tree.flatten(grads)
@@ -598,7 +604,7 @@ def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
     new_trainable = t_treedef.unflatten(new_t_leaves)
     new_opt_state = o_treedef.unflatten(new_o_leaves)
 
-    return loss, merge_params(new_trainable, static), new_opt_state
+    return merge_params(new_trainable, static), new_opt_state
 
 
 # Initialize optimizer state (only for trainable params)
@@ -666,21 +672,38 @@ for step in range(num_iterations + 1):
     if last_step:
         break
 
-    # === Train step ===
-    x_np, y_np = next(train_loader)
-    x_batch = jnp.array(x_np)
-    y_batch = jnp.array(y_np)
+    # === Train step (with gradient accumulation) ===
     lr_mult = jnp.array(get_lr_multiplier(step, num_iterations, config), dtype=jnp.float32)
+    accum_loss = 0.0
 
     t0 = time.time()
-    loss, params, opt_state = train_step(config, params, opt_state, x_batch, y_batch, lr_mult)
-    jax.block_until_ready(loss)
+    accum_grads = None
+    for micro_step in range(config.grad_accum_steps):
+        x_np, y_np = next(train_loader)
+        x_batch = jnp.array(x_np)
+        y_batch = jnp.array(y_np)
+
+        micro_loss, micro_grads = compute_grads(config, params, x_batch, y_batch)
+        accum_loss += float(micro_loss)
+
+        if accum_grads is None:
+            accum_grads = micro_grads
+        else:
+            accum_grads = jax.tree.map(lambda a, b: a + b, accum_grads, micro_grads)
+
+    # Average the accumulated gradients
+    accum_grads = jax.tree.map(lambda g: g / config.grad_accum_steps, accum_grads)
+    avg_loss = accum_loss / config.grad_accum_steps
+
+    # Apply optimizer
+    params, opt_state = apply_optimizer(config, params, opt_state, accum_grads, lr_mult)
+    jax.block_until_ready(jax.tree.leaves(params)[0])
     dt = time.time() - t0
 
     if step > 10:
         total_training_time += dt
 
-    loss_val = float(loss)
+    loss_val = avg_loss
     ema_beta = 0.9
     smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_val
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
