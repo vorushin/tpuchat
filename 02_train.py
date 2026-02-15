@@ -613,16 +613,52 @@ def apply_optimizer(config: Config, params: dot_dict, opt_state: dot_dict,
 
 
 @jax.jit
-def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
-               x: jax.Array, y: jax.Array, lr_mult: jax.Array):
-    """Single training step with proper functional updates."""
-    # Compute gradients (no JIT here since train_step is JIT)
-    loss, grads = compute_grads(config, params, x, y)
+def train_step_accum(config: Config, params: dot_dict, opt_state: dot_dict,
+                     x_batch: jax.Array, y_batch: jax.Array, lr_mult: jax.Array):
+    """
+    Perform gradient accumulation and optimizer update in a single JIT-compiled step.
+    x_batch: (accum_steps, batch_size, seq_len)
+    y_batch: (accum_steps, batch_size, seq_len)
+    """
+    # 1. Accumulate gradients loop
+    def accum_step(carry, i):
+        curr_loss, curr_grads = carry
+        x_micro = x_batch[i]
+        y_micro = y_batch[i]
+        loss, grads = compute_grads(config, params, x_micro, y_micro)
+        
+        # Accumulate: loss + curr, grads + curr
+        new_loss = curr_loss + loss
+        new_grads = jax.tree.map(lambda a, b: a + b, curr_grads, grads)
+        return (new_loss, new_grads), None
+
+    # Initialize accumulation
+    # We need a dummy 'zero' gradient structure. We can get it by tracing once or using a helper?
+    # Easier: Compute first step, then loop for the rest.
+    loss_0, grads_0 = compute_grads(config, params, x_batch[0], y_batch[0])
     
-    # Apply optimizer update (functional)
-    new_params, new_opt_state = apply_optimizer(config, params, opt_state, grads, lr_mult)
+    # Loop over remaining steps (1 to accum_steps-1)
+    # Using python loop is fine since this is JIT-compiled and unrolled (small loop count)
+    # But for JAX dynamic shapes, lax.scan or fori_loop is better. 
+    # Since accum_steps=4 is small and static, Python loop unrolling is perfect.
     
-    return loss, new_params, new_opt_state
+    accum_loss = loss_0
+    accum_grads = grads_0
+    
+    # Simple Python unroll for fixed accum_steps
+    for i in range(1, x_batch.shape[0]):
+        l, g = compute_grads(config, params, x_batch[i], y_batch[i])
+        accum_loss += l
+        accum_grads = jax.tree.map(lambda a, b: a + b, accum_grads, g)
+        
+    # Average
+    avg_loss = accum_loss / x_batch.shape[0]
+    avg_grads = jax.tree.map(lambda g: g / x_batch.shape[0], accum_grads)
+    
+    # 2. Apply optimizer
+    new_params, new_opt_state = apply_optimizer(config, params, opt_state, avg_grads, lr_mult)
+    
+    return avg_loss, new_params, new_opt_state
 
 
 # Initialize optimizer state (only for trainable params)
@@ -829,30 +865,24 @@ for step in range(num_iterations + 1):
 
     # === Train step (with gradient accumulation) ===
     lr_mult = jnp.array(get_lr_multiplier(step, num_iterations, config), dtype=jnp.float32)
-    accum_loss = 0.0
-
     t0 = time.time()
-    accum_grads = None
-    for micro_step in range(config.grad_accum_steps):
-        x_np, y_np = next(train_loader)
-        x_batch = jnp.array(x_np)
-        y_batch = jnp.array(y_np)
 
-        micro_loss, micro_grads = compute_grads(config, params, x_batch, y_batch)
-        accum_loss += float(micro_loss)
+    # Collect batch of micro-batches (accum_steps, B, T) via prefetch loader
+    xs, ys = [], []
+    for _ in range(config.grad_accum_steps):
+        bx, by = next(train_loader)
+        xs.append(bx)
+        ys.append(by)
+    
+    # Stack into (accum_steps, B, T)
+    x_stack = jnp.array(xs)
+    y_stack = jnp.array(ys)
 
-        if accum_grads is None:
-            accum_grads = micro_grads
-        else:
-            accum_grads = jax.tree.map(lambda a, b: a + b, accum_grads, micro_grads)
-
-    # Average the accumulated gradients
-    accum_grads = jax.tree.map(lambda g: g / config.grad_accum_steps, accum_grads)
-    avg_loss = accum_loss / config.grad_accum_steps
-
-    # Apply optimizer
-    params, opt_state = apply_optimizer(config, params, opt_state, accum_grads, lr_mult)
-    jax.block_until_ready(jax.tree.leaves(params)[0])
+    # Single JIT call for full accumulation + update
+    loss, params, opt_state = train_step_accum(config, params, opt_state, x_stack, y_stack, lr_mult)
+    
+    # Ensure sync
+    loss.block_until_ready()
     dt = time.time() - t0
 
     if step > 10:
