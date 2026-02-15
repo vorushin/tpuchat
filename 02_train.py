@@ -24,7 +24,7 @@
 
 # %%
 # Install dependencies (uncomment for Colab)
-# !pip install -q jax[tpu] optax huggingface_hub tiktoken pyarrow requests torch
+# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests torch tensorboard tensorboard-plugin-profile
 
 # %%
 # === Config ===
