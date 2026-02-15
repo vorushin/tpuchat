@@ -617,6 +617,12 @@ print(f'Trainable param arrays: {len(jax.tree.leaves(trainable_params))}')
 # %%
 # === Text generation (temperature + top-k sampling) ===
 
+@jax.jit
+def predict_step(config: Config, params: dot_dict, x: jax.Array):
+    """JIT-compiled single step inference."""
+    return model_apply(config, params, x)
+
+
 def generate(config, params, enc, prompt, max_new_tokens=100,
              temperature=0.8, top_k=200, top_p=0.95, seed=None):
     """Generate text from a prompt using temperature + top-k + top-p sampling.
@@ -645,7 +651,7 @@ def generate(config, params, enc, prompt, max_new_tokens=100,
         context = ids[-config.seq_len:]
         x = jnp.array([context], dtype=jnp.int32)
 
-        logits = model_apply(config, params, x)
+        logits = predict_step(config, params, x)
         next_logits = logits[0, -1, :]  # (vocab_size,)
         next_logits = next_logits.astype(jnp.float32)
 
