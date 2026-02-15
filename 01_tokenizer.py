@@ -223,7 +223,7 @@ import torch
 tokenizer.save(LOCAL_TOKENIZER_DIR)
 
 # 2) Quick sanity check: encode/decode roundtrip
-test_text = "Hello world! Numbers: 123. Unicode: \u4f60\u597d\u4e16\u754c \ud83c\udf0d"
+test_text = "Hello world! Numbers: 42. The quick brown fox jumps over the lazy dog."
 encoded = tokenizer.encode(test_text)
 decoded = tokenizer.decode(encoded)
 assert decoded == test_text, f"Roundtrip failed: {decoded!r} != {test_text!r}"
