@@ -649,10 +649,16 @@ def generate(config, params, enc, prompt, max_new_tokens=100,
     for _ in range(max_new_tokens):
         # Truncate context to max seq_len if needed
         context = ids[-config.seq_len:]
-        x = jnp.array([context], dtype=jnp.int32)
 
+        # Pad context to full seq_len to avoid JIT recompilation
+        # (JIT cache depends on shape, so variable shape = recompile every step)
+        pad_len = config.seq_len - len(context)
+        padded_context = context + [0] * pad_len
+        x = jnp.array([padded_context], dtype=jnp.int32)
+        
+        # We need the logits at the last valid token position
         logits = predict_step(config, params, x)
-        next_logits = logits[0, -1, :]  # (vocab_size,)
+        next_logits = logits[0, len(context) - 1, :]  # (vocab_size,)
         next_logits = next_logits.astype(jnp.float32)
 
         if temperature == 0:
