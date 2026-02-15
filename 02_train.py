@@ -59,7 +59,7 @@ class Config:
     num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
     target_param_data_ratio: float = 10.5
     device_batch_size: int = 2
-    grad_accum_steps: int = 8  # accumulate grads over N micro-batches
+    grad_accum_steps: int = 8 // 2  # accumulate grads over N micro-batches
     total_batch_size: int = -1  # -1 = auto (device_batch_size * grad_accum_steps * seq_len)
     max_chars_per_doc: int = 10_000
 
@@ -761,6 +761,14 @@ for step in range(num_iterations + 1):
 
     if last_step:
         break
+
+    # === Profiling ===
+    if step == 15:
+        jax.profiler.start_trace('log_dir')
+        print("Profiling started...")
+    if step == 20:
+        jax.profiler.stop_trace()
+        print("Profiling stopped. Trace saved to 'log_dir'.")
 
     # === Train step (with gradient accumulation) ===
     lr_mult = jnp.array(get_lr_multiplier(step, num_iterations, config), dtype=jnp.float32)
