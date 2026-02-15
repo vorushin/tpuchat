@@ -8,11 +8,13 @@ I am writing small snippets as I go along the work to BLOG_LOG.md. The agent is 
 
 ## Notebooks
 
-Notebooks are stored as `.py` files in [jupytext percent format](https://jupytext.readthedocs.io/en/latest/formats-scripts.html#the-percent-format). To convert to `.ipynb` for Colab:
+Notebooks are stored as `.py` files in [jupytext percent format](https://jupytext.readthedocs.io/en/latest/formats-scripts.html#the-percent-format) for readable diffs. The corresponding `.ipynb` files are also committed so you can open them directly in Colab from GitHub.
 
+**Workflow:** edit the `.py` file, regenerate `.ipynb`, commit both:
 ```bash
-pip install jupytext
 jupytext --to ipynb 01_tokenizer.py
 ```
 
-- **01_tokenizer.py** — Train a BPE tokenizer (vocab 32768) on FineWeb-Edu data, upload to HuggingFace Hub
+| Notebook | Open in Colab | Description |
+|----------|--------------|-------------|
+| `01_tokenizer.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/01_tokenizer.ipynb) | Train BPE tokenizer (vocab 32768), upload to HuggingFace Hub |
