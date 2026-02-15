@@ -33,6 +33,9 @@ import itertools as it
 import time
 import os
 import math
+import math
+import queue
+import threading
 from dataclasses import dataclass
 
 import jax
@@ -711,9 +714,50 @@ PROMPTS = [
 ]
 
 # %%
+@dataclass
+class PrefetchDataLoader:
+    """Wraps an iterator and prefetches items in a background thread."""
+    iterator: any
+    capacity: int = 2
+
+    def __post_init__(self):
+        self.queue = queue.Queue(maxsize=self.capacity)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            for item in self.iterator:
+                if self.stop_event.is_set():
+                    break
+                # Optional: convert to jax.device_put here to hide transfer latency?
+                # For now just prefetch the numpy arrays.
+                # Actually, JAX is async, so main thread dispatch is fast.
+                # The bottleneck is likely tokenization/disk.
+                self.queue.put(item)
+        except Exception as e:
+            print(f"Prefetch worker error: {e}")
+            self.stop_event.set()
+        finally:
+            self.stop_event.set()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.stop_event.is_set() and self.queue.empty():
+            raise StopIteration
+        return self.queue.get()
+
+    def stop(self):
+        self.stop_event.set()
+
+
 # === Training loop ===
 
-train_loader = tokenize_shards(train_shard_indices, config.device_batch_size, config.seq_len)
+raw_train_loader = tokenize_shards(train_shard_indices, config.device_batch_size, config.seq_len)
+train_loader = PrefetchDataLoader(raw_train_loader, capacity=4)
 val_loader_fn = lambda: tokenize_shards(val_shard_indices, config.device_batch_size, config.seq_len)
 
 # History for plotting
