@@ -43,3 +43,7 @@ step 00070/01000 (7.0%) | loss: 7.7359 | lr_mult: 1.000 | dt: 153ms | tok/s: 107
 step 00080/01000 (8.0%) | loss: 7.7449 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,271 | eta: 2.3m
 
 The data loading is clearly not a bottleneck.
+Agent: Added jax.named_scope XProf annotations throughout model (embedding, layer_N/attention, layer_N/mlp, lm_head) and train_step (forward_backward, optimizer). Added use_random_data checkbox — pre-generates random tensors on HBM to isolate pure compute from data loading in profiles.
+Agent: Performance audit against JAX/TPU checklist. donate_argnums didn't work (split_trainable/merge_params pattern incompatible). Applied two working optimizations: (1) moved jax.device_put into PrefetchDataLoader background thread to overlap host→device transfer with compute, (2) JIT-compiled eval_step replacing per-call closure that retraced every eval.
+Agent: Scaled model — n_head is now the primary scaling knob (was depth). n_head=8 → n_embd=1024, depth=16 (derived as n_embd/aspect_ratio). All tensor dims now 128-aligned for TPU MXU. ~419M params, fits in v6e 32GB HBM.
+Agent: XProf showed attention taking 5x longer than MLP. Root cause: jax.nn.dot_product_attention uses vmap internally. Replaced with direct einsum: scores=einsum('bthd,bshd->bhts'), softmax, attn_out=einsum('bhts,bshd->bthd'). Eliminates vmap dispatch overhead.
