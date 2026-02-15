@@ -18,3 +18,4 @@ jupytext --to ipynb 01_tokenizer.py
 | Notebook | Open in Colab | Description |
 |----------|--------------|-------------|
 | `01_tokenizer.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/01_tokenizer.ipynb) | Train BPE tokenizer (vocab 32768), upload to HuggingFace Hub |
+| `02_train.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/02_train.ipynb) | Pretrain GPT model in raw JAX on single TPU |
