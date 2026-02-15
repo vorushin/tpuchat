@@ -581,12 +581,22 @@ def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
 
     loss, grads = jax.value_and_grad(loss_fn)(trainable)
 
-    # Functional update: returns new params and new opt state
-    step_fn = ft.partial(adamw_step, config, lr_mult)
-    new_trainable, new_opt_state = jax.tree.map(
-        step_fn, trainable, grads, opt_state,
-        is_leaf=lambda x: isinstance(x, dot_dict) and 'mu' in x,
-    )
+    # Flatten trees to apply optimizer per-leaf
+    # (can't use jax.tree.map because adamw_step returns a tuple,
+    #  and tuples are pytree nodes that JAX would try to traverse)
+    is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
+    t_leaves, t_treedef = jax.tree.flatten(trainable)
+    g_leaves, _ = jax.tree.flatten(grads)
+    o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
+
+    new_t_leaves, new_o_leaves = [], []
+    for p, g, s in zip(t_leaves, g_leaves, o_leaves):
+        new_p, new_s = adamw_step(config, lr_mult, p, g, s)
+        new_t_leaves.append(new_p)
+        new_o_leaves.append(new_s)
+
+    new_trainable = t_treedef.unflatten(new_t_leaves)
+    new_opt_state = o_treedef.unflatten(new_o_leaves)
 
     return loss, merge_params(new_trainable, static), new_opt_state
 
