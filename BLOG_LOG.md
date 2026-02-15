@@ -23,3 +23,5 @@ Roman: batch_size=8 doesn't fit into 12G HBM. Thus using gradient accumulaiton.
 Agent: Added JAX profiler (steps 15-20) + TensorBoard to visualize traces. Profile revealed two bottlenecks: (1) input-bound — TPU idle waiting for data, (2) slow scatter-add in backward pass from manual log_softmax+indexing loss. Fixed both: added PrefetchDataLoader (background thread tokenization), replaced manual loss with optax.softmax_cross_entropy_with_integer_labels (fused kernel).
 Roman: Switched from free TPU v5e-1 to Colab Pro+ TPU v6e (32GB HBM). batch_size=8 fits now — no more gradient accumulation needed.
 Agent: Holistic cleanup of 02_train.py (-125 lines). Removed gradient accumulation, consolidated compute_grads + apply_optimizer + train_step_accum into a single @jax.jit train_step. Fixed several bugs: undefined avg_loss variable, missing import optax, accidentally deleted train_step function. Moved TensorBoard cell above training loop for easy profile reload. device_batch_size=8, total_batch_size=16384 tokens/step.
+
+Roman: v6e1, random data

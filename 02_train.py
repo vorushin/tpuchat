@@ -570,7 +570,7 @@ def merge_params(trainable, static):
     return merged
 
 
-@ft.partial(jax.jit, donate_argnums=(1, 2))
+@jax.jit
 def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
                x: jax.Array, y: jax.Array, lr_mult: jax.Array):
     """Single training step: forward, backward, optimizer update."""
