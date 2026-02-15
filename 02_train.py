@@ -572,7 +572,7 @@ def merge_params(trainable, static):
     return merged
 
 
-@jax.jit
+
 def compute_grads(config: Config, params: dot_dict,
                  x: jax.Array, y: jax.Array):
     """Forward + backward only. Returns loss and grads."""
