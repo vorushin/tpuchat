@@ -2,7 +2,7 @@
 
 nanochat folder (not commited) contains the Andrej Karpathy project NanoChat - small GPT-2 model with its own tokenizer, trained on 8*H100 in 3 hours.
 
-I am porting it to train on a TPU v6e-1 available on a Colab Pro+ plan.
+I am porting it to train on a single TPU v6e available on a Colab Pro+ plan.
 
 I am writing small snippets as I go along the work to BLOG_LOG.md. The agent is also welcome to add a few lines of its notes to the log after some significant amount of work is done. Annotate it with "Agent:". I will annotate my lines with "Roman:".
 
@@ -18,4 +18,4 @@ jupytext --to ipynb 01_tokenizer.py
 | Notebook | Open in Colab | Description |
 |----------|--------------|-------------|
 | `01_tokenizer.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/01_tokenizer.ipynb) | Train BPE tokenizer (vocab 32768), upload to HuggingFace Hub |
-| `02_train.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/02_train.ipynb) | Pretrain GPT model in raw JAX on single TPU |
+| `02_train.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/02_train.ipynb) | Pretrain GPT model in raw JAX on single TPU (batch_size=8, JIT-compiled train step, optax fused loss, prefetch data loader) |
