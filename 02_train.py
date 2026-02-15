@@ -570,7 +570,7 @@ def merge_params(trainable, static):
     return merged
 
 
-@jax.jit
+@ft.partial(jax.jit, donate_argnums=(1, 2))
 def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
                x: jax.Array, y: jax.Array, lr_mult: jax.Array):
     """Single training step: forward, backward, optimizer update."""
@@ -613,7 +613,14 @@ print('Optimizer state initialized.')
 print(f'Trainable param arrays: {len(jax.tree.leaves(trainable_params))}')
 
 # %%
-# === Text generation (temperature + top-k sampling) ===
+# === Eval + inference helpers ===
+
+@jax.jit
+def eval_step(config: Config, params: dot_dict, x: jax.Array, y: jax.Array):
+    """JIT-compiled eval: returns loss for a single batch."""
+    logits = model_apply(config, params, x)
+    return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
+
 
 @jax.jit
 def predict_step(config: Config, params: dot_dict, x: jax.Array):
@@ -726,10 +733,9 @@ class PrefetchDataLoader:
             for item in self.iterator:
                 if self.stop_event.is_set():
                     break
-                # Optional: convert to jax.device_put here to hide transfer latency?
-                # For now just prefetch the numpy arrays.
-                # Actually, JAX is async, so main thread dispatch is fast.
-                # The bottleneck is likely tokenization/disk.
+                # Transfer to HBM in background thread — overlaps with compute
+                x, y = item
+                item = (jax.device_put(jnp.array(x)), jax.device_put(jnp.array(y)))
                 self.queue.put(item)
         except Exception as e:
             print(f"Prefetch worker error: {e}")
@@ -796,15 +802,10 @@ for step in range(num_iterations + 1):
     if config.eval_every > 0 and (last_step or step % config.eval_every == 0):
         val_loader = val_loader_fn()
         val_losses = []
-        for eval_step in range(config.eval_steps):
+        for ei in range(config.eval_steps):
             vx, vy = next(val_loader)
             vx, vy = jnp.array(vx), jnp.array(vy)
-            trainable, static = split_trainable(params)
-            def val_loss_fn(tp):
-                full_p = merge_params(tp, static)
-                logits = model_apply(config, full_p, vx)
-                return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, vy))
-            vl = val_loss_fn(trainable)
+            vl = eval_step(config, params, vx, vy)
             val_losses.append(float(vl))
         avg_val_loss = sum(val_losses) / len(val_losses)
         if avg_val_loss < best_val_loss:
@@ -838,9 +839,7 @@ for step in range(num_iterations + 1):
     if use_random_data:
         x_batch, y_batch = random_x, random_y
     else:
-        x_batch, y_batch = next(train_loader)
-        x_batch = jnp.array(x_batch)
-        y_batch = jnp.array(y_batch)
+        x_batch, y_batch = next(train_loader)  # already on HBM from prefetch worker
 
     loss, params, opt_state = train_step(config, params, opt_state, x_batch, y_batch, lr_mult)
     loss.block_until_ready()
