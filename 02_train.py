@@ -611,6 +611,20 @@ def apply_optimizer(config: Config, params: dot_dict, opt_state: dot_dict,
     return merge_params(new_trainable, static), new_opt_state
 
 
+
+@jax.jit
+def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
+               x: jax.Array, y: jax.Array, lr_mult: jax.Array):
+    """Single training step with proper functional updates."""
+    # Compute gradients (no JIT here since train_step is JIT)
+    loss, grads = compute_grads(config, params, x, y)
+    
+    # Apply optimizer update (functional)
+    new_params, new_opt_state = apply_optimizer(config, params, opt_state, grads, lr_mult)
+    
+    return loss, new_params, new_opt_state
+
+
 # Initialize optimizer state (only for trainable params)
 trainable_params, static_params = split_trainable(params)
 opt_state = jax.tree.map(init_adam_state, trainable_params)
