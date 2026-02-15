@@ -850,6 +850,16 @@ plt.tight_layout()
 plt.show()
 
 # %%
+# === View Profiling Results ===
+# Run this cell to load TensorBoard and view the trace captured in steps 15-20.
+# Look for "Op Profile" or "Trace Viewer" tabs.
+# - If you see large gaps between "Device Execution", you are INPUT BOUND (data loader is too slow).
+# - If "Device Execution" blocks are packed tightly, you are COMPUTE BOUND (good!).
+
+%load_ext tensorboard
+%tensorboard --logdir log_dir
+
+# %%
 # === Save checkpoint to HuggingFace Hub ===
 import pickle
 
