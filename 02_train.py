@@ -411,23 +411,27 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             q = rms_norm(q)
             k = rms_norm(k)
 
-            # GQA: repeat k,v heads if needed
-            if n_kv_head < n_head:
-                repeats = n_head // n_kv_head
-                k = jnp.repeat(k, repeats, axis=2)
-                v = jnp.repeat(v, repeats, axis=2)
+            # Attention scores via einsum (no vmap overhead)
+            scale = head_dim ** -0.5
+            scores = jnp.einsum('bthd,bshd->bhts', q, k) * scale  # (B, H, T, S)
 
-            # Sliding window: create mask if window < seq_len
+            # Causal / sliding-window mask
             w = window_sizes[i]
+            rows = jnp.arange(T)[:, None]
+            cols = jnp.arange(T)[None, :]
             if w < T:
-                rows = jnp.arange(T)[:, None]
-                cols = jnp.arange(T)[None, :]
                 mask = (cols <= rows) & (cols >= rows - w + 1)
-                attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
             else:
-                attn_out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+                mask = cols <= rows
+            scores = jnp.where(mask[None, None, :, :], scores,
+                               jnp.finfo(scores.dtype).min)
 
-            # Already (B, T, H, D), reshape to (B, T, n_head*head_dim)
+            attn_weights = jax.nn.softmax(scores, axis=-1)
+
+            # Weighted sum
+            attn_out = jnp.einsum('bhts,bshd->bthd', attn_weights, v)  # (B, T, H, D)
+
+            # Reshape to (B, T, n_head*head_dim)
             attn_out = attn_out.reshape(B, T, -1)
 
             # Output projection
