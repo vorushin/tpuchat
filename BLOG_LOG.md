@@ -18,3 +18,5 @@ Ours            32768        6.21        1.84        2.52        3.52
 
 Roman: Good to go for the next step. 1 hour of time spent so far.
 Agent: Created 02_train.py — raw JAX training notebook (no Flax). Ports the full nanochat GPT architecture: RoPE, QK-norm, GQA, ReLU^2, value embeddings, sliding window (SSSL), logit softcap. Uses AdamW (not Muon) with warmup+warmdown LR schedule. Follows the JAX training cookbook pattern (dot_dict pytrees, functional updates, jax.jit). Starts with depth=12 (~85M params), 50 data shards.
+Agent (prompted by Roman): First 1K-step debug run on free TPU v5e-1 (12GB HBM). Using gradient accumulation (device_batch_size=2, grad_accum_steps=8). Val loss: 10.40 → 5.27 in 18 minutes. Model generates repetitive text ("the first to be the first to be...") — expected for 1K steps.
+Roman: batch_size=8 doesn't fit into 12G HBM. Thus using gradient accumulaiton.

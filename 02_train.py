@@ -615,6 +615,89 @@ print('Optimizer state initialized.')
 print(f'Trainable param arrays: {len(jax.tree.leaves(trainable_params))}')
 
 # %%
+# === Text generation (temperature + top-k sampling) ===
+
+def generate(config, params, enc, prompt, max_new_tokens=100,
+             temperature=0.8, top_k=200, top_p=0.95, seed=None):
+    """Generate text from a prompt using temperature + top-k + top-p sampling.
+
+    Args:
+        config: model config
+        params: model parameters
+        enc: tiktoken encoding
+        prompt: text prompt string
+        max_new_tokens: number of tokens to generate
+        temperature: sampling temperature (0 = greedy, higher = more random)
+        top_k: keep only top-k logits before sampling (0 = no filtering)
+        top_p: nucleus sampling cumulative probability (1.0 = no filtering)
+        seed: random seed (None = use current time)
+    """
+    if seed is None:
+        seed = int(time.time() * 1000) % (2**31)
+    key = jax.random.key(seed)
+
+    prompt_ids = enc.encode_ordinary(prompt)
+    bos_id = enc.encode_single_token('<|bos|>')
+    ids = [bos_id] + prompt_ids
+
+    for _ in range(max_new_tokens):
+        # Truncate context to max seq_len if needed
+        context = ids[-config.seq_len:]
+        x = jnp.array([context], dtype=jnp.int32)
+
+        logits = model_apply(config, params, x)
+        next_logits = logits[0, -1, :]  # (vocab_size,)
+        next_logits = next_logits.astype(jnp.float32)
+
+        if temperature == 0:
+            # Greedy
+            next_id = int(jnp.argmax(next_logits))
+        else:
+            # Temperature scaling
+            next_logits = next_logits / temperature
+
+            # Top-k filtering
+            if top_k > 0:
+                top_k_logits, top_k_indices = jax.lax.top_k(next_logits, top_k)
+                # Set everything outside top-k to -inf
+                mask_k = jnp.full_like(next_logits, -jnp.inf)
+                next_logits = mask_k.at[top_k_indices].set(top_k_logits)
+
+            # Top-p (nucleus) filtering
+            if top_p < 1.0:
+                # Sort logits in descending order
+                sorted_logits, sorted_indices = jax.lax.top_k(next_logits, len(next_logits))
+                sorted_probs = jax.nn.softmax(sorted_logits)
+                cumulative_probs = jnp.cumsum(sorted_probs)
+
+                # Mask tokens after cumulative probability > top_p
+                # We want to keep the first token that exceeds top_p, so we shift mask
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift right to keep at least one token
+                sorted_indices_to_remove = jnp.concatenate([jnp.array([False]), sorted_indices_to_remove[:-1]])
+
+                # Scatter -inf back to original indices
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_logits = next_logits.at[indices_to_remove].set(-jnp.inf)
+
+            # Sample
+            key, subkey = jax.random.split(key)
+            next_id = int(jax.random.categorical(subkey, next_logits))
+
+        ids.append(next_id)
+
+    return enc.decode(ids)
+
+
+# Quick test prompts (re-run this cell after training)
+PROMPTS = [
+    'The capital of France is',
+    'In a distant galaxy, scientists discovered',
+    'The quick brown fox',
+    'Machine learning is',
+]
+
+# %%
 # === Training loop ===
 
 train_loader = tokenize_shards(train_shard_indices, config.device_batch_size, config.seq_len)
@@ -657,17 +740,11 @@ for step in range(num_iterations + 1):
 
     # === Sample ===
     if config.sample_every > 0 and step > 0 and (last_step or step % config.sample_every == 0):
-        prompt = 'The capital of France is'
-        prompt_ids = enc.encode_ordinary(prompt)
-        bos_id = enc.encode_single_token('<|bos|>')
-        ids = jnp.array([[bos_id] + prompt_ids], dtype=jnp.int32)
-        for _ in range(50):
-            logits = model_apply(config, params, ids)
-            next_logit = logits[0, -1, :]
-            next_id = jnp.argmax(next_logit)
-            ids = jnp.concatenate([ids, next_id[None, None]], axis=1)
-        sample_text = enc.decode(ids[0].tolist())
-        print(f'Sample: {sample_text}')
+        print(f"\n--- Samples (step {step}) ---")
+        for prompt in PROMPTS:
+            sample_text = generate(config, params, enc, prompt, max_new_tokens=64, top_p=0.95)
+            print(f"Prompt: {prompt}\nOutput: {sample_text}\n")
+        print("----------------------------")
 
     if last_step:
         break
