@@ -33,7 +33,6 @@ import itertools as it
 import time
 import os
 import math
-import math
 import queue
 import threading
 from dataclasses import dataclass
@@ -63,9 +62,8 @@ class Config:
     # Training
     num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
     target_param_data_ratio: float = 10.5
-    device_batch_size: int = 2
-    grad_accum_steps: int = 8 // 2  # accumulate grads over N micro-batches
-    total_batch_size: int = -1  # -1 = auto (device_batch_size * grad_accum_steps * seq_len)
+    device_batch_size: int = 8
+    total_batch_size: int = -1  # -1 = auto (device_batch_size * seq_len)
     max_chars_per_doc: int = 10_000
 
     # Optimizer (AdamW)
@@ -530,12 +528,12 @@ def count_matrix_params(params):
 scaling_params = count_matrix_params(params)
 target_tokens = int(config.target_param_data_ratio * scaling_params)
 
-# Batch size (accounts for gradient accumulation)
+# Batch size
 total_batch_size = config.total_batch_size
 if total_batch_size == -1:
-    total_batch_size = config.device_batch_size * config.grad_accum_steps * config.seq_len
+    total_batch_size = config.device_batch_size * config.seq_len
     print(f'Total batch size: {total_batch_size:,} tokens/step '
-          f'({config.device_batch_size}×{config.grad_accum_steps}×{config.seq_len})')
+          f'({config.device_batch_size}×{config.seq_len})')
 
 # Number of iterations
 if config.num_iterations > 0:
@@ -572,28 +570,21 @@ def merge_params(trainable, static):
     return merged
 
 
-
-def compute_grads(config: Config, params: dot_dict,
-                 x: jax.Array, y: jax.Array):
-    """Forward + backward only. Returns loss and grads."""
+@jax.jit
+def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
+               x: jax.Array, y: jax.Array, lr_mult: jax.Array):
+    """Single training step: forward, backward, optimizer update."""
     trainable, static = split_trainable(params)
 
     def loss_fn(trainable_params):
         full_params = merge_params(trainable_params, static)
         logits = model_apply(config, full_params, x)
-        # Fused cross entropy loss (more efficient on TPU than manual log_softmax + indexing)
         loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(trainable)
-    return loss, grads
 
-
-def apply_optimizer(config: Config, params: dot_dict, opt_state: dot_dict,
-                    grads: dot_dict, lr_mult: jax.Array):
-    """Apply AdamW update given accumulated gradients."""
-    trainable, static = split_trainable(params)
-
+    # Apply AdamW update
     is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
     t_leaves, t_treedef = jax.tree.flatten(trainable)
     g_leaves, _ = jax.tree.flatten(grads)
@@ -607,58 +598,9 @@ def apply_optimizer(config: Config, params: dot_dict, opt_state: dot_dict,
 
     new_trainable = t_treedef.unflatten(new_t_leaves)
     new_opt_state = o_treedef.unflatten(new_o_leaves)
+    new_params = merge_params(new_trainable, static)
 
-    return merge_params(new_trainable, static), new_opt_state
-
-
-
-@jax.jit
-def train_step_accum(config: Config, params: dot_dict, opt_state: dot_dict,
-                     x_batch: jax.Array, y_batch: jax.Array, lr_mult: jax.Array):
-    """
-    Perform gradient accumulation and optimizer update in a single JIT-compiled step.
-    x_batch: (accum_steps, batch_size, seq_len)
-    y_batch: (accum_steps, batch_size, seq_len)
-    """
-    # 1. Accumulate gradients loop
-    def accum_step(carry, i):
-        curr_loss, curr_grads = carry
-        x_micro = x_batch[i]
-        y_micro = y_batch[i]
-        loss, grads = compute_grads(config, params, x_micro, y_micro)
-        
-        # Accumulate: loss + curr, grads + curr
-        new_loss = curr_loss + loss
-        new_grads = jax.tree.map(lambda a, b: a + b, curr_grads, grads)
-        return (new_loss, new_grads), None
-
-    # Initialize accumulation
-    # We need a dummy 'zero' gradient structure. We can get it by tracing once or using a helper?
-    # Easier: Compute first step, then loop for the rest.
-    loss_0, grads_0 = compute_grads(config, params, x_batch[0], y_batch[0])
-    
-    # Loop over remaining steps (1 to accum_steps-1)
-    # Using python loop is fine since this is JIT-compiled and unrolled (small loop count)
-    # But for JAX dynamic shapes, lax.scan or fori_loop is better. 
-    # Since accum_steps=4 is small and static, Python loop unrolling is perfect.
-    
-    accum_loss = loss_0
-    accum_grads = grads_0
-    
-    # Simple Python unroll for fixed accum_steps
-    for i in range(1, x_batch.shape[0]):
-        l, g = compute_grads(config, params, x_batch[i], y_batch[i])
-        accum_loss += l
-        accum_grads = jax.tree.map(lambda a, b: a + b, accum_grads, g)
-        
-    # Average
-    avg_loss = accum_loss / x_batch.shape[0]
-    avg_grads = jax.tree.map(lambda g: g / x_batch.shape[0], accum_grads)
-    
-    # 2. Apply optimizer
-    new_params, new_opt_state = apply_optimizer(config, params, opt_state, avg_grads, lr_mult)
-    
-    return avg_loss, new_params, new_opt_state
+    return loss, new_params, new_opt_state
 
 
 # Initialize optimizer state (only for trainable params)
@@ -805,6 +747,17 @@ class PrefetchDataLoader:
         self.stop_event.set()
 
 
+# %%
+# === View Profiling Results ===
+# Run this cell to load TensorBoard and view the trace captured in steps 15-20.
+# Reload this cell after training to see updated profiles.
+# - If you see large gaps between "Device Execution", you are INPUT BOUND.
+# - If "Device Execution" blocks are packed tightly, you are COMPUTE BOUND (good!).
+
+%load_ext tensorboard
+%tensorboard --logdir log_dir
+
+# %%
 # === Training loop ===
 
 raw_train_loader = tokenize_shards(train_shard_indices, config.device_batch_size, config.seq_len)
@@ -863,32 +816,22 @@ for step in range(num_iterations + 1):
         jax.profiler.stop_trace()
         print("Profiling stopped. Trace saved to 'log_dir'.")
 
-    # === Train step (with gradient accumulation) ===
+    # === Train step ===
     lr_mult = jnp.array(get_lr_multiplier(step, num_iterations, config), dtype=jnp.float32)
     t0 = time.time()
 
-    # Collect batch of micro-batches (accum_steps, B, T) via prefetch loader
-    xs, ys = [], []
-    for _ in range(config.grad_accum_steps):
-        bx, by = next(train_loader)
-        xs.append(bx)
-        ys.append(by)
-    
-    # Stack into (accum_steps, B, T)
-    x_stack = jnp.array(xs)
-    y_stack = jnp.array(ys)
+    x_batch, y_batch = next(train_loader)
+    x_batch = jnp.array(x_batch)
+    y_batch = jnp.array(y_batch)
 
-    # Single JIT call for full accumulation + update
-    loss, params, opt_state = train_step_accum(config, params, opt_state, x_stack, y_stack, lr_mult)
-    
-    # Ensure sync
+    loss, params, opt_state = train_step(config, params, opt_state, x_batch, y_batch, lr_mult)
     loss.block_until_ready()
     dt = time.time() - t0
 
     if step > 10:
         total_training_time += dt
 
-    loss_val = avg_loss
+    loss_val = float(loss)
     ema_beta = 0.9
     smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_val
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
@@ -936,15 +879,7 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# %%
-# === View Profiling Results ===
-# Run this cell to load TensorBoard and view the trace captured in steps 15-20.
-# Look for "Op Profile" or "Trace Viewer" tabs.
-# - If you see large gaps between "Device Execution", you are INPUT BOUND (data loader is too slow).
-# - If "Device Execution" blocks are packed tightly, you are COMPUTE BOUND (good!).
 
-%load_ext tensorboard
-%tensorboard --logdir log_dir
 
 # %%
 # === Save checkpoint to HuggingFace Hub ===
