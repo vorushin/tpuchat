@@ -407,21 +407,18 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
         k = rms_norm(k)
 
         # Attention via jax.nn.dot_product_attention
-        # Transpose to (B, H, T, D) for dot_product_attention
-        q = jnp.transpose(q, (0, 2, 1, 3))
-        k = jnp.transpose(k, (0, 2, 1, 3))
-        v = jnp.transpose(v, (0, 2, 1, 3))
+        # JAX expects (B, T, H, D) — no transpose needed
 
         # GQA: repeat k,v heads if needed
         if n_kv_head < n_head:
             repeats = n_head // n_kv_head
-            k = jnp.repeat(k, repeats, axis=1)
-            v = jnp.repeat(v, repeats, axis=1)
+            k = jnp.repeat(k, repeats, axis=2)
+            v = jnp.repeat(v, repeats, axis=2)
 
         # Sliding window: create mask if window < seq_len
         w = window_sizes[i]
         if w < T:
-            # Create sliding window causal mask
+            # Create sliding window causal mask: (T, T)
             rows = jnp.arange(T)[:, None]
             cols = jnp.arange(T)[None, :]
             mask = (cols <= rows) & (cols >= rows - w + 1)
@@ -429,8 +426,7 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
         else:
             attn_out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
-        # Transpose back to (B, T, H, D) and reshape
-        attn_out = jnp.transpose(attn_out, (0, 2, 1, 3))
+        # Already (B, T, H, D), reshape to (B, T, n_head*head_dim)
         attn_out = attn_out.reshape(B, T, -1)
 
         # Output projection
