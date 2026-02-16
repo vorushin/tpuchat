@@ -194,6 +194,49 @@ The research methods for collecting data from a variety of different sources hav
 Training complete. Total time: 43.4m
 Best val loss: 3.8809
 
+### Attention implemenations
 
-Btw, TPU v5e-1 has MXU utilization around 25% - has lower arithmetic intensity. Back to v6e-1 - asked Agent to add optimized attention kernels, 3 diffirent variants. Let's benchmark them.
+Btw, TPU v5e-1 has MXU utilization around 25% - has lower arithmetic intensity. Back to v6e-1 - asked Agent to add optimized attention kernels, 3 different variants. Let's benchmark them.
 
+device_batch_size=4, v6e-1
+
+**default (as before) 'einsum':**
+
+step 00990/01000 (99.0%) | loss: 5.8589 | lr_mult: 0.020 | dt: 127ms | tok/s: 64,455 | eta: 0.0m
+Step 01000 | Val loss: 5.9245 (best: 5.9245)
+
+FLOPS Utilization
+higher is better.
+Utilization of TPU Matrix Units	
+14.5%
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+20.03 GiB
+Timestamp: 519.2 ms 
+Stack Reservation: 12.75 GiB 
+Heap Allocation: 7.27 GiB 
+Free Memory: 11.22 GiB 
+Fragmentation: 0.00% 
+
+**jax.nn.dot_product_attention:**
+
+step 00990/01000 (99.0%) | loss: 5.8565 | lr_mult: 0.020 | dt: 126ms | tok/s: 65,015 | eta: 0.0m
+Step 01000 | Val loss: 5.9222 (best: 5.9222)
+
+Utilization of TPU Matrix Units	
+14.6%
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+20.06 GiB
+Timestamp: 518.4 ms 
+Stack Reservation: 12.75 GiB 
+Heap Allocation: 7.31 GiB 
+Free Memory: 11.18 GiB 
+Fragmentation: 0.78% 
+
+
+**Pallas splash kernel**
+
+**Pallas flash attention (simpler than above)**

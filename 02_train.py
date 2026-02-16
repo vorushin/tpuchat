@@ -428,7 +428,7 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
                 smask = splash_attention_mask.CausalMask(shape=(T, T))
                 if w < T:
                     smask = smask & splash_attention_mask.LocalMask(
-                        shape=(T, T), window_size=(w, w))
+                        shape=(T, T), window_size=(w, w), offset=0)
                 kernel = splash_attention_kernel.make_splash_mha(
                     mask=smask, head_shards=1, q_seq_shards=1)
                 # Splash expects (H, T, D) per sample — vmap over batch
