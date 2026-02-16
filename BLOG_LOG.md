@@ -100,3 +100,7 @@ device_batch_size = 8 fits now (most likely because of removed VE), but tok/s is
 step 00080/01000 (8.0%) | loss: 12.7541 | lr_mult: 1.000 | dt: 288ms | tok/s: 56,924 | eta: 4.4m
 
 With the shared embed/unembed tensors the learning is happening much much slower (see the diff in the loss values at step 80). I can also see that the decoding of the examples every 250 steps is pretty dump. Interesting.
+
+Agent: The quickest fix would be to scale the logits by 1/√n_embd when using tied weights. This brings initial logit magnitude from ~32 back down to ~1, well within the softcap's linear regime.
+
+step 00080/01000 (8.0%) | loss: 8.3550 | lr_mult: 1.000 | dt: 289ms | tok/s: 56,695 | eta: 4.4m

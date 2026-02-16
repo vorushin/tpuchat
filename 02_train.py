@@ -301,8 +301,11 @@ def init_param_state(config: Config) -> dot_dict:
 
     params = dot_dict()
 
-    # Token embedding (also used as lm_head via weight tying)
+    # Token embedding: normal(0, 1)
     params.wte = jax.random.normal(split_key(), (padded_vocab, n_embd), dtype=jnp.bfloat16)
+
+    # LM head: normal(0, 0.001)
+    params.lm_head = jax.random.normal(split_key(), (n_embd, padded_vocab), dtype=jnp.bfloat16) * 0.001
 
     # Per-layer scalars
     params.resid_lambdas = jnp.ones(n_layer, dtype=jnp.bfloat16)
@@ -433,8 +436,7 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     # Final norm + lm_head
     with jax.named_scope('lm_head'):
         x = rms_norm(x)
-        logits = jnp.einsum('btd,vd->btv', x, params.wte)  # weight-tied: wte.T
-        logits = logits * (config.n_embd ** -0.5)  # scale for tied weights (Gemma-style)
+        logits = jnp.einsum('btd,dv->btv', x, params.lm_head)
         logits = logits[:, :, :config.vocab_size]  # remove padding
 
         # Logit softcap
@@ -499,13 +501,14 @@ def get_lr_multiplier(step, num_iterations, config: Config):
 
 # Count parameters for scaling laws
 def count_matrix_params(params):
-    """Count parameters that contribute to scaling (matrices + wte)."""
+    """Count parameters that contribute to scaling."""
     non_emb = 0
     for i in range(config.n_layer):
         layer = params.layers[i]
         for name in ['c_q', 'c_k', 'c_v', 'c_proj', 'c_fc', 'mlp_proj']:
             non_emb += layer[name].size
-    emb = params.wte.size  # shared embed/unembed
+    non_emb += params.lm_head.size
+    emb = params.wte.size
     return emb, non_emb
 
 emb_params, non_emb_params = count_matrix_params(params)
