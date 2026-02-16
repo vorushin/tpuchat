@@ -52,7 +52,7 @@ class Config:
 
     # Model architecture — n_head is the primary scaling knob
     n_head: int = 8
-    n_kv_head: int = 2  # GQA: 4x fewer KV heads
+    n_kv_head: int = 2  # GQA: must divide n_head evenly
     aspect_ratio: int = 64
     head_dim: int = 128
     vocab_size: int = 32768
@@ -107,8 +107,11 @@ class Config:
         return ((self.vocab_size + 63) // 64) * 64
 
 config = Config()
+assert config.n_head % config.n_kv_head == 0, \
+    f'n_head ({config.n_head}) must be divisible by n_kv_head ({config.n_kv_head})'
 print(f'Model: depth={config.depth}, n_embd={config.n_embd}, n_head={config.n_head}, '
-      f'head_dim={config.head_dim}, vocab={config.vocab_size} (padded={config.padded_vocab})')
+      f'n_kv_head={config.n_kv_head}, head_dim={config.head_dim}, '
+      f'vocab={config.vocab_size} (padded={config.padded_vocab})')
 
 # %%
 # === HuggingFace Hub login + download tokenizer ===
@@ -288,8 +291,6 @@ def init_param_state(config: Config) -> dot_dict:
     head_dim = config.head_dim
     n_layer = config.n_layer
     padded_vocab = config.padded_vocab
-    kv_dim = n_kv_head * head_dim
-
     def split_key():
         nonlocal key
         key, subkey = jax.random.split(key)
@@ -350,6 +351,14 @@ def compute_window_sizes(config: Config):
     return sizes
 
 
+def _expand_kv(k, v, n_head, n_kv_head):
+    """Repeat KV heads to match Q head count for non-splash backends."""
+    if n_kv_head == n_head:
+        return k, v
+    ratio = n_head // n_kv_head
+    return jnp.repeat(k, ratio, axis=1), jnp.repeat(v, ratio, axis=1)
+
+
 def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Array:
     """Forward pass: tokens (B, T) -> logits (B, T, vocab_size)."""
     B, T = tokens.shape
@@ -391,20 +400,17 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             q = rms_norm(q)
             k = rms_norm(k)
 
-            # GQA: Repeat KV heads to match Q heads -> (B, H, T, D)
-            if n_kv_head != n_head:
-                ratio = n_head // n_kv_head
-                k = jnp.repeat(k, ratio, axis=1)
-                v = jnp.repeat(v, ratio, axis=1)
-
             # Attention — dispatch to selected implementation
+            # Splash handles GQA natively (no KV repeat needed).
+            # Other backends need explicit KV head expansion.
             w = window_sizes[i]
 
             if config.attn_impl == 'einsum':
                 # Manual einsum attention (supports sliding window)
-                # Need (B, H, T, D) -> scores (B, H, T, S)
+                # GQA: expand KV heads to match Q heads
+                k_exp, v_exp = _expand_kv(k, v, n_head, n_kv_head)
                 scale = head_dim ** -0.5
-                scores = jnp.einsum('bhtd,bhsd->bhts', q, k) * scale
+                scores = jnp.einsum('bhtd,bhsd->bhts', q, k_exp) * scale
                 rows = jnp.arange(T)[:, None]
                 cols = jnp.arange(T)[None, :]
                 if w < T:
@@ -414,57 +420,62 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
                 scores = jnp.where(mask[None, None, :, :], scores,
                                    jnp.finfo(scores.dtype).min)
                 attn_weights = jax.nn.softmax(scores, axis=-1)
-                attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v)
+                attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
 
             elif config.attn_impl == 'jax':
                 # jax.nn.dot_product_attention expects (B, H, T, D)
+                # GQA: expand KV heads to match Q heads
+                k_exp, v_exp = _expand_kv(k, v, n_head, n_kv_head)
                 if w < T:
                     rows = jnp.arange(T)[:, None]
                     cols = jnp.arange(T)[None, :]
                     mask = (cols <= rows) & (cols >= rows - w + 1)
                     # mask needs to be broadcastable to (B, H, T, S) -> (1, 1, T, S)
                     attn_out = jax.nn.dot_product_attention(
-                        q, k, v, mask=mask[None, None, :, :], implementation='xla')
+                        q, k_exp, v_exp, mask=mask[None, None, :, :], implementation='xla')
                 else:
                     attn_out = jax.nn.dot_product_attention(
-                        q, k, v, is_causal=True, implementation='xla')
+                        q, k_exp, v_exp, is_causal=True, implementation='xla')
 
             elif config.attn_impl == 'splash':
                 # Splash Attention — Pallas kernel
-                # Expects (H, T, D) per sample — so we just vmap over batch dim 0
+                # Handles GQA natively: pass K/V with n_kv_head heads,
+                # kernel reshapes Q and uses index mapping internally.
                 from jax.experimental.pallas.ops.tpu.splash_attention import (
                     splash_attention_mask, splash_attention_kernel)
-                
+
                 smask = splash_attention_mask.CausalMask(shape=(T, T))
                 if w < T:
                     smask = smask & splash_attention_mask.LocalMask(
                         shape=(T, T), window_size=(w, w), offset=0)
-                
+
+                # Mask uses Q head count — kernel maps Q heads to KV heads
                 mh_mask = splash_attention_mask.MultiHeadMask(masks=[smask] * n_head)
-                
+
                 bs = config.splash_block_size
                 block_sizes = splash_attention_kernel.BlockSizes(
                     block_q=bs, block_kv=bs,
                     block_q_dkv=bs, block_kv_dkv=bs,
                     block_q_dq=bs, block_kv_dq=bs,
                 )
-                
+
                 kernel = splash_attention_kernel.make_splash_mha(
-                    mask=mh_mask, 
-                    head_shards=1, 
+                    mask=mh_mask,
+                    head_shards=1,
                     q_seq_shards=1,
                     block_sizes=block_sizes
                 )
-                
-                # Input is already (B, H, T, D) — perfect for vmap(kernel)
+
+                # Q: (B, n_head, T, D), K/V: (B, n_kv_head, T, D)
                 attn_out = jax.vmap(kernel)(q, k, v)
 
             elif config.attn_impl == 'pallas':
                 # Pallas Flash Attention
-                # Expects (B, H, T, D) — perfect match
+                # GQA: expand KV heads to match Q heads
+                k_exp, v_exp = _expand_kv(k, v, n_head, n_kv_head)
                 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
                 attn_out = flash_attention(
-                    q, k, v,
+                    q, k_exp, v_exp,
                     causal=True,
                     sm_scale=head_dim ** -0.5,
                 )
