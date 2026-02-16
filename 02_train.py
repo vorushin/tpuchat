@@ -499,15 +499,18 @@ def get_lr_multiplier(step, num_iterations, config: Config):
 # Count parameters for scaling laws
 def count_matrix_params(params):
     """Count parameters that contribute to scaling (matrices + wte)."""
-    count = 0
+    non_emb = 0
     for i in range(config.n_layer):
         layer = params.layers[i]
         for name in ['c_q', 'c_k', 'c_v', 'c_proj', 'c_fc', 'mlp_proj']:
-            count += layer[name].size
-    count += params.wte.size  # shared embed/unembed
-    return count
+            non_emb += layer[name].size
+    emb = params.wte.size  # shared embed/unembed
+    return emb, non_emb
 
-scaling_params = count_matrix_params(params)
+emb_params, non_emb_params = count_matrix_params(params)
+scaling_params = emb_params + non_emb_params
+print(f'Params: {scaling_params/1e6:.1f}M total '
+      f'(embed: {emb_params/1e6:.1f}M, non-embed: {non_emb_params/1e6:.1f}M)')
 target_tokens = int(config.target_param_data_ratio * scaling_params)
 
 # Batch size
