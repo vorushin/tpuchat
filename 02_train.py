@@ -54,10 +54,10 @@ class Config:
     n_head: int = 8
     n_kv_head: int = 2  # GQA: must divide n_head evenly
     aspect_ratio: int = 64
-    head_dim: int = 128
+    head_dim: int = 256
     vocab_size: int = 32768
     seq_len: int = 2048
-    window_pattern: str = 'SSSL'
+    window_pattern: str = 'LLLL'
     softcap: float = 15.0
     attn_impl: str = 'splash'  # 'einsum', 'jax', 'splash', 'pallas'
     splash_block_size: int = 1024  # block size for splash kernel
