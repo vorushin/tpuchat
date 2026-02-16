@@ -164,3 +164,36 @@ Stack Reservation: 21.86 GiB
 Heap Allocation: 6.92 GiB 
 Free Memory: 2.47 GiB 
 Fragmentation: 5.71% 
+
+
+Trained batch_size=4, 20000 steps, it's not bad:
+
+step 19900/20000 (99.5%) | loss: 3.8105 | lr_mult: 0.010 | dt: 129ms | tok/s: 63,493 | eta: 0.2m
+Step 20000 | Val loss: 3.8809 (best: 3.8809)
+
+--- Samples (step 20000) ---
+Prompt: The capital of France is
+Output: <|bos|>The capital of France is one of the richest and most productive of all cities in Europe and this is also the largest city in the world. The capital of France is in the heart of the town of Dicas. It is located in the town of Cologne, now named after the city of Dicas. It is the world
+
+Prompt: In a distant galaxy, scientists discovered
+Output: <|bos|>In a distant galaxy, scientists discovered a new object: the star that once covered the solar system.
+This is a bright star that is about 12 light years from the Sun. This was the first time scientists discovered that this young star is too light to be seen, by the star's optical system.
+The team, who led the study, says the
+
+Prompt: The quick brown fox
+Output: <|bos|>The quick brown fox (cuckus pomentus) is a large, small, bird-like cat.
+The white male is often seen with a white bill, which is a small black bill. The brown is also known as the red wolf, but may be found in the southern part of the United States.
+In the wild,
+
+Prompt: Machine learning is
+Output: <|bos|>Machine learning is a research and learning method that is used to define and construct theories and ideas of ideas and to build knowledge. The research techniques that are used to form this understanding can be used to create knowledge and knowledge that can be obtained through the research methods.
+The research methods for collecting data from a variety of different sources have been described
+
+----------------------------
+
+Training complete. Total time: 43.4m
+Best val loss: 3.8809
+
+
+Btw, TPU v5e-1 has MXU utilization around 25% - has lower arithmetic intensity. Back to v6e-1 - asked Agent to add optimized attention kernels, 3 diffirent variants. Let's benchmark them.
+

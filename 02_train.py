@@ -58,6 +58,7 @@ class Config:
     seq_len: int = 2048
     window_pattern: str = 'SSSL'
     softcap: float = 15.0
+    attn_impl: str = 'einsum'  # 'einsum', 'jax', 'splash', 'pallas'
 
     # Training
     num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
@@ -390,26 +391,66 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             q = rms_norm(q)
             k = rms_norm(k)
 
-            # Attention scores via einsum
-            scale = head_dim ** -0.5
-            scores = jnp.einsum('bthd,bshd->bhts', q, k) * scale  # (B, H, T, S)
-
-            # Causal / sliding-window mask
+            # Attention — dispatch to selected implementation
             w = window_sizes[i]
-            rows = jnp.arange(T)[:, None]
-            cols = jnp.arange(T)[None, :]
-            if w < T:
-                mask = (cols <= rows) & (cols >= rows - w + 1)
-            else:
-                mask = cols <= rows
-            scores = jnp.where(mask[None, None, :, :], scores,
-                               jnp.finfo(scores.dtype).min)
 
-            attn_weights = jax.nn.softmax(scores, axis=-1)
+            if config.attn_impl == 'einsum':
+                # Manual einsum attention (supports sliding window)
+                scale = head_dim ** -0.5
+                scores = jnp.einsum('bthd,bshd->bhts', q, k) * scale
+                rows = jnp.arange(T)[:, None]
+                cols = jnp.arange(T)[None, :]
+                if w < T:
+                    mask = (cols <= rows) & (cols >= rows - w + 1)
+                else:
+                    mask = cols <= rows
+                scores = jnp.where(mask[None, None, :, :], scores,
+                                   jnp.finfo(scores.dtype).min)
+                attn_weights = jax.nn.softmax(scores, axis=-1)
+                attn_out = jnp.einsum('bhts,bshd->bthd', attn_weights, v)
 
-            # Weighted sum + output projection (no reshape needed)
-            attn_out = jnp.einsum('bhts,bshd->bthd', attn_weights, v)  # (B, T, H, D)
-            attn_out = jnp.einsum('bthd,hde->bte', attn_out, layer.c_proj)  # (B, T, E)
+            elif config.attn_impl == 'jax':
+                # jax.nn.dot_product_attention — XLA flash kernel, handles GQA
+                if w < T:
+                    rows = jnp.arange(T)[:, None]
+                    cols = jnp.arange(T)[None, :]
+                    mask = (cols <= rows) & (cols >= rows - w + 1)
+                    attn_out = jax.nn.dot_product_attention(
+                        q, k, v, mask=mask, implementation='xla')
+                else:
+                    attn_out = jax.nn.dot_product_attention(
+                        q, k, v, is_causal=True, implementation='xla')
+
+            elif config.attn_impl == 'splash':
+                # Splash Attention — Pallas kernel (used in MaxText/Gemma)
+                from jax.experimental.pallas.ops.tpu.splash_attention import (
+                    splash_attention_mask, splash_attention_kernel)
+                smask = splash_attention_mask.CausalMask(shape=(T, T))
+                if w < T:
+                    smask = smask & splash_attention_mask.LocalMask(
+                        shape=(T, T), window_size=(w, w))
+                kernel = splash_attention_kernel.make_splash_mha(
+                    mask=smask, head_shards=1, q_seq_shards=1)
+                # Splash expects (H, T, D) per sample — vmap over batch
+                attn_out = jax.vmap(kernel)(
+                    q.transpose(0, 2, 1, 3),   # (B, H, T, D)
+                    k.transpose(0, 2, 1, 3),
+                    v.transpose(0, 2, 1, 3),
+                ).transpose(0, 2, 1, 3)  # back to (B, T, H, D)
+
+            elif config.attn_impl == 'pallas':
+                # Pallas Flash Attention (causal only, no sliding window)
+                from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+                attn_out = flash_attention(
+                    q.transpose(0, 2, 1, 3),   # (B, H, T, D)
+                    k.transpose(0, 2, 1, 3),
+                    v.transpose(0, 2, 1, 3),
+                    causal=True,
+                    sm_scale=head_dim ** -0.5,
+                ).transpose(0, 2, 1, 3)  # back to (B, T, H, D)
+
+            # Output projection
+            attn_out = jnp.einsum('bthd,hde->bte', attn_out, layer.c_proj)
 
         # Residual with per-layer scaling
         x = params.resid_lambdas[i] * x + params.x0_lambdas[i] * x0
