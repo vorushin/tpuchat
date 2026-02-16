@@ -429,8 +429,10 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
                 if w < T:
                     smask = smask & splash_attention_mask.LocalMask(
                         shape=(T, T), window_size=(w, w), offset=0)
+                mh_mask = splash_attention_mask.MultiHeadMask(
+                    masks=[smask] * n_head)
                 kernel = splash_attention_kernel.make_splash_mha(
-                    mask=smask, head_shards=1, q_seq_shards=1)
+                    mask=mh_mask, head_shards=1, q_seq_shards=1)
                 # Splash expects (H, T, D) per sample — vmap over batch
                 attn_out = jax.vmap(kernel)(
                     q.transpose(0, 2, 1, 3),   # (B, H, T, D)
