@@ -4,7 +4,7 @@ nanochat folder (not commited) contains the Andrej Karpathy project NanoChat - s
 
 I am porting it to train on a single TPU v6e available on a Colab Pro+ plan.
 
-I am writing small snippets as I go along the work to BLOG_LOG.md. The agent is also welcome to add a few lines of its notes to the log after some significant amount of work is done. Annotate it with "Agent:". I will annotate my lines with "Roman:".
+I am writing small snippets as I go along the work to LOG.md. The agent is also welcome to add a few lines of its notes to the log after some significant amount of work is done. Annotate it with "Agent:". I will annotate my lines with "Roman:".
 
 ## Notebooks
 
