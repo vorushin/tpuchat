@@ -103,4 +103,64 @@ With the shared embed/unembed tensors the learning is happening much much slower
 
 Agent: The quickest fix would be to scale the logits by 1/√n_embd when using tied weights. This brings initial logit magnitude from ~32 back down to ~1, well within the softcap's linear regime.
 
+Roman:
+
 step 00080/01000 (8.0%) | loss: 8.3550 | lr_mult: 1.000 | dt: 289ms | tok/s: 56,695 | eta: 4.4m
+
+step 00490/01000 (49.0%) | loss: 6.5318 | lr_mult: 1.000 | dt: 288ms | tok/s: 56,972 | eta: 2.5m
+Step 00500 | Val loss: 6.5308 (best: 6.5308)
+
+Reverting to the separate embed/unembed.
+
+step 00490/01000 (49.0%) | loss: 6.0491 | lr_mult: 1.000 | dt: 291ms | tok/s: 56,397 | eta: 2.5m
+Step 00500 | Val loss: 6.0524 (best: 6.0524)
+
+Let's stick with it for now.
+
+Let's experiment with device_batch_size values:
+
+**device_batch_size = 1**
+
+step 00990/01000 (99.0%) | loss: 6.6651 | lr_mult: 0.020 | dt: 37ms | tok/s: 56,048 | eta: 0.0m
+Step 01000 | Val loss: 6.6013 (best: 6.6013)
+
+**device_batch_size = 2**
+
+step 00990/01000 (99.0%) | loss: 6.2589 | lr_mult: 0.020 | dt: 65ms | tok/s: 63,266 | eta: 0.0m
+Step 01000 | Val loss: 6.2527 (best: 6.2527)
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+13.26 GiB
+Timestamp: 267.5 ms 
+Stack Reservation: 6.04 GiB 
+Heap Allocation: 7.21 GiB 
+Free Memory: 17.99 GiB 
+Fragmentation: 0.56% 
+
+**device_batch_size = 4**
+
+step 00990/01000 (99.0%) | loss: 5.8556 | lr_mult: 0.020 | dt: 126ms | tok/s: 64,765 | eta: 0.0m
+Step 01000 | Val loss: 5.9217 (best: 5.9217)
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+19.87 GiB
+Timestamp: 524.1 ms 
+Stack Reservation: 12.67 GiB 
+Heap Allocation: 7.20 GiB 
+Free Memory: 11.37 GiB 
+Fragmentation: 1.12% 
+
+**device_batch_size = 6**
+
+step 00090/01000 (9.0%) | loss: 7.4390 | lr_mult: 1.000 | dt: 198ms | tok/s: 62,095 | eta: 3.0m
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+28.78 GiB
+Timestamp: 809.6 ms 
+Stack Reservation: 21.86 GiB 
+Heap Allocation: 6.92 GiB 
+Free Memory: 2.47 GiB 
+Fragmentation: 5.71% 

@@ -319,13 +319,14 @@ def init_param_state(config: Config) -> dot_dict:
     for i in range(n_layer):
         layer = dot_dict()
         # Attention projections: uniform(-s, s), proj=zeros
-        layer.c_q = jax.random.uniform(split_key(), (n_embd, n_head * head_dim),
+        # Weights shaped with head dim for reshape-free einsums
+        layer.c_q = jax.random.uniform(split_key(), (n_embd, n_head, head_dim),
                                         dtype=jnp.bfloat16, minval=-s, maxval=s)
-        layer.c_k = jax.random.uniform(split_key(), (n_embd, n_kv_head * head_dim),
+        layer.c_k = jax.random.uniform(split_key(), (n_embd, n_kv_head, head_dim),
                                         dtype=jnp.bfloat16, minval=-s, maxval=s)
-        layer.c_v = jax.random.uniform(split_key(), (n_embd, n_kv_head * head_dim),
+        layer.c_v = jax.random.uniform(split_key(), (n_embd, n_kv_head, head_dim),
                                         dtype=jnp.bfloat16, minval=-s, maxval=s)
-        layer.c_proj = jnp.zeros((n_head * head_dim, n_embd), dtype=jnp.bfloat16)
+        layer.c_proj = jnp.zeros((n_head, head_dim, n_embd), dtype=jnp.bfloat16)
         # MLP: uniform(-s, s), proj=zeros
         layer.c_fc = jax.random.uniform(split_key(), (n_embd, 4 * n_embd),
                                          dtype=jnp.bfloat16, minval=-s, maxval=s)
@@ -377,15 +378,9 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
 
         with jax.named_scope(f'layer_{i}/attention'):
             # === Attention ===
-            q = jnp.einsum('btd,dh->bth', h, layer.c_q)  # (B, T, n_head*head_dim)
-            k = jnp.einsum('btd,dh->bth', h, layer.c_k)  # (B, T, n_kv*head_dim)
-            v = jnp.einsum('btd,dh->bth', h, layer.c_v)
-
-            # Reshape to (B, T, H, D)
-            q = q.reshape(B, T, n_head, head_dim)
-            k = k.reshape(B, T, n_kv_head, head_dim)
-            v = v.reshape(B, T, n_kv_head, head_dim)
-
+            q = jnp.einsum('btd,dhk->bthk', h, layer.c_q)  # (B, T, H, D)
+            k = jnp.einsum('btd,dhk->bthk', h, layer.c_k)
+            v = jnp.einsum('btd,dhk->bthk', h, layer.c_v)
 
             # Apply RoPE
             q = apply_rope(q, cos, sin)
@@ -395,7 +390,7 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             q = rms_norm(q)
             k = rms_norm(k)
 
-            # Attention scores via einsum (no vmap overhead)
+            # Attention scores via einsum
             scale = head_dim ** -0.5
             scores = jnp.einsum('bthd,bshd->bhts', q, k) * scale  # (B, H, T, S)
 
@@ -412,14 +407,9 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
 
             attn_weights = jax.nn.softmax(scores, axis=-1)
 
-            # Weighted sum
+            # Weighted sum + output projection (no reshape needed)
             attn_out = jnp.einsum('bhts,bshd->bthd', attn_weights, v)  # (B, T, H, D)
-
-            # Reshape to (B, T, n_head*head_dim)
-            attn_out = attn_out.reshape(B, T, -1)
-
-            # Output projection
-            attn_out = jnp.einsum('btd,de->bte', attn_out, layer.c_proj)
+            attn_out = jnp.einsum('bthd,hde->bte', attn_out, layer.c_proj)  # (B, T, E)
 
         # Residual with per-layer scaling
         x = params.resid_lambdas[i] * x + params.x0_lambdas[i] * x0
