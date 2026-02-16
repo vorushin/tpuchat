@@ -99,10 +99,6 @@ class Config:
         return self.n_embd // self.aspect_ratio
 
     @property
-    def n_kv_head(self):
-        return self.n_head  # no GQA for simplicity
-
-    @property
     def n_layer(self):
         return self.depth
 
