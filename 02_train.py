@@ -52,6 +52,7 @@ class Config:
 
     # Model architecture — n_head is the primary scaling knob
     n_head: int = 8
+    n_kv_head: int = 2  # GQA: 4x fewer KV heads
     aspect_ratio: int = 64
     head_dim: int = 128
     vocab_size: int = 32768
@@ -271,15 +272,13 @@ def precompute_rope(seq_len, head_dim, base=10000):
     return cos, sin  # (seq_len, head_dim/2)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input: (x1, x2) -> (-x2, x1)."""
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
 def apply_rope(x, cos, sin):
-    """Apply rotary embeddings. x: (B, H, T, D), cos/sin: (1, 1, T, D)"""
-    return (x * cos) + (rotate_half(x) * sin)
+    """Apply rotary embeddings. x: (B, H, T, D), cos/sin: (1, 1, T, D/2)"""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return jnp.concatenate([y1, y2], axis=-1)
 
 
 
@@ -364,12 +363,9 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     n_layer = config.n_layer
     window_sizes = compute_window_sizes(config)
 
-    # RoPE: (T, D/2) -> (1, 1, T, D) for broadcasting
-    # MaxText constructs full D-dim cos/sin by concatenating halves
-    cos_half = params.rope_cos[:T][None, None, :, :]  # (1, 1, T, D/2)
-    sin_half = params.rope_sin[:T][None, None, :, :]
-    cos = jnp.concatenate([cos_half, cos_half], axis=-1)  # (1, 1, T, D)
-    sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+    # RoPE: (T, head_dim/2) -> (1, 1, T, head_dim/2) for (B, H, T, D) broadcasting
+    cos = params.rope_cos[:T][None, None, :, :]  # (1, 1, T, D/2)
+    sin = params.rope_sin[:T][None, None, :, :]
 
     # Token embedding + norm
     with jax.named_scope('embedding'):
@@ -385,12 +381,11 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
 
         with jax.named_scope(f'layer_{i}/attention'):
             # === Attention ===
-            # === Attention ===
             # Native layout for splash/pallas is (B, H, T, D)
             # We want to avoid transposes, so let's produce q/k/v in (B, H, T, D) directly
             q = jnp.einsum('btd,dhk->bhtk', h, layer.c_q)  # (B, H, T, D)
-            k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)
-            v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)
+            k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)  # (B, KV, T, D)
+            v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)  # (B, KV, T, D)
 
             # Apply RoPE (T-dim aligned with (B, H, T, D))
             q = apply_rope(q, cos, sin)
@@ -399,6 +394,12 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             # QK-norm
             q = rms_norm(q)
             k = rms_norm(k)
+
+            # GQA: Repeat KV heads to match Q heads -> (B, H, T, D)
+            if n_kv_head != n_head:
+                ratio = n_head // n_kv_head
+                k = jnp.repeat(k, ratio, axis=1)
+                v = jnp.repeat(v, ratio, axis=1)
 
             # Attention — dispatch to selected implementation
             w = window_sizes[i]
