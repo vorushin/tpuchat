@@ -58,8 +58,8 @@ class Config:
     seq_len: int = 2048
     window_pattern: str = 'SSSL'
     softcap: float = 15.0
-    attn_impl: str = 'einsum'  # 'einsum', 'jax', 'splash', 'pallas'
-    splash_block_size: int = 128  # block size for splash kernel
+    attn_impl: str = 'splash'  # 'einsum', 'jax', 'splash', 'pallas'
+    splash_block_size: int = 1024  # block size for splash kernel
 
     # Training
     num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
@@ -362,9 +362,9 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     n_layer = config.n_layer
     window_sizes = compute_window_sizes(config)
 
-    # RoPE: (T, head_dim/2) -> (1, T, 1, head_dim/2) for broadcasting
-    cos = params.rope_cos[:T][None, :, None, :]  # (1, T, 1, D/2)
-    sin = params.rope_sin[:T][None, :, None, :]
+    # RoPE: (T, head_dim/2) -> (1, 1, T, head_dim/2) for (B, H, T, D) broadcasting
+    cos = params.rope_cos[:T][None, None, :, :]  # (1, 1, T, D/2)
+    sin = params.rope_sin[:T][None, None, :, :]
 
     # Token embedding + norm
     with jax.named_scope('embedding'):
@@ -387,12 +387,9 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)
             v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)
 
-            # Apply RoPE (needs T-dim alignment)
-            # rope_cos is (1, T, 1, D/2) -> we need (1, 1, T, D/2) for (B, H, T, D)
-            cos_h = cos.transpose(0, 2, 1, 3)
-            sin_h = sin.transpose(0, 2, 1, 3)
-            q = apply_rope(q, cos_h, sin_h)
-            k = apply_rope(k, cos_h, sin_h)
+            # Apply RoPE (T-dim aligned with (B, H, T, D))
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
 
             # QK-norm
             q = rms_norm(q)
