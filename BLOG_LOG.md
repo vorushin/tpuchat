@@ -1,4 +1,4 @@
-Feb 15. 
+## Feb 15 2026
 
 Roman: Starting to work on the project.01
 Roman: GPT-2 speedrun is trained on 370 FineWeb-Edu-100B-Shuffle shards (eash shard is ~100MB). The tokenizer - on 8 shards.
@@ -47,3 +47,31 @@ Agent: Added jax.named_scope XProf annotations throughout model (embedding, laye
 Agent: Performance audit against JAX/TPU checklist. donate_argnums didn't work (split_trainable/merge_params pattern incompatible). Applied two working optimizations: (1) moved jax.device_put into PrefetchDataLoader background thread to overlap host→device transfer with compute, (2) JIT-compiled eval_step replacing per-call closure that retraced every eval.
 Agent: Scaled model — n_head is now the primary scaling knob (was depth). n_head=8 → n_embd=1024, depth=16 (derived as n_embd/aspect_ratio). All tensor dims now 128-aligned for TPU MXU. ~419M params, fits in v6e 32GB HBM.
 Agent: XProf showed attention taking 5x longer than MLP. Root cause: jax.nn.dot_product_attention uses vmap internally. Replaced with direct einsum: scores=einsum('bthd,bshd->bhts'), softmax, attn_out=einsum('bhts,bshd->bthd'). Eliminates vmap dispatch overhead.
+
+## Feb 16 2026
+Roman: 
+Value Embeddings (VE) uses a lot of params. Let's disable (manually in a Colab interface, later have to be done in the repo).
+****With VE on**:
+
+step 00080/01000 (8.0%) | loss: 7.5212 | lr_mult: 1.000 | dt: 140ms | tok/s: 58,375 | eta: 2.1m
+
+**With VE off**:
+step 00080/01000 (8.0%) | loss: 7.5225 | lr_mult: 1.000 | dt: 126ms | tok/s: 64,808 | eta: 1.9m
+
+Utilization of TPU Matrix Units	
+14.5%
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+22.07 GiB
+Timestamp: 520.4 ms 
+Stack Reservation: 12.67 GiB 
+Heap Allocation: 9.40 GiB 
+Free Memory: 9.18 GiB 
+Fragmentation: 43.18%
+
+Nice win!
+
+Next thing to try is to share embed/unebmed tensors. Should save some HBM.
+Agent: Removed Value Embeddings (ve_embed, ve_gate, has_ve) entirely. Tied embed/unembed weights — removed separate lm_head param, using wte.T in forward pass via einsum('btd,vd->btv'). Standard practice from GPT-2/T5/LLaMA. Init stays normal(0,1) for the shared wte.
+

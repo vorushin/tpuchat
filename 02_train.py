@@ -278,9 +278,6 @@ def apply_rope(x, cos, sin):
     return jnp.concatenate([y1, y2], axis=-1)
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have value embedding (alternating, last always)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 def init_param_state(config: Config) -> dot_dict:
@@ -304,11 +301,8 @@ def init_param_state(config: Config) -> dot_dict:
 
     params = dot_dict()
 
-    # Token embedding: normal(0, 1)
+    # Token embedding (also used as lm_head via weight tying)
     params.wte = jax.random.normal(split_key(), (padded_vocab, n_embd), dtype=jnp.bfloat16)
-
-    # LM head: normal(0, 0.001)
-    params.lm_head = jax.random.normal(split_key(), (n_embd, padded_vocab), dtype=jnp.bfloat16) * 0.001
 
     # Per-layer scalars
     params.resid_lambdas = jnp.ones(n_layer, dtype=jnp.bfloat16)
@@ -333,12 +327,6 @@ def init_param_state(config: Config) -> dot_dict:
         layer.c_fc = jax.random.uniform(split_key(), (n_embd, 4 * n_embd),
                                          dtype=jnp.bfloat16, minval=-s, maxval=s)
         layer.mlp_proj = jnp.zeros((4 * n_embd, n_embd), dtype=jnp.bfloat16)
-
-        # Value embedding (alternating layers)
-        if has_ve(i, n_layer):
-            layer.ve_embed = jax.random.uniform(split_key(), (padded_vocab, kv_dim),
-                                                 dtype=jnp.bfloat16, minval=-s, maxval=s)
-            layer.ve_gate = jnp.zeros((32, n_kv_head), dtype=jnp.bfloat16)
 
         params.layers[i] = layer
 
@@ -395,13 +383,6 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             k = k.reshape(B, T, n_kv_head, head_dim)
             v = v.reshape(B, T, n_kv_head, head_dim)
 
-            # Value embedding (ResFormer-style)
-            if has_ve(i, n_layer):
-                ve = layer.ve_embed[tokens]  # (B, T, kv_dim)
-                ve = ve.reshape(B, T, n_kv_head, head_dim)
-                # Gate: input-dependent, per head
-                gate = 2.0 * jax.nn.sigmoid(jnp.einsum('btd,dh->bth', h[:, :, :32], layer.ve_gate))
-                v = v + gate[:, :, :, None] * ve
 
             # Apply RoPE
             q = apply_rope(q, cos, sin)
@@ -452,7 +433,7 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     # Final norm + lm_head
     with jax.named_scope('lm_head'):
         x = rms_norm(x)
-        logits = jnp.einsum('btd,dv->btv', x, params.lm_head)
+        logits = jnp.einsum('btd,vd->btv', x, params.wte)  # weight-tied: wte.T
         logits = logits[:, :, :config.vocab_size]  # remove padding
 
         # Logit softcap
@@ -517,15 +498,13 @@ def get_lr_multiplier(step, num_iterations, config: Config):
 
 # Count parameters for scaling laws
 def count_matrix_params(params):
-    """Count parameters that contribute to scaling (matrices + lm_head)."""
+    """Count parameters that contribute to scaling (matrices + wte)."""
     count = 0
     for i in range(config.n_layer):
         layer = params.layers[i]
         for name in ['c_q', 'c_k', 'c_v', 'c_proj', 'c_fc', 'mlp_proj']:
             count += layer[name].size
-        if has_ve(i, config.n_layer):
-            count += layer['ve_gate'].size
-    count += params.lm_head.size
+    count += params.wte.size  # shared embed/unembed
     return count
 
 scaling_params = count_matrix_params(params)
