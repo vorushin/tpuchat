@@ -236,7 +236,54 @@ Heap Allocation: 7.31 GiB
 Free Memory: 11.18 GiB 
 Fragmentation: 0.78% 
 
-
 **Pallas splash kernel**
+
+step 00240/01000 (24.0%) | loss: 6.6512 | lr_mult: 1.000 | dt: 400ms | tok/s: 40,971 | eta: 5.1m
+
+Utilization of TPU Matrix Units	
+8.8%
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+23.80 GiB
+Timestamp: 1620.6 ms 
+Stack Reservation: 16.01 GiB 
+Heap Allocation: 7.79 GiB 
+Free Memory: 7.45 GiB 
+Fragmentation: 0.32%
+
+block_sizes: 128 -> 256
+
+step 00060/01000 (6.0%) | loss: 7.6033 | lr_mult: 1.000 | dt: 208ms | tok/s: 78,904 | eta: 3.3m
+
+Utilization of TPU Matrix Units	
+17.2%
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+23.31 GiB
+Timestamp: 850.0 ms 
+Stack Reservation: 16.01 GiB 
+Heap Allocation: 7.30 GiB 
+Free Memory: 7.94 GiB 
+Fragmentation: 1.08% 
+
+block_sizes: 512
+
+step 00190/01000 (19.0%) | loss: 6.8646 | lr_mult: 1.000 | dt: 167ms | tok/s: 98,326 | eta: 2.2m
+
+Utilization of TPU Matrix Units	
+22.3%
+
+step 00240/01000 (24.0%) | loss: 6.6497 | lr_mult: 1.000 | dt: 161ms | tok/s: 102,030 | eta: 2.0m
+
+block_sizes: 1024
+
+Utilization of TPU Matrix Units	
+25.3%
+
+block_sizes: 2048
+
+Scoped allocation with size 34.08M and limit 32.00M exceeded scoped vmem limit by 2.08M. It should not be possible to run out of scoped vmem - please ...
 
 **Pallas flash attention (simpler than above)**
