@@ -434,6 +434,7 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     with jax.named_scope('lm_head'):
         x = rms_norm(x)
         logits = jnp.einsum('btd,vd->btv', x, params.wte)  # weight-tied: wte.T
+        logits = logits * (config.n_embd ** -0.5)  # scale for tied weights (Gemma-style)
         logits = logits[:, :, :config.vocab_size]  # remove padding
 
         # Logit softcap

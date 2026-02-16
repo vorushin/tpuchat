@@ -53,6 +53,8 @@ Roman:
 Value Embeddings (VE) uses a lot of params. Let's disable (manually in a Colab interface, later have to be done in the repo).
 ****With VE on**:
 
+device_batch_size = 4
+
 step 00080/01000 (8.0%) | loss: 7.5212 | lr_mult: 1.000 | dt: 140ms | tok/s: 58,375 | eta: 2.1m
 
 **With VE off**:
@@ -75,3 +77,26 @@ Nice win!
 Next thing to try is to share embed/unebmed tensors. Should save some HBM.
 Agent: Removed Value Embeddings (ve_embed, ve_gate, has_ve) entirely. Tied embed/unembed weights — removed separate lm_head param, using wte.T in forward pass via einsum('btd,vd->btv'). Standard practice from GPT-2/T5/LLaMA. Init stays normal(0,1) for the shared wte.
 
+Roman:
+device_batch_size = 4
+
+step 00080/01000 (8.0%) | loss: 12.9113 | lr_mult: 1.000 | dt: 127ms | tok/s: 64,490 | eta: 1.9m
+
+We didn't expect a speed-up, but expected lower HBM usage.
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+21.68 GiB
+Timestamp: 520.3 ms 
+Stack Reservation: 13.05 GiB 
+Heap Allocation: 8.63 GiB 
+Free Memory: 9.57 GiB 
+Fragmentation: 49.41% 
+
+We use slightly less HBM now.
+
+device_batch_size = 8 fits now (most likely because of removed VE), but tok/s is surprisingly smaller
+
+step 00080/01000 (8.0%) | loss: 12.7541 | lr_mult: 1.000 | dt: 288ms | tok/s: 56,924 | eta: 4.4m
+
+With the shared embed/unembed tensors the learning is happening much much slower (see the diff in the loss values at step 80). I can also see that the decoding of the examples every 250 steps is pretty dump. Interesting.
