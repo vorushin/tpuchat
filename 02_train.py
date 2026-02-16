@@ -271,13 +271,15 @@ def precompute_rope(seq_len, head_dim, base=10000):
     return cos, sin  # (seq_len, head_dim/2)
 
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input: (x1, x2) -> (-x2, x1)."""
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
 def apply_rope(x, cos, sin):
-    """Apply rotary embeddings. x: (B, T, H, D)"""
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return jnp.concatenate([y1, y2], axis=-1)
+    """Apply rotary embeddings. x: (B, H, T, D), cos/sin: (1, 1, T, D)"""
+    return (x * cos) + (rotate_half(x) * sin)
 
 
 
@@ -362,9 +364,12 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     n_layer = config.n_layer
     window_sizes = compute_window_sizes(config)
 
-    # RoPE: (T, head_dim/2) -> (1, 1, T, head_dim/2) for (B, H, T, D) broadcasting
-    cos = params.rope_cos[:T][None, None, :, :]  # (1, 1, T, D/2)
-    sin = params.rope_sin[:T][None, None, :, :]
+    # RoPE: (T, D/2) -> (1, 1, T, D) for broadcasting
+    # MaxText constructs full D-dim cos/sin by concatenating halves
+    cos_half = params.rope_cos[:T][None, None, :, :]  # (1, 1, T, D/2)
+    sin_half = params.rope_sin[:T][None, None, :, :]
+    cos = jnp.concatenate([cos_half, cos_half], axis=-1)  # (1, 1, T, D)
+    sin = jnp.concatenate([sin_half, sin_half], axis=-1)
 
     # Token embedding + norm
     with jax.named_scope('embedding'):
