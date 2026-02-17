@@ -286,4 +286,121 @@ block_sizes: 2048
 
 Scoped allocation with size 34.08M and limit 32.00M exceeded scoped vmem limit by 2.08M. It should not be possible to run out of scoped vmem - please ...
 
-**Pallas flash attention (simpler than above)**
+Roman: 
+apply_rope is taking a long time. Changing the implemenation slightly - based on maxtext - didn't help. Reduced number of KV heads 8 -> 2. 8 Q heads still. helped a ton:
+
+step 00490/01000 (49.0%) | loss: 6.0802 | lr_mult: 1.000 | dt: 137ms | tok/s: 119,698 | eta: 1.2m
+
+Utilization of TPU Matrix Units	
+27.7%
+
+SSSL pattern -> LLLL
+step 00090/01000 (9.0%) | loss: 7.4665 | lr_mult: 1.000 | dt: 137ms | tok/s: 119,945 | eta: 2.1m
+
+Utilization of TPU Matrix Units	
+27.8%
+
+block size 1024 -> 512
+step 00100/01000 (10.0%) | loss: 7.3906 | lr_mult: 1.000 | dt: 144ms | tok/s: 114,068 | eta: 2.2m
+
+1024 is still optimal.
+
+Checked with Claude Code for the possible optimizations. The biggest issue is head_dim = 128 when v6e MMX unit accepts 256*256 matrices. Trying head_dim = 256, n_head = 4, n_kv_head = 1
+
+step 00090/01000 (9.0%) | loss: 7.4782 | lr_mult: 1.000 | dt: 119ms | tok/s: 137,825 | eta: 1.8m
+
+Utilization of TPU Matrix Units	
+25.5%
+
+Nice speedup - lower utilization because before we multipled zeros a lot.
+
+trying diff block sizes: 256, SSSL
+
+step 00500/01000 (50.0%) | loss: 6.1184 | lr_mult: 1.000 | dt: 141ms | tok/s: 116,013 | eta: 1.2m
+
+trying diff block sizes: 256, LLLL
+
+step 00070/01000 (7.0%) | loss: 7.5517 | lr_mult: 1.000 | dt: 153ms | tok/s: 107,009 | eta: 2.4m
+
+let's keep 1024, LLLL
+
+Running a longer run on 100k steps * batch_size 8 * seq 2k = 1.6B tokens
+
+=== Starting training for 100,000 steps ===
+
+Step 00000 | Val loss: 10.3975 (best: 10.3975)
+step 00000/100000 (0.0%) | loss: 10.3980 | lr_mult: 0.001 | dt: 33512ms | tok/s: 488
+Profiling started...
+Profiling stopped. Trace saved to 'log_dir'.
+Step 01000 | Val loss: 6.2024 (best: 6.2024)
+step 01000/100000 (1.0%) | loss: 6.1779 | lr_mult: 0.501 | dt: 118ms | tok/s: 138,962 | eta: 195.6m
+
+step 79000/100000 (79.0%) | loss: 3.3970 | lr_mult: 0.420 | dt: 117ms | tok/s: 139,858 | eta: 41.4m
+Step 80000 | Val loss: 3.3618 (best: 3.3618)
+
+--- Samples (step 80000) ---
+Prompt: The capital of France is
+Output: <|bos|>The capital of France is Paris. Paris is the most populous city in Europe, with a population of 9.7 million people. It is the capital of France. It is a centre of industrial activity and for a long time it has been a city of merchants and merchants, for trade and trade. At the time of its founding, Paris
+
+Prompt: In a distant galaxy, scientists discovered
+Output: <|bos|>In a distant galaxy, scientists discovered a supermassive black hole that has a mass of about 2 billion times the mass of the Sun. The black hole’s mass is approximately 10 times larger than the galaxy’s own Sun, and the mass of the black hole is only 0.2 suns.
+The black hole’s mass is about 
+
+Prompt: The quick brown fox
+Output: <|bos|>The quick brown fox is found in the Southeast of North Carolina in the Great Plains and its northern ranges. The fox is a common type of fox that is known to breed all over the United States, from the Mexican to the American west.
+The fox has a long, narrow, or flat bottom that allows it to reach heights of 30
+
+Prompt: Machine learning is
+Output: <|bos|>Machine learning is an area of research that involves the use of machine learning to improve a particular technology or system. This area of research can include fields such as machine learning, image classification, machine learning, data analytics, and other types of artificial intelligence. The purpose of machine learning is to improve an system’s performance by finding out what people
+
+
+Much better than after prev run at 20k steps (bs 4) - 0.1 of the current larger run.
+
+step 99000/100000 (99.0%) | loss: 3.2519 | lr_mult: 0.020 | dt: 118ms | tok/s: 139,213 | eta: 2.0m
+Step 100000 | Val loss: 3.2509 (best: 3.2509)
+
+--- Samples (step 100000) ---
+Prompt: The capital of France is
+Output: <|bos|>The capital of France is the capital of the United Kingdom. It is a country of considerable economic and social importance. The capital is Paris. There are 44 cities, and the city of Paris is the largest in France. The capital is Paris. The capital of the Republic of France is Paris.
+The capital of France is Paris. It is
+
+Prompt: In a distant galaxy, scientists discovered
+Output: <|bos|>In a distant galaxy, scientists discovered that the first humans lived in the far distant past – 3.5 billion years ago.
+“It was a big surprise to me to see that, more than 2.5 billion years ago, we lived in a galaxy that’s now 1.5 billion years older,” says Stephen Doy, a professor at
+
+Prompt: The quick brown fox
+Output: <|bos|>The quick brown fox is one of the most common and widespread species of fox, although there are currently only 2 subspecies found in Australia. Their range is primarily in South East Asia, Central and South East Asia, the Indo-Australian region and South East Asia. Its range is also in the Indian subcontinent, from the coast of
+
+Prompt: Machine learning is
+Output: <|bos|>Machine learning is the use of machine learning to make machines learn from data. Machine learning is the study of data and machine learning is the use of data to make machines learn. The most basic form of machine learning is a deep learning.
+We shall see how machine learning works and how machine learning can be applied to other fields in the
+
+----------------------------
+
+Training complete. Total time: 197.3m
+Best val loss: 3.2509
+
+## Feb 17 2026
+Roman:
+Let's dig for better ways of integration with Colab - can we have a way where the Agent can launch and track experiments without Roman reloading and running things manually. We have a Colab Pro+ account with a lot of cool features. Let's figure out how to use them for this project.
+
+While Agent is working on this, I am quadrupling the size of the LLM: 8 query heads, 32 layers, batch_size 2. Let's see if this changes the MXU utilization. HBM OOM. Trying device_batch_size=1. Still OOM. Trying a smaller model.
+
+Model: depth=24, n_embd=1536, n_head=6, n_kv_head=1, head_dim=256, vocab=32768 (padded=32768)
+Params: 685.8M total (embed: 50.3M, attn: 132.1M, mlp: 453.0M, lm_head: 50.3M)
+Total batch size: 2,048 tokens/step (1×2048)
+Scaling params: 685,768,704
+Target tokens: 7,200,571,392
+Num iterations: 100
+Estimated training tokens: 204,800
+
+step 00090/00100 (90.0%) | loss: 7.6009 | lr_mult: 0.200 | dt: 43ms | tok/s: 47,366 | eta: 0.0m
+Step 00100 | Val loss: 7.6175 (best: 7.6175)
+
+Utilization of TPU Matrix Units	
+24.7%
+
+The larger model is not leading to the better MXU utilization.
+
+Agent: Created 03_worker.py — wandb hyperparameter sweep worker notebook. Self-contained jupytext notebook with all model/training code copied from 02_train.py. Uses wandb Sweeps for coordination: Bayesian search over learning_rate, n_head, n_kv_head, head_dim, device_batch_size, warmup_ratio, warmdown_ratio. Hyperband early termination (min_iter=3, eta=3) kills bad runs early. Run cap of 30. Two-phase usage: (1) run once to create sweep and get sweep_id, (2) paste sweep_id into agent cell on each Colab Pro+ instance. Invalid configs (e.g. n_head % n_kv_head != 0) log val_loss=999 and return immediately. Updated README.md with notebook entry.
+

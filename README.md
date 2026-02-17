@@ -27,6 +27,7 @@ Port of [NanoChat](https://github.com/karpathy/nanochat) (Andrej Karpathy's GPT-
 
 ```
 02_train.py          Main training notebook (jupytext percent format)
+03_worker.py         Hyperparameter sweep worker (wandb sweeps)
 01_tokenizer.py      Tokenizer training notebook
 LOG.md               Chronological development log (Roman: / Agent: entries)
 update_notebooks.sh  Converts .py → .ipynb via jupytext
@@ -57,3 +58,4 @@ Notebooks are stored as `.py` files in [jupytext percent format](https://jupytex
 |----------|--------------|-------------|
 | `01_tokenizer.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/01_tokenizer.ipynb) | Train BPE tokenizer (vocab 32768), upload to HuggingFace Hub |
 | `02_train.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/02_train.ipynb) | Pretrain GPT model in raw JAX on single TPU |
+| `03_worker.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/03_worker.ipynb) | wandb hyperparameter sweep worker |
