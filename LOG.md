@@ -404,3 +404,37 @@ The larger model is not leading to the better MXU utilization.
 
 Agent: Created 03_worker.py — wandb hyperparameter sweep worker notebook. Self-contained jupytext notebook with all model/training code copied from 02_train.py. Uses wandb Sweeps for coordination: Bayesian search over learning_rate, n_head, n_kv_head, head_dim, device_batch_size, warmup_ratio, warmdown_ratio. Hyperband early termination (min_iter=3, eta=3) kills bad runs early. Run cap of 30. Two-phase usage: (1) run once to create sweep and get sweep_id, (2) paste sweep_id into agent cell on each Colab Pro+ instance. Invalid configs (e.g. n_head % n_kv_head != 0) log val_loss=999 and return immediately. Updated README.md with notebook entry.
 
+Roman: Running a first sweep:
+
+sweep_config = {
+    "name": "tpuchat-hparam-sweep",
+    "method": "bayes",
+    "metric": {"goal": "minimize", "name": "val_loss"},
+    "early_terminate": {"type": "hyperband", "min_iter": 3, "eta": 3},
+    "run_cap": 30,
+    "parameters": {
+        "learning_rate": {"distribution": "log_uniform_values", "min": 5e-5, "max": 1e-3},
+        "weight_decay": {"distribution": "uniform", "min": 0.01, "max": 0.2},
+    },
+}
+
+https://wandb.ai/vorushin/tpuchat/sweeps/e67oc6lq
+
+Running 10 runs times 2 colab instances.
+
+While it's running trying to reach higher MMX utilization in 02_train.py - editing in Colab UI.
+
+TPU v6e bfloat16 arithmetic intensity is ~560 FLOPs/byte.
+Trying to boost the sizes of all tensors.
+
+Agent: Recommendation: learning_rate=7e-4, weight_decay=0.1
+
+  This is right in the middle of the winning cluster. The current default (3e-4) is on the low side — bumping to 7e-4 should give ~0.1 lower val_loss based on the
+  sweep. Weight decay can stay at 0.1 (current default) since it's not a significant factor in this range.
+
+  The top 5 runs are within 0.04 of each other, so there's not much to squeeze from further tuning these two params. The next sweep should explore architectural knobs
+   (n_head, head_dim, n_kv_head) which likely have bigger impact.
+
+Roman: Not much luck with getting to the higher MXU in the meantime.
+Roman: Asked for a next notebook with maxtext-inspired 200M-400M model with the dimensions optimal for v6e-1.
+Agent: Created 04_maxtext.py — MaxText-inspired ~370M param model. 5 changes from 02_train.py: (1) SwiGLU MLP replaces ReLU^2 (w_gate/w_up/w_down), (2) explicit dimensions in Config (n_embd=1024, n_layer=24, mlp_dim=3072) with 256-alignment assertions instead of derived aspect_ratio, (3) standard pre-norm residual (no x0 connection), (4) lr=7e-4 from sweep results, (5) updated param names. All matrix dims are multiples of 256 for perfect v6e MXU tiling. Everything else (data pipeline, tokenizer, optimizer, splash attention, RoPE, QK-norm, softcap, profiling, eval, plotting, checkpoint) copied verbatim.

@@ -59,3 +59,4 @@ Notebooks are stored as `.py` files in [jupytext percent format](https://jupytex
 | `01_tokenizer.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/01_tokenizer.ipynb) | Train BPE tokenizer (vocab 32768), upload to HuggingFace Hub |
 | `02_train.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/02_train.ipynb) | Pretrain GPT model in raw JAX on single TPU |
 | `03_worker.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/03_worker.ipynb) | wandb hyperparameter sweep worker |
+| `04_maxtext.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/04_maxtext.ipynb) | MaxText-inspired ~370M model (SwiGLU, 256-aligned dims) |
