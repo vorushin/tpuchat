@@ -68,6 +68,7 @@ class Config:
     softcap: float = 15.0
     attn_impl: str = 'splash'  # 'einsum', 'jax', 'splash', 'pallas'
     splash_block_size: int = 1024  # block size for splash kernel
+    num_lm_head_chunks: int = 8    # chunk sequence for memory-efficient lm_head loss
 
     # Training
     num_iterations: int = 1000  # set to -1 for auto from target_param_data_ratio
@@ -109,6 +110,8 @@ assert config.n_embd == config.n_head * config.head_dim, \
 assert config.n_embd % 256 == 0, f'n_embd ({config.n_embd}) must be 256-aligned'
 assert config.mlp_dim % 256 == 0, f'mlp_dim ({config.mlp_dim}) must be 256-aligned'
 assert config.head_dim % 256 == 0, f'head_dim ({config.head_dim}) must be 256-aligned'
+assert (config.device_batch_size * config.seq_len) % config.num_lm_head_chunks == 0, \
+    f'device_batch_size * seq_len ({config.device_batch_size * config.seq_len}) must be divisible by num_lm_head_chunks ({config.num_lm_head_chunks})'
 print(f'Model: n_layer={config.n_layer}, n_embd={config.n_embd}, n_head={config.n_head}, '
       f'n_kv_head={config.n_kv_head}, head_dim={config.head_dim}, '
       f'mlp_dim={config.mlp_dim}, vocab={config.vocab_size} (padded={config.padded_vocab})')
@@ -359,7 +362,7 @@ def _expand_kv(k, v, n_head, n_kv_head):
 
 
 def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Array:
-    """Forward pass: tokens (B, T) -> logits (B, T, vocab_size)."""
+    """Forward pass: tokens (B, T) -> hidden (B, T, n_embd) after final norm."""
     B, T = tokens.shape
     n_head = config.n_head
     n_kv_head = config.n_kv_head
@@ -493,17 +496,90 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
             mlp_out = jnp.einsum('bth,hd->btd', gate * up, layer.w_down)
         x = x + mlp_out
 
-    # Final norm + lm_head
-    with jax.named_scope('lm_head'):
-        x = rms_norm(x)
-        logits = jnp.einsum('btd,dv->btv', x, params.lm_head)
-        logits = logits[:, :, :config.vocab_size]  # remove padding
+    # Final norm only — lm_head applied separately
+    x = rms_norm(x)
 
-        # Logit softcap
+    return x  # (B, T, n_embd)
+
+
+def apply_lm_head(config: Config, params: dot_dict, hidden: jax.Array) -> jax.Array:
+    """Apply lm_head to get logits. Used for eval and generation."""
+    with jax.named_scope('lm_head'):
+        logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head)
+        logits = logits[:, :, :config.vocab_size]
         logits = logits.astype(jnp.float32)
         logits = config.softcap * jnp.tanh(logits / config.softcap)
-
     return logits
+
+
+def _logits_from_chunk(h_chunk: jax.Array, lm_head: jax.Array, config: Config) -> jax.Array:
+    """Compute logits for a single (chunk_size, n_embd) slice."""
+    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
+    logits = logits[:, :config.vocab_size]
+    logits = logits.astype(jnp.float32)
+    return config.softcap * jnp.tanh(logits / config.softcap)
+
+
+@ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def chunked_lm_head_loss(hidden: jax.Array, lm_head: jax.Array,
+                         labels: jax.Array, config: Config) -> jax.Array:
+    """Cross-entropy loss without materialising full (B, T, vocab) logits.
+
+    Tiles the B×T dimension into config.num_lm_head_chunks slices, computes
+    logits and loss per slice via jax.lax.scan, then sums.  The custom VJP
+    recomputes logits during the backward pass (gradient checkpointing).
+    """
+    B, T, D = hidden.shape
+    N = config.num_lm_head_chunks
+    S = B * T // N  # tokens per chunk
+
+    hidden_chunks = hidden.reshape(N, S, D)
+    labels_chunks = labels.reshape(N, S)
+
+    def fwd_body(_, data):
+        h_chunk, l_chunk = data
+        return None, jnp.sum(
+            optax.softmax_cross_entropy_with_integer_labels(
+                _logits_from_chunk(h_chunk, lm_head, config), l_chunk))
+
+    _, chunk_losses = jax.lax.scan(fwd_body, None, (hidden_chunks, labels_chunks))
+    return jnp.sum(chunk_losses) / (B * T)
+
+
+def _chunked_loss_fwd(hidden, lm_head, labels, config):
+    loss = chunked_lm_head_loss(hidden, lm_head, labels, config)
+    return loss, (hidden, lm_head, labels)   # residuals: small tensors, no logits
+
+
+def _chunked_loss_bwd(config, residuals, g):
+    hidden, lm_head, labels = residuals
+    B, T, D = hidden.shape
+    N = config.num_lm_head_chunks
+    S = B * T // N
+
+    hidden_chunks = hidden.reshape(N, S, D)
+    labels_chunks = labels.reshape(N, S)
+
+    def bwd_body(d_lm_head_acc, data):
+        h_chunk, l_chunk = data
+
+        def chunk_loss(h, w):
+            return jnp.sum(
+                optax.softmax_cross_entropy_with_integer_labels(
+                    _logits_from_chunk(h, w, config), l_chunk))
+
+        _, vjp_fn = jax.vjp(chunk_loss, h_chunk, lm_head)
+        d_h, d_w = vjp_fn(g / (B * T))   # scale by upstream g / total_tokens
+        return d_lm_head_acc + d_w, d_h
+
+    d_lm_head_init = jnp.zeros_like(lm_head)
+    d_lm_head, d_hidden_chunks = jax.lax.scan(
+        bwd_body, d_lm_head_init, (hidden_chunks, labels_chunks))
+
+    return d_hidden_chunks.reshape(B, T, D), d_lm_head, jnp.zeros_like(labels)
+
+
+chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
 
 
 # Test model initialization
@@ -632,9 +708,8 @@ def train_step(config: Config, params: dot_dict, opt_state: dot_dict,
 
     def loss_fn(trainable_params):
         full_params = merge_params(trainable_params, static)
-        logits = model_apply(config, full_params, x)
-        loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
-        return loss
+        hidden = model_apply(config, full_params, x)
+        return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
 
     with jax.named_scope('forward_backward'):
         loss, grads = jax.value_and_grad(loss_fn)(trainable)
@@ -672,14 +747,16 @@ print(f'Trainable param arrays: {len(jax.tree.leaves(trainable_params))}')
 @jax.jit
 def eval_step(config: Config, params: dot_dict, x: jax.Array, y: jax.Array):
     """JIT-compiled eval: returns loss for a single batch."""
-    logits = model_apply(config, params, x)
+    hidden = model_apply(config, params, x)
+    logits = apply_lm_head(config, params, hidden)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y))
 
 
 @jax.jit
 def predict_step(config: Config, params: dot_dict, x: jax.Array):
     """JIT-compiled single step inference."""
-    return model_apply(config, params, x)
+    hidden = model_apply(config, params, x)
+    return apply_lm_head(config, params, hidden)
 
 
 def generate(config, params, enc, prompt, max_new_tokens=100,
