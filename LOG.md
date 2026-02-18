@@ -438,3 +438,33 @@ Agent: Recommendation: learning_rate=7e-4, weight_decay=0.1
 Roman: Not much luck with getting to the higher MXU in the meantime.
 Roman: Asked for a next notebook with maxtext-inspired 200M-400M model with the dimensions optimal for v6e-1.
 Agent: Created 04_maxtext.py — MaxText-inspired ~370M param model. 5 changes from 02_train.py: (1) SwiGLU MLP replaces ReLU^2 (w_gate/w_up/w_down), (2) explicit dimensions in Config (n_embd=1024, n_layer=24, mlp_dim=3072) with 256-alignment assertions instead of derived aspect_ratio, (3) standard pre-norm residual (no x0 connection), (4) lr=7e-4 from sweep results, (5) updated param names. All matrix dims are multiples of 256 for perfect v6e MXU tiling. Everything else (data pipeline, tokenizer, optimizer, splash attention, RoPE, QK-norm, softcap, profiling, eval, plotting, checkpoint) copied verbatim.
+
+
+## Feb 18 2026
+Roman:
+Before chunking logits: 
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+29.80 GiB
+Timestamp: 843.6 ms 
+Stack Reservation: 20.83 GiB 
+Heap Allocation: 8.97 GiB 
+Free Memory: 1.44 GiB 
+Fragmentation: 8.65% 
+
+After chunking logits:
+
+With 8 chunks:
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+28.39 GiB
+Timestamp: 813.9 ms 
+Stack Reservation: 18.93 GiB 
+Heap Allocation: 9.46 GiB 
+Free Memory: 2.86 GiB 
+Fragmentation: 0.03% 
+
+And no more huge tensors in the Memory Viewer - used to domitate everything by the size.
+Agent: Added chunked lm_head loss to 04_maxtext.py (commit 456233e). Factored final norm + lm_head out of model_apply — model now returns hidden state (B, T, n_embd). New apply_lm_head used by eval_step/predict_step. New chunked_lm_head_loss tiles B×T into num_lm_head_chunks=8 slices, computes cross-entropy per chunk via jax.lax.scan, and uses a custom VJP that saves only hidden/lm_head/labels as residuals (no logits) — recomputing logits chunk-by-chunk in the backward pass. Pattern adapted from MaxText vocabulary_tiling.py. Stack reduction ~2 GiB (20.83→18.93 GiB), fragmentation dropped from 8.65% to 0.03%, free memory up from 1.44→2.86 GiB.
