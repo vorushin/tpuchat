@@ -468,3 +468,6 @@ Fragmentation: 0.03%
 
 And no more huge tensors in the Memory Viewer - used to domitate everything by the size.
 Agent: Added chunked lm_head loss to 04_maxtext.py (commit 456233e). Factored final norm + lm_head out of model_apply — model now returns hidden state (B, T, n_embd). New apply_lm_head used by eval_step/predict_step. New chunked_lm_head_loss tiles B×T into num_lm_head_chunks=8 slices, computes cross-entropy per chunk via jax.lax.scan, and uses a custom VJP that saves only hidden/lm_head/labels as residuals (no logits) — recomputing logits chunk-by-chunk in the backward pass. Pattern adapted from MaxText vocabulary_tiling.py. Stack reduction ~2 GiB (20.83→18.93 GiB), fragmentation dropped from 8.65% to 0.03%, free memory up from 1.44→2.86 GiB.
+
+## Feb 19 2026
+Agent: Fixed 05_tpu_perf.py benchmark harness — two issues. (1) MXU was over 100% because PEAK_TFLOPS was hardcoded to 197 (wrong estimate). Updated to 918 TFLOPS from official v6e docs (https://docs.cloud.google.com/tpu/docs/v6e). (2) HBM reporting showed bytes_in_use (capacity) instead of bandwidth utilization. Replaced with HBM BW% = (bytes read+written) / wall_time / 1600 GB/s × 100. Added hbm_bytes parameter to benchmark(). Phase 1 matmuls now report both MXU% and HBM BW%. The 8192×8192 matmul at ~622 TFLOP/s should now show ~68% MXU instead of 316%.

@@ -25,13 +25,13 @@
 # |------|-------|
 # | HBM | 32 GB |
 # | MXU | 256×256 systolic array (bfloat16) |
-# | Peak bf16 TFLOPS | ~197 (2 MXUs × 256² × 2 FLOPs/MAC × ~1.5 GHz) |
-# | HBM bandwidth | ~820 GB/s |
-# | Arithmetic intensity | ~560 FLOPs/byte |
+# | Peak bf16 TFLOPS | 918 |
+# | HBM capacity | 32 GB |
+# | HBM bandwidth | 1600 GB/s |
+# | Arithmetic intensity | 918e12 / 1600e9 ≈ 574 FLOPs/byte |
 #
-# > **Tip:** Calibrate `PEAK_TFLOPS` from XProf — run the largest matmul
-# > that fits, read wall time, compute actual TFLOP/s.  XProf also shows
-# > utilization = actual / peak directly.
+# > **HBM BW%:** shows what fraction of the ~820 GB/s peak bandwidth
+# > is utilized, computed from (bytes read+written) / wall_time.
 
 # %%
 # !pip install -q "jax[tpu]" optax
@@ -50,14 +50,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-# TPU v6e-1 constants (adjust PEAK_TFLOPS after calibration)
-PEAK_TFLOPS = 197          # bf16 peak — conservative estimate
+# TPU v6e-1 constants (from https://docs.cloud.google.com/tpu/docs/v6e)
+PEAK_TFLOPS = 918          # bf16 peak compute per chip
 HBM_GB = 32
+HBM_BW_GBS = 1600         # HBM bandwidth in GB/s
 MXU_DIM = 256              # 256×256 systolic array
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
-print(f"Peak TFLOPS : {PEAK_TFLOPS} (bf16, assumed)")
+print(f"Peak TFLOPS : {PEAK_TFLOPS} (bf16, from v6e docs)")
 
 # %%
 # === dot_dict: JAX-compatible mutable dictionary ===
@@ -78,8 +79,9 @@ class dot_dict(dict):
 # %%
 # === Benchmark harness ===
 
-def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None, label=""):
-    """Run fn repeatedly and report wall time, TFLOP/s, MXU%, HBM.
+def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None,
+              hbm_bytes=None, label=""):
+    """Run fn repeatedly and report wall time, TFLOP/s, MXU%, HBM bandwidth%.
 
     Args:
         fn: callable (JIT-compiled or not — warmup handles compilation)
@@ -87,10 +89,11 @@ def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None, label=""):
         warmup: number of warmup calls (absorbs JIT compilation)
         repeats: number of timed calls
         flop_count: manual FLOP count (int); None = skip MXU calculation
+        hbm_bytes: total bytes read+written per call (int); None = skip BW calc
         label: display label for printing
 
     Returns:
-        dict with wall_ms, tflops, mxu_pct, hbm_used_gb, hbm_peak_gb
+        dict with wall_ms, tflops, mxu_pct, hbm_bw_gbs, hbm_bw_pct
     """
     # Warmup (triggers JIT + XLA compilation)
     for _ in range(warmup):
@@ -110,34 +113,37 @@ def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None, label=""):
 
     # FLOP/s and MXU
     tflops = flop_count / (wall_s * 1e12) if flop_count else 0.0
-    mxu_pct = tflops / PEAK_TFLOPS * 100 if flop_count else 0.0
+    mxu_pct = (tflops / PEAK_TFLOPS * 100
+               if flop_count and PEAK_TFLOPS else 0.0)
 
-    # HBM stats
-    stats = jax.local_devices()[0].memory_stats() or {}
-    hbm_used = stats.get('bytes_in_use', 0) / 2**30
-    hbm_peak = stats.get('peak_bytes_in_use', 0) / 2**30
+    # HBM bandwidth utilization
+    hbm_bw_gbs = hbm_bytes / (wall_s * 1e9) if hbm_bytes else 0.0
+    hbm_bw_pct = hbm_bw_gbs / HBM_BW_GBS * 100 if hbm_bytes else 0.0
 
     result = dict(label=label, wall_ms=wall_ms, tflops=tflops,
-                  mxu_pct=mxu_pct, hbm_used_gb=hbm_used, hbm_peak_gb=hbm_peak)
+                  mxu_pct=mxu_pct, hbm_bw_gbs=hbm_bw_gbs,
+                  hbm_bw_pct=hbm_bw_pct)
 
     # Print single row
     mxu_str = f"{mxu_pct:5.1f}%" if flop_count else "  n/a"
     tflop_str = f"{tflops:6.1f}" if flop_count else "   n/a"
+    bw_str = f"{hbm_bw_pct:5.1f}%" if hbm_bytes else "  n/a"
     print(f"  {label:<40s}  {wall_ms:8.2f} ms  {tflop_str} TFLOP/s  MXU {mxu_str}  "
-          f"HBM {hbm_used:.1f}/{hbm_peak:.1f} GiB")
+          f"HBM BW {bw_str}")
     return result
 
 
 def print_summary(results):
     """Print a formatted comparison table from benchmark results."""
     print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'TFLOP/s':>8s}  {'MXU %':>6s}  "
-          f"{'HBM GiB':>8s}")
+          f"{'HBM BW%':>7s}")
     print("  " + "-" * 88)
     for r in results:
         mxu = f"{r['mxu_pct']:5.1f}%" if r['tflops'] > 0 else "  n/a"
         tf = f"{r['tflops']:7.1f}" if r['tflops'] > 0 else "    n/a"
+        bw = f"{r['hbm_bw_pct']:5.1f}%" if r['hbm_bw_pct'] > 0 else "  n/a"
         print(f"  {r['label']:<40s}  {r['wall_ms']:8.2f}  {tf}  {mxu}  "
-              f"{r['hbm_used_gb']:8.1f}")
+              f"{bw:>7s}")
     print()
 
 # %%
@@ -194,9 +200,12 @@ for size in [128, 256, 512, 1024, 2048, 4096, 8192]:
     def mm(a, b):
         return a @ b
 
+    # HBM bytes: read A + read B + write C, all bf16 (2 bytes each)
+    hbm = 3 * size * size * 2
     r = benchmark(mm, a, b, flop_count=matmul_flops(size, size, size),
-                  label=f"matmul {size}x{size}")
+                  hbm_bytes=hbm, label=f"matmul {size}x{size}")
     results_1a.append(r)
+
 print_summary(results_1a)
 
 # %%
@@ -211,8 +220,9 @@ for size in [255, 256, 257, 300, 384, 500, 512, 1000, 1024]:
     def mm(a, b):
         return a @ b
 
+    hbm = 3 * size * size * 2
     r = benchmark(mm, a, b, flop_count=matmul_flops(size, size, size),
-                  label=f"matmul {size}x{size}")
+                  hbm_bytes=hbm, label=f"matmul {size}x{size}")
     results_1b.append(r)
 print_summary(results_1b)
 
@@ -234,8 +244,10 @@ for B, M, N, K, desc in shapes:
     def mm(a, b):
         return a @ b
 
+    # read A (B*M×K) + read B (K×N) + write C (B*M×N), all bf16
+    hbm = (B * M * K + K * N + B * M * N) * 2
     r = benchmark(mm, a, b, flop_count=matmul_flops(B * M, N, K),
-                  label=desc)
+                  hbm_bytes=hbm, label=desc)
     results_1c.append(r)
 print_summary(results_1c)
 
