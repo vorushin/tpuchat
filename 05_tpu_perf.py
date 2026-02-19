@@ -30,7 +30,7 @@
 # | HBM bandwidth | 1600 GB/s |
 # | Arithmetic intensity | 918e12 / 1600e9 ≈ 574 FLOPs/byte |
 #
-# > **HBM BW%:** shows what fraction of the ~820 GB/s peak bandwidth
+# > **HBM BW%:** shows what fraction of the 1600 GB/s peak bandwidth
 # > is utilized, computed from (bytes read+written) / wall_time.
 
 # %%
@@ -165,11 +165,21 @@ def matmul_flops(M, N, K, batch=1):
     return 2 * batch * M * N * K
 
 def attention_flops(B, H, T, D):
-    """Approximate FLOPs for QK^T + softmax + AV (full, not causal-halved)."""
+    """FLOPs for QK^T + AV (full T×T, not causal-halved).
+
+    Counts full attention matrix. Causal kernels (splash, pallas) skip the
+    upper triangle, so actual MXU work is ~half this — meaning MXU% for
+    attention is overestimated by ~2x.
+    """
     return 2 * (2 * B * H * T * T * D)   # QK^T + AV
 
 def layer_flops(B, T, E, H, KV, D, MLP):
-    """Approximate FLOPs for one transformer layer."""
+    """MXU-relevant FLOPs for one transformer layer.
+
+    Counts only matmul FLOPs (projections + attention core + MLP).
+    Excludes elementwise ops (RMSNorm, RoPE, softmax, SiLU) which
+    run on the vector unit, not the MXU.
+    """
     tok = B * T
     q  = 2 * tok * E * H * D             # Q projection
     k  = 2 * tok * E * KV * D            # K projection
@@ -231,12 +241,13 @@ print_summary(results_1b)
 print("=== Batched matmul (transformer-shaped) ===")
 results_1c = []
 shapes = [
+    # (B, M, K, N) -> (B*M, K) @ (K, N)
     (8, 2048, 1024, 1024, "B=8 hidden->hidden"),
-    (8, 2048, 3072, 1024, "B=8 hidden->mlp"),
-    (8, 2048, 1024, 3072, "B=8 mlp->hidden"),
-    (8, 2048, 32768, 1024, "B=8 hidden->vocab"),
+    (8, 2048, 1024, 3072, "B=8 hidden->mlp"),
+    (8, 2048, 3072, 1024, "B=8 mlp->hidden"),
+    (8, 2048, 1024, 32768, "B=8 hidden->vocab"),
 ]
-for B, M, N, K, desc in shapes:
+for B, M, K, N, desc in shapes:
     a = jax.random.normal(jax.random.key(0), (B * M, K), dtype=jnp.bfloat16)
     b = jax.random.normal(jax.random.key(1), (K, N), dtype=jnp.bfloat16)
 
@@ -319,6 +330,7 @@ class PerfConfig:
     n_layer: int = 24
     softcap: float = 15.0
     splash_block_size: int = 1024
+    pallas_block_size: int = 512
     num_lm_head_chunks: int = 8
 
     @property
@@ -326,6 +338,8 @@ class PerfConfig:
         return ((self.vocab_size + 63) // 64) * 64
 
 cfg = PerfConfig()
+assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
+    f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
 print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, "
       f"H={cfg.n_head}, KV={cfg.n_kv_head}, D={cfg.head_dim}, "
       f"MLP={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
@@ -506,7 +520,22 @@ r_attn_splash = benchmark(bench_attn_splash, x, attn_params, cos_b, sin_b,
 # 2g. Attention — Pallas flash attention
 print("=== Attention (pallas flash) ===")
 
-from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+from jax.experimental.pallas.ops.tpu.flash_attention import (
+    flash_attention, BlockSizes as FlashBlockSizes)
+
+
+def make_flash_block_sizes(bs):
+    """Create FlashBlockSizes with all tiles set to bs (block_b=1)."""
+    return FlashBlockSizes(
+        block_q=bs, block_k_major=bs, block_k=bs, block_b=1,
+        block_q_major_dkv=bs, block_k_major_dkv=bs,
+        block_k_dkv=bs, block_q_dkv=bs,
+        block_k_major_dq=bs, block_k_dq=bs, block_q_dq=bs,
+    )
+
+# Note: flash_attention defaults to block_size=128 which is suboptimal for v6e.
+# We use 512 here; Phase 7 sweeps different values.
+pallas_block_sizes = make_flash_block_sizes(512)
 
 @jax.jit
 def bench_attn_pallas(x, params, cos, sin):
@@ -521,7 +550,8 @@ def bench_attn_pallas(x, params, cos, sin):
         k = rms_norm(k)
         k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
         attn_out = flash_attention(
-            q, k_exp, v_exp, causal=True, sm_scale=cfg.head_dim ** -0.5)
+            q, k_exp, v_exp, causal=True, sm_scale=cfg.head_dim ** -0.5,
+            block_sizes=pallas_block_sizes)
         return jnp.einsum('bhtd,hde->bte', attn_out, params.c_proj)
 
 r_attn_pallas = benchmark(bench_attn_pallas, x, attn_params, cos_b, sin_b,
@@ -609,6 +639,11 @@ def single_layer_forward(cfg, layer, x, cos, sin, *, attn_impl='splash',
                            jnp.finfo(scores.dtype).min)
         attn_weights = jax.nn.softmax(scores, axis=-1)
         attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
+    elif attn_impl == 'pallas':
+        k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
+        attn_out = flash_attention(
+            q, k_exp, v_exp, causal=True, sm_scale=cfg.head_dim ** -0.5,
+            block_sizes=make_flash_block_sizes(cfg.pallas_block_size))
     else:
         k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
         attn_out = jax.nn.dot_product_attention(
@@ -955,8 +990,6 @@ print("\n=== Phase 6 Summary ===")
 print_summary([r_fwd, r_fwd_bwd, r_remat])
 print(f"  Backward / Forward ratio:  {r_fwd_bwd['wall_ms'] / max(r_fwd['wall_ms'], 0.01):.2f}x")
 print(f"  Remat overhead vs no-remat: {r_remat['wall_ms'] / max(r_fwd_bwd['wall_ms'], 0.01):.2f}x")
-print(f"  Remat HBM savings:          "
-      f"{r_fwd_bwd['hbm_peak_gb'] - r_remat['hbm_peak_gb']:.2f} GiB")
 
 # %% [markdown]
 # ### Ideas to try
@@ -1098,7 +1131,7 @@ x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
 lf = layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
                  cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
 
-for bs in [128, 256, 512, 1024]:
+for bs in [256, 512, 1024]:
     cfg_bs = PerfConfig(splash_block_size=bs)
     layer_p = init_layer_params(cfg_bs)
 
@@ -1113,13 +1146,34 @@ for bs in [128, 256, 512, 1024]:
 print_summary(results_7e)
 
 # %%
+# 7e2. Pallas flash block size sweep (single layer)
+# Default block_size=128 is suboptimal for v6e MXU (256×256 tiles).
+print("\n=== Pallas flash block size sweep (single layer) ===")
+results_7e2 = []
+
+for bs in [256, 512, 1024]:
+    cfg_bs = PerfConfig(pallas_block_size=bs)
+    layer_p = init_layer_params(cfg_bs)
+
+    @jax.jit
+    def bench_fn(x, layer, cos, sin, _cfg=cfg_bs):
+        return single_layer_forward(_cfg, layer, x, cos, sin, attn_impl='pallas')
+
+    r = benchmark(bench_fn, x, layer_p, cos_b, sin_b,
+                  flop_count=lf, label=f"pallas block_size={bs}")
+    results_7e2.append(r)
+
+print_summary(results_7e2)
+
+# %%
 # 7f. Attention implementation comparison (single layer)
+# jax.nn.dot_product_attention has no tile size control (handled by XLA internally).
 print("\n=== Attention implementation comparison (single layer) ===")
 results_7f = []
 x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
 layer_p = init_layer_params(cfg)
 
-for impl in ['einsum', 'jax', 'splash']:
+for impl in ['einsum', 'jax', 'splash', 'pallas']:
     @jax.jit
     def bench_fn(x, layer, cos, sin, _impl=impl):
         return single_layer_forward(cfg, layer, x, cos, sin, attn_impl=_impl)
