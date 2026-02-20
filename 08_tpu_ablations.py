@@ -368,6 +368,7 @@ class Config:
     mlp_dim: int = 3072             # 3072 for glu, 4096 for plain
     softcap: float = 15.0
     splash_block_size: int = 1024
+    num_lm_head_chunks: int = 8
     batch_size: int = 4
 
     # ── Training ───────────────────────────────────────────────
@@ -548,17 +549,65 @@ def model_forward_remat(config, params, tokens):
     return rms_norm(x)
 
 # %%
-# === lm_head_loss ===
+# === chunked_lm_head_loss ===
 
-def lm_head_loss(hidden, lm_head, labels, config):
-    """Simple LM head loss — no chunking needed for small models."""
-    with jax.named_scope('lm_head'):
-        logits = jnp.einsum('btd,dv->btv', hidden, lm_head)
-        logits = logits[:, :, :config.vocab_size]
-        logits = logits.astype(jnp.float32)
-        logits = config.softcap * jnp.tanh(logits / config.softcap)
-    return jnp.mean(
-        optax.softmax_cross_entropy_with_integer_labels(logits, labels))
+def _logits_from_chunk(h_chunk, lm_head, config):
+    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
+    logits = logits[:, :config.vocab_size]
+    logits = logits.astype(jnp.float32)
+    return config.softcap * jnp.tanh(logits / config.softcap)
+
+
+@ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def chunked_lm_head_loss(hidden, lm_head, labels, config):
+    B, T, D = hidden.shape
+    N = config.num_lm_head_chunks
+    S = B * T // N
+    hidden_chunks = hidden.reshape(N, S, D)
+    labels_chunks = labels.reshape(N, S)
+
+    def fwd_body(_, data):
+        h_chunk, l_chunk = data
+        return None, jnp.sum(
+            optax.softmax_cross_entropy_with_integer_labels(
+                _logits_from_chunk(h_chunk, lm_head, config), l_chunk))
+
+    _, chunk_losses = jax.lax.scan(fwd_body, None, (hidden_chunks, labels_chunks))
+    return jnp.sum(chunk_losses) / (B * T)
+
+
+def _chunked_loss_fwd(hidden, lm_head, labels, config):
+    loss = chunked_lm_head_loss(hidden, lm_head, labels, config)
+    return loss, (hidden, lm_head, labels)
+
+
+def _chunked_loss_bwd(config, residuals, g):
+    hidden, lm_head, labels = residuals
+    B, T, D = hidden.shape
+    N = config.num_lm_head_chunks
+    S = B * T // N
+    hidden_chunks = hidden.reshape(N, S, D)
+    labels_chunks = labels.reshape(N, S)
+
+    def bwd_body(d_lm_head_acc, data):
+        h_chunk, l_chunk = data
+
+        def chunk_loss(h, w):
+            return jnp.sum(
+                optax.softmax_cross_entropy_with_integer_labels(
+                    _logits_from_chunk(h, w, config), l_chunk))
+
+        _, vjp_fn = jax.vjp(chunk_loss, h_chunk, lm_head)
+        d_h, d_w = vjp_fn(g / (B * T))
+        return d_lm_head_acc + d_w, d_h
+
+    d_lm_head_init = jnp.zeros_like(lm_head)
+    d_lm_head, d_hidden_chunks = jax.lax.scan(
+        bwd_body, d_lm_head_init, (hidden_chunks, labels_chunks))
+    return d_hidden_chunks.reshape(B, T, D), d_lm_head, jnp.zeros_like(labels)
+
+
+chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
 
 # %%
 # === train_step, eval_step, predict_step, generate ===
@@ -572,7 +621,7 @@ def make_train_step(optimizer):
         def loss_fn(trainable_params):
             full_params = merge_params(trainable_params, static)
             hidden = model_forward(config, full_params, x)
-            return lm_head_loss(hidden, full_params.lm_head, y, config)
+            return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
 
         with jax.named_scope('forward_backward'):
             loss, grads = jax.value_and_grad(loss_fn)(trainable)
@@ -589,7 +638,7 @@ def make_train_step(optimizer):
 def eval_step(config, params, x, y):
     """JIT-compiled eval: returns loss for a single batch."""
     hidden = model_forward(config, params, x)
-    return lm_head_loss(hidden, params.lm_head, y, config)
+    return chunked_lm_head_loss(hidden, params.lm_head, y, config)
 
 
 @jax.jit
