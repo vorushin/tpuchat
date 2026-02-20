@@ -56,6 +56,8 @@ HBM_GB = 32
 HBM_BW_GBS = 1600         # HBM bandwidth in GB/s
 MXU_DIM = 256              # 256×256 systolic array
 
+ALL_RESULTS = []   # global collector — every benchmark() appends here
+
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
 print(f"Peak TFLOPS : {PEAK_TFLOPS} (bf16, from v6e docs)")
@@ -123,6 +125,7 @@ def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None,
     result = dict(label=label, wall_ms=wall_ms, tflops=tflops,
                   mxu_pct=mxu_pct, hbm_bw_gbs=hbm_bw_gbs,
                   hbm_bw_pct=hbm_bw_pct)
+    ALL_RESULTS.append(result)
 
     # Print single row
     mxu_str = f"{mxu_pct:5.1f}%" if flop_count else "  n/a"
@@ -194,9 +197,7 @@ def layer_flops(B, T, E, H, KV, D, MLP):
 # %% [markdown]
 # ## Phase 1 — Matmul Baseline
 #
-# Establish the MXU ceiling with pure matmuls.
-# - 256-aligned sizes should hit best utilization
-# - Non-aligned sizes show the padding penalty
+# Establish the MXU ceiling with pure matmuls at 256-aligned sizes.
 
 # %%
 # 1a. Square matmul — aligned sizes
@@ -217,24 +218,6 @@ for size in [128, 256, 512, 1024, 2048, 4096, 8192]:
     results_1a.append(r)
 
 print_summary(results_1a)
-
-# %%
-# 1b. Non-aligned sizes — alignment penalty
-print("=== Non-aligned matmul ===")
-results_1b = []
-for size in [255, 256, 257, 300, 384, 500, 512, 1000, 1024]:
-    a = jax.random.normal(jax.random.key(0), (size, size), dtype=jnp.bfloat16)
-    b = jax.random.normal(jax.random.key(1), (size, size), dtype=jnp.bfloat16)
-
-    @jax.jit
-    def mm(a, b):
-        return a @ b
-
-    hbm = 3 * size * size * 2
-    r = benchmark(mm, a, b, flop_count=matmul_flops(size, size, size),
-                  hbm_bytes=hbm, label=f"matmul {size}x{size}")
-    results_1b.append(r)
-print_summary(results_1b)
 
 # %%
 # 1c. Batched matmul — simulating transformer projections
@@ -1305,22 +1288,25 @@ print_summary(results_7f)
 # - Idle gaps (input-bound vs compute-bound)
 
 # %%
-# === Final summary ===
+# === All outputs — copy/paste this cell's output into Claude Code ===
 print("=" * 90)
-print("  FULL SESSION SUMMARY")
+print("  ALL BENCHMARK RESULTS")
 print("=" * 90)
-
-all_results = []
-for name, rlist in [
-    ("Phase 1 — Matmul", results_1a[-2:]),      # last two large sizes
-    ("Phase 2 — Components", [r_mlp, r_attn_splash]),
-    ("Phase 3 — Single layer", [r_layer]),
-    ("Phase 4 — Depth", results_4a[-1:]),         # 24 layers
-    ("Phase 5 — LM head", [r_lm, r_lm_chunked]),
-    ("Phase 6 — Fwd/Bwd", [r_fwd, r_fwd_bwd, r_remat]),
-]:
-    for r in rlist:
-        all_results.append(r)
-
-print_summary(all_results)
-print("Done!  Use XProf (Phase 8.9) for detailed hardware traces.")
+print()
+print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, "
+      f"H={cfg.n_head}, KV={cfg.n_kv_head}, D={cfg.head_dim}, "
+      f"MLP={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}, "
+      f"softcap={cfg.softcap}, splash_bs={cfg.splash_block_size}, "
+      f"lm_chunks={cfg.num_lm_head_chunks}")
+print(f"TPU: peak={PEAK_TFLOPS} TFLOPS, HBM={HBM_GB} GB, BW={HBM_BW_GBS} GB/s")
+print()
+print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MXU%':>6s} {'BW%':>6s}")
+print("-" * 82)
+for i, r in enumerate(ALL_RESULTS):
+    mxu = f"{r['mxu_pct']:5.1f}" if r['tflops'] > 0 else "  n/a"
+    tf = f"{r['tflops']:7.1f}" if r['tflops'] > 0 else "    n/a"
+    bw = f"{r['hbm_bw_pct']:5.1f}" if r['hbm_bw_pct'] > 0 else "  n/a"
+    print(f"{i:<4d} {r['label']:<45s} {r['wall_ms']:8.2f} {tf} {mxu} {bw}")
+print()
+print(f"Total benchmarks: {len(ALL_RESULTS)}")
+print("=" * 90)
