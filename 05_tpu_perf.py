@@ -928,9 +928,9 @@ def model_forward_remat(cfg, params, tokens):
     cos = params.rope_cos[:T][None, None, :, :]
     sin = params.rope_sin[:T][None, None, :, :]
     x = rms_norm(params.wte[tokens])
+    layer_fn = ft.partial(single_layer_forward, cfg, attn_impl='splash')
     for i in range(cfg.n_layer):
-        x = jax.checkpoint(single_layer_forward)(
-            cfg, params.layers[i], x, cos, sin, attn_impl='splash')
+        x = jax.checkpoint(layer_fn)(params.layers[i], x, cos, sin)
     return rms_norm(x)
 
 
