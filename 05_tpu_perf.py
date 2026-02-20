@@ -41,7 +41,7 @@
 # > is utilized, computed from (bytes read+written) / wall_time.
 
 # %%
-# !pip install -q "jax[tpu]" optax
+# !pip install -q "jax[tpu]" optax tensorboard tensorboard-plugin-profile
 
 # %% [markdown]
 # ## Phase 0 — Prerequisites
