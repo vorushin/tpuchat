@@ -1621,13 +1621,12 @@ print("=== Phase 11: ~100M Non-Embed Param Architecture Sweep ===")
 
 sweep_configs_11 = [
     # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
-    ("D768-F3328",     3, 1, 256, 768,  3328, 8, 16),   # Balanced baseline
-    ("D1024-F1792",    4, 1, 256, 1024, 1792, 8, 16),   # Wider D, slimmer F
-    ("D768-H128",      6, 2, 128, 768,  3328, 8, 16),   # head_dim=128 (same params as #1)
-    ("D768-MHA",       3, 3, 256, 768,  3072, 8, 16),   # MHA vs MQA
-    ("D1280-F1024",    5, 1, 256, 1280, 1024, 8, 16),   # Very wide D, very slim F
-    ("D768-F4096",     3, 1, 256, 768,  4096, 8, 16),   # Large MLP (5.3×D)
-    ("D768-F3328-B32", 3, 1, 256, 768,  3328, 8, 32),   # B=32 batch effect
+    ("D768-F3328-B4",    3, 1, 256, 768,  3328, 8, 4),    # 99M non-embed baseline
+    ("D1024-F3072-B2",   3, 1, 256, 1024, 3072, 8, 2),    # 126M, small batch
+    ("D1024-F3072-B4",   3, 1, 256, 1024, 3072, 8, 4),    # 126M, peak MXU
+    ("D1024-F3072-B8",   3, 1, 256, 1024, 3072, 8, 8),    # 126M, batch scaling
+    ("D1024-F3072-B16",  3, 1, 256, 1024, 3072, 8, 16),   # 126M, batch scaling
+    ("D1024-F3072-B32",  3, 1, 256, 1024, 3072, 8, 32),   # 126M, large batch
 ]
 
 results_11 = []
