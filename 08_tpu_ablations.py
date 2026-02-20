@@ -370,6 +370,7 @@ class Config:
     splash_block_size: int = 1024
     num_lm_head_chunks: int = 8
     batch_size: int = 4
+    microbatch_size: int = 4    # gradient accumulation when < batch_size
 
     # ── Training ───────────────────────────────────────────────
     learning_rate: float = 3e-4
@@ -389,6 +390,10 @@ class Config:
     def padded_vocab(self):
         return ((self.vocab_size + 63) // 64) * 64
 
+    @property
+    def num_microbatches(self):
+        return self.batch_size // self.microbatch_size
+
 
 config = Config()
 print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
@@ -396,7 +401,9 @@ print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
       f'H={config.head_dim}, F={config.mlp_dim}')
 print(f'Ablations: attn_impl={config.attn_impl}, mlp_type={config.mlp_type}, '
       f'qk_norm={config.qk_norm}')
-print(f'Training: lr={config.learning_rate:.1e}, B={config.batch_size}')
+mb_info = (f', microbatch={config.microbatch_size}, accum={config.num_microbatches}x'
+           if config.num_microbatches > 1 else '')
+print(f'Training: lr={config.learning_rate:.1e}, B={config.batch_size}{mb_info}')
 
 # %%
 # === init_layer_params (branches on mlp_type) ===
@@ -613,18 +620,39 @@ chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
 # === train_step, eval_step, predict_step, generate ===
 
 def make_train_step(optimizer):
-    """Create a JIT-compiled train step with the given optax optimizer."""
+    """Create a JIT-compiled train step with the given optax optimizer.
+
+    Supports gradient accumulation: when config.microbatch_size < config.batch_size,
+    uses jax.lax.scan to process microbatches sequentially, accumulating gradients
+    before a single optimizer update.
+    """
     @jax.jit
     def train_step(config, params, opt_state, x, y, _opt=optimizer):
         trainable, static = split_trainable(params)
+        num_mb = config.num_microbatches
 
-        def loss_fn(trainable_params):
+        # Reshape full batch into microbatches: (B,T) → (num_mb, mb_size, T)
+        x_micro = x.reshape(num_mb, config.microbatch_size, config.seq_len)
+        y_micro = y.reshape(num_mb, config.microbatch_size, config.seq_len)
+
+        def loss_fn(trainable_params, x_mb, y_mb):
             full_params = merge_params(trainable_params, static)
-            hidden = model_forward(config, full_params, x)
-            return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
+            hidden = model_forward(config, full_params, x_mb)
+            return chunked_lm_head_loss(hidden, full_params.lm_head, y_mb, config)
+
+        def microbatch_step(grad_acc, data):
+            x_mb, y_mb = data
+            loss, grads = jax.value_and_grad(loss_fn)(trainable, x_mb, y_mb)
+            grad_acc = jax.tree.map(jax.lax.add, grad_acc, grads)
+            return grad_acc, loss
 
         with jax.named_scope('forward_backward'):
-            loss, grads = jax.value_and_grad(loss_fn)(trainable)
+            grad_init = jax.tree.map(jnp.zeros_like, trainable)
+            grads, losses = jax.lax.scan(microbatch_step, grad_init,
+                                         (x_micro, y_micro))
+            grads = jax.tree.map(lambda g: g / num_mb, grads)
+            loss = jnp.mean(losses)
+
         with jax.named_scope('optimizer'):
             updates, new_opt_state = _opt.update(grads, opt_state, trainable)
             new_trainable = optax.apply_updates(trainable, updates)
