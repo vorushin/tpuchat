@@ -3,3 +3,4 @@ maxtext
 .venv
 uv.lock
 __pycache__
+scaling-book/
