@@ -14,7 +14,7 @@
 # # 05 — TPU v6e Performance Lab
 #
 # Standalone notebook that progressively builds a modern transformer and
-# benchmarks **MXU utilization** and **HBM usage** at each stage.
+# benchmarks **MFU** (Model FLOPs Utilization) and **HBM usage** at each stage.
 #
 # - **No data loading, no tokenizer, no HuggingFace** — pure fake data
 # - Every phase is independently runnable after Phase 0
@@ -29,6 +29,13 @@
 # | HBM capacity | 32 GB |
 # | HBM bandwidth | 1600 GB/s |
 # | Arithmetic intensity | 918e12 / 1600e9 ≈ 574 FLOPs/byte |
+#
+# > **MFU%** (Model FLOPs Utilization): `analytical_matmul_FLOPs / (peak_TFLOPS × wall_time)`.
+# > We count every matmul individually — Q/K/V projections, attention (QK^T + AV),
+# > output projection, SwiGLU gate/up/down, lm_head — then multiply by 3× for
+# > fwd+bwd. This is more accurate than the common `6·N·B·T` shorthand which
+# > misses attention FLOPs and doesn't reflect GQA savings. **MXU%** in this
+# > notebook refers to XProf hardware measurements (not computed here).
 #
 # > **HBM BW%:** shows what fraction of the 1600 GB/s peak bandwidth
 # > is utilized, computed from (bytes read+written) / wall_time.
@@ -83,19 +90,19 @@ class dot_dict(dict):
 
 def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None,
               hbm_bytes=None, label=""):
-    """Run fn repeatedly and report wall time, TFLOP/s, MXU%, HBM bandwidth%.
+    """Run fn repeatedly and report wall time, TFLOP/s, MFU%, HBM bandwidth%.
 
     Args:
         fn: callable (JIT-compiled or not — warmup handles compilation)
         *args: arguments forwarded to fn
         warmup: number of warmup calls (absorbs JIT compilation)
         repeats: number of timed calls
-        flop_count: manual FLOP count (int); None = skip MXU calculation
+        flop_count: manual FLOP count (int); None = skip MFU calculation
         hbm_bytes: total bytes read+written per call (int); None = skip BW calc
         label: display label for printing
 
     Returns:
-        dict with wall_ms, tflops, mxu_pct, hbm_bw_gbs, hbm_bw_pct
+        dict with wall_ms, tflops, mfu_pct, hbm_bw_gbs, hbm_bw_pct
     """
     # Warmup (triggers JIT + XLA compilation)
     for _ in range(warmup):
@@ -113,9 +120,9 @@ def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None,
     wall_s = sum(times) / len(times)
     wall_ms = wall_s * 1000
 
-    # FLOP/s and MXU
+    # FLOP/s and MFU
     tflops = flop_count / (wall_s * 1e12) if flop_count else 0.0
-    mxu_pct = (tflops / PEAK_TFLOPS * 100
+    mfu_pct = (tflops / PEAK_TFLOPS * 100
                if flop_count and PEAK_TFLOPS else 0.0)
 
     # HBM bandwidth utilization
@@ -123,26 +130,26 @@ def benchmark(fn, *args, warmup=3, repeats=10, flop_count=None,
     hbm_bw_pct = hbm_bw_gbs / HBM_BW_GBS * 100 if hbm_bytes else 0.0
 
     result = dict(label=label, wall_ms=wall_ms, tflops=tflops,
-                  mxu_pct=mxu_pct, hbm_bw_gbs=hbm_bw_gbs,
+                  mfu_pct=mfu_pct, hbm_bw_gbs=hbm_bw_gbs,
                   hbm_bw_pct=hbm_bw_pct)
     ALL_RESULTS.append(result)
 
     # Print single row
-    mxu_str = f"{mxu_pct:5.1f}%" if flop_count else "  n/a"
+    mfu_str = f"{mfu_pct:5.1f}%" if flop_count else "  n/a"
     tflop_str = f"{tflops:6.1f}" if flop_count else "   n/a"
     bw_str = f"{hbm_bw_pct:5.1f}%" if hbm_bytes else "  n/a"
-    print(f"  {label:<40s}  {wall_ms:8.2f} ms  {tflop_str} TFLOP/s  MXU {mxu_str}  "
+    print(f"  {label:<40s}  {wall_ms:8.2f} ms  {tflop_str} TFLOP/s  MFU {mfu_str}  "
           f"HBM BW {bw_str}")
     return result
 
 
 def print_summary(results):
     """Print a formatted comparison table from benchmark results."""
-    print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'TFLOP/s':>8s}  {'MXU %':>6s}  "
+    print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'TFLOP/s':>8s}  {'MFU %':>6s}  "
           f"{'HBM BW%':>7s}")
     print("  " + "-" * 88)
     for r in results:
-        mxu = f"{r['mxu_pct']:5.1f}%" if r['tflops'] > 0 else "  n/a"
+        mxu = f"{r['mfu_pct']:5.1f}%" if r['tflops'] > 0 else "  n/a"
         tf = f"{r['tflops']:7.1f}" if r['tflops'] > 0 else "    n/a"
         bw = f"{r['hbm_bw_pct']:5.1f}%" if r['hbm_bw_pct'] > 0 else "  n/a"
         print(f"  {r['label']:<40s}  {r['wall_ms']:8.2f}  {tf}  {mxu}  "
@@ -174,7 +181,7 @@ def attention_flops(B, N, T, H):
     """FLOPs for QK^T + AV (full T×T, not causal-halved).
 
     Counts full attention matrix. Causal kernels (e.g. splash) skip the
-    upper triangle, so actual MXU work is ~half this — meaning MXU% for
+    upper triangle, so actual MXU work is ~half this — meaning MFU% for
     attention is overestimated by ~2x.
     """
     return 2 * (2 * B * N * T * T * H)   # QK^T + AV
@@ -200,7 +207,7 @@ def layer_flops(B, T, D, N, K, H, F):
 # %% [markdown]
 # ## Phase 1 — Matmul Baseline
 #
-# Establish the MXU ceiling with pure matmuls at 256-aligned sizes.
+# Establish the MFU ceiling with pure matmuls at 256-aligned sizes.
 
 # %%
 # 1a. Square matmul — aligned sizes
@@ -258,8 +265,8 @@ print_summary(results_1c)
 # %% [markdown]
 # ## Phase 2 — Individual Transformer Components
 #
-# Isolate each building block and measure MXU independently.
-# - **RMSNorm / RoPE**: memory-bound (expect ~0% MXU)
+# Isolate each building block and measure MFU independently.
+# - **RMSNorm / RoPE**: memory-bound (expect ~0% MFU)
 # - **MLP**: compute-heavy (3 large matmuls)
 # - **Attention**: mixed (projections = compute, softmax = memory)
 
@@ -330,7 +337,7 @@ print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
       f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
 
 # %%
-# 2a. RMSNorm — pure elementwise, expect ~0% MXU
+# 2a. RMSNorm — pure elementwise, expect ~0% MFU
 print("=== RMSNorm ===")
 x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
 
@@ -341,7 +348,7 @@ def bench_rmsnorm(x):
 r_norm = benchmark(bench_rmsnorm, x, flop_count=None, label="RMSNorm")
 
 # %%
-# 2b. RoPE — elementwise multiply/concat, expect ~0% MXU
+# 2b. RoPE — elementwise multiply/concat, expect ~0% MFU
 print("=== RoPE ===")
 cos, sin = precompute_rope(cfg.seq_len, cfg.head_dim)
 cos_b = cos[None, None, :, :]
@@ -510,7 +517,7 @@ print_summary([r_norm, r_rope, r_mlp, r_attn_ein, r_attn_jax, r_attn_splash])
 # ### Ideas to try
 # - **Fused RMSNorm+Linear** as a single Pallas kernel (saves one HBM read/write roundtrip)
 # - **Remove QK-norm** from attention — saves 2 RMSNorm calls on Q and K
-# - **Vary head_dim**: try 64, 128, 256, 512 — how does per-component MXU change?
+# - **Vary head_dim**: try 64, 128, 256, 512 — how does per-component MFU change?
 # - **GQA within attention**: try n_kv_head = 1 (MQA), 2, 4 (MHA)
 
 # %% [markdown]
@@ -651,7 +658,7 @@ print_summary(results_3b)
 # %% [markdown]
 # ## Phase 4 — Stacking Layers
 #
-# Does MXU change with depth? How does HBM scale?
+# Does MFU change with depth? How does HBM scale?
 
 # %%
 # === Multi-layer model ===
@@ -710,8 +717,8 @@ for r in results_4a:
 # %% [markdown]
 # ## Phase 5 — Embedding & LM Head
 #
-# - Embedding: pure memory lookup (0% MXU)
-# - LM head: large matmul `(B*T, n_embd) @ (n_embd, vocab)` — high MXU
+# - Embedding: pure memory lookup (0% MFU)
+# - LM head: large matmul `(B*T, n_embd) @ (n_embd, vocab)` — high MFU
 # - Chunked vs non-chunked loss comparison
 
 # %%
@@ -1001,7 +1008,7 @@ print(f"  Remat overhead vs no-remat: {r_remat['wall_ms'] / max(r_fwd_bwd['wall_
 n_params = count_params(full_params)
 print(f"\n  Trainable params: {n_params:,}")
 for r in [r_fwd_bwd, r_remat]:
-    print(f"  {r['label']:<30s}  MXU {r['mxu_pct']:5.1f}%")
+    print(f"  {r['label']:<30s}  MFU {r['mfu_pct']:5.1f}%")
 
 # %% [markdown]
 # ### Ideas to try
@@ -1179,9 +1186,9 @@ print_summary(results_7f)
 # ### Ideas to try
 # - **Combined batch_size × seq_len grid** — find the throughput-maximizing combo
 # - **`n_embd` sweep**: 512, 768, 1024, 1536, 2048 (all 256-aligned)
-# - **`mlp_dim` expansion ratio**: 2x, 3x, 4x — how does MLP FLOPs fraction affect overall MXU?
+# - **`mlp_dim` expansion ratio**: 2x, 3x, 4x — how does MLP FLOPs fraction affect overall MFU?
 # - **`n_layer` vs `n_embd`**: given a fixed param budget, is it better to go deep or wide?
-# - **Tok/s vs MXU%**: these are different! MXU measures compute efficiency, tok/s measures throughput
+# - **Tok/s vs MFU%**: these are different! MFU measures compute efficiency, tok/s measures throughput
 
 # %% [markdown]
 # ## Phase 8 — Advanced Optimization Ideas
@@ -1300,7 +1307,7 @@ print_summary(results_7f)
 # - Einsum `'bhtd,bhsd->bhts'` has good locality
 #
 # The alternative `(B, T, H, D)` (common in PyTorch) requires a transpose before
-# attention, which is a pure memory operation with 0% MXU.
+# attention, which is a pure memory operation with 0% MFU.
 #
 # Our codebase avoids transposes entirely by producing Q/K/V in `(B, H, T, D)`
 # directly via `einsum('btd,dhk->bhtk', ...)` — the einsum fuses the reshape.
@@ -1358,7 +1365,7 @@ print_summary(results_7f)
 # ```
 #
 # XProf shows:
-# - MXU utilization (actual vs peak)
+# - MFU (actual vs peak)
 # - Memory timeline (stack, heap, fragmentation)
 # - Op-level breakdown (which ops are slowest)
 # - Idle gaps (input-bound vs compute-bound)
@@ -1493,11 +1500,11 @@ r_optax_bf16 = benchmark(bench_optax_bf16, optax_params_bf16, optax_state_bf16,
 # 9d. Phase 9 Summary
 print("\n=== Phase 9 Summary ===")
 phase9_results = [r_remat, r_manual, r_optax_f32, r_optax_bf16]
-print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MXU%':>6s}  {'tok/s':>10s}")
+print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MFU%':>6s}  {'tok/s':>10s}")
 print("  " + "-" * 72)
 for r in phase9_results:
     tok_s = cfg.batch_size * cfg.seq_len / (r['wall_ms'] / 1000)
-    print(f"  {r['label']:<40s}  {r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  "
+    print(f"  {r['label']:<40s}  {r['wall_ms']:8.2f}  {r['mfu_pct']:5.1f}%  "
           f"{tok_s:>10,.0f}")
 
 # Optimizer overhead vs fwd+bwd only
@@ -1575,12 +1582,12 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
 # %%
 # 10b. Phase 10 Summary
 print("\n=== Phase 10 Summary ===")
-print(f"\n  {'Label':<25s}  {'Params':>10s}  {'Wall ms':>8s}  {'MXU%':>6s}  "
+print(f"\n  {'Label':<25s}  {'Params':>10s}  {'Wall ms':>8s}  {'MFU%':>6s}  "
       f"{'tok/s':>10s}  {'20x hrs':>8s}")
 print("  " + "-" * 82)
 for r in results_10:
     print(f"  {r['label']:<25s}  {r['n_params']:>10,}  {r['wall_ms']:8.2f}  "
-          f"{r['mxu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
+          f"{r['mfu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
           f"{r['est_hours_20x']:7.1f}h")
 
 # %% [markdown]
@@ -1590,8 +1597,8 @@ for r in results_10:
 # choices matter most for ~100M non-embedding parameter models on TPU v6e.
 #
 # **Parameter counting convention (Chinchilla/Kaplan):**
-# - **Embedding** (V×D) is a pure lookup table — 0 MXU FLOPs, **not counted**
-# - **Unembedding** (D×V) is a real matmul (our biggest at ~78% MXU) — **counted**
+# - **Embedding** (V×D) is a pure lookup table — 0 matmul FLOPs, **not counted**
+# - **Unembedding** (D×V) is a real matmul (our biggest at ~78% MFU) — **counted**
 # - Non-embed params = unembed (D×V) + layer params
 # - For ~100M non-embed models at L=8, embed is 20-30% of total params
 #   (wasted budget if not tying, but tying hurts convergence)
@@ -1605,7 +1612,7 @@ sweep_configs_11 = [
     # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
     ("D768-F3328-B4",    3, 1, 256, 768,  3328, 8, 4),    # 99M non-embed baseline
     ("D1024-F3072-B2",   3, 1, 256, 1024, 3072, 8, 2),    # 126M, small batch
-    ("D1024-F3072-B4",   3, 1, 256, 1024, 3072, 8, 4),    # 126M, peak MXU
+    ("D1024-F3072-B4",   3, 1, 256, 1024, 3072, 8, 4),    # 126M, peak MFU
     ("D1024-F3072-B8",   3, 1, 256, 1024, 3072, 8, 8),    # 126M, batch scaling
     ("D1024-F3072-B16",  3, 1, 256, 1024, 3072, 8, 16),   # 126M, batch scaling
     ("D1024-F3072-B32",  3, 1, 256, 1024, 3072, 8, 32),   # 126M, large batch
@@ -1666,11 +1673,11 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
 # 11b. Phase 11 Summary
 print("\n=== Phase 11 Summary ===")
 print(f"\n  {'Label':<20s}  {'Non-embed':>10s}  {'Total':>10s}  {'Wall ms':>8s}  "
-      f"{'MXU%':>6s}  {'tok/s':>10s}  {'20x hrs':>8s}")
+      f"{'MFU%':>6s}  {'tok/s':>10s}  {'20x hrs':>8s}")
 print("  " + "-" * 92)
 for r in results_11:
     print(f"  {r['label']:<20s}  {r['n_non_embed']:>10,}  {r['n_params']:>10,}  "
-          f"{r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  "
+          f"{r['wall_ms']:8.2f}  {r['mfu_pct']:5.1f}%  "
           f"{r['tok_per_sec']:>10,.0f}  {r['est_hours_20x']:7.1f}h")
 
 # %% [markdown]
@@ -1679,8 +1686,8 @@ for r in results_11:
 # Reference: `jax-ml/scaling-book` (cloned locally in `scaling-book/`)
 #
 # **Remat FLOPs accounting** — Block remat costs ~8ND FLOPs (vs 6ND without remat)
-# because it recomputes the forward pass during backward. Our MXU% uses analytical
-# FLOP counts (3× forward for fwd+bwd) which correctly reflects actual MXU work.
+# because it recomputes the forward pass during backward. Our MFU% uses analytical
+# FLOP counts (3× forward for fwd+bwd) which correctly reflects actual compute work.
 #
 # **Arithmetic intensity roofline** — The book defines `intensity = FLOPs / bytes`.
 # For our matmul benchmarks we already compute HBM bytes — could plot a roofline
@@ -1713,10 +1720,10 @@ print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
       f"lm_chunks={cfg.num_lm_head_chunks}")
 print(f"TPU: peak={PEAK_TFLOPS} TFLOPS, HBM={HBM_GB} GB, BW={HBM_BW_GBS} GB/s")
 print()
-print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MXU%':>6s} {'BW%':>6s}")
+print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MFU%':>6s} {'BW%':>6s}")
 print("-" * 84)
 for i, r in enumerate(ALL_RESULTS):
-    mxu = f"{r['mxu_pct']:5.1f}" if r['tflops'] > 0 else "  n/a"
+    mxu = f"{r['mfu_pct']:5.1f}" if r['tflops'] > 0 else "  n/a"
     tf = f"{r['tflops']:7.1f}" if r['tflops'] > 0 else "    n/a"
     bw = f"{r['hbm_bw_pct']:5.1f}" if r['hbm_bw_pct'] > 0 else "  n/a"
     print(f"{i:<4d} {r['label']:<45s} {r['wall_ms']:8.2f} {tf} {mxu} {bw}")
