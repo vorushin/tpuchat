@@ -507,3 +507,64 @@ Features for the 08_tpu_ablations.py:
 
 Agent: Created 08_tpu_ablations.py — ablation lab for D1024 125M non-embed model (N=3, K=1, H=256, F=3072, L=8, B=4). Three ablation knobs at the top of the Model section: ATTN_IMPL (splash/einsum), MLP_TYPE (glu with SwiGLU F=3072 / plain with ReLU² F=4096), QK_NORM (on/off). Three training modes: Quick (~300 steps with XProf capture on steps 15-20, prints MFU + ideal tok/s), Sweep (wandb Bayesian LR search, ~40k steps per run), Hero (20 tok/param ≈ 308k steps, ~1.9h). Model code adapted from 05_tpu_perf.py with mlp_type branching in init_layer_params, single_layer_forward, and layer_flops. Training loop from 02_train.py pattern with chunked lm_head loss + remat. Note: D=1024 with N=3, H=256 means D ≠ N×H (the QKV projections are rectangular, mapping between d_model=1024 and head space=768).
 Agent: Fixed update_notebooks.sh — added --update flag to jupytext to preserve cell IDs across runs (eliminates noisy diffs), and added EXCLUDE list to skip local-only notebooks (06, 07).
+
+Roman:
+3 attn heads, 1 KV:
+
+Params: 159.4M total, 125.8M non-embed
+Batch: 4 x 2048 = 8,192 tokens/step
+
+=== Quick Training: 300 steps ===
+
+Step 00000 | Val loss: 10.3978
+step 00000/300 | loss: 10.3979 | dt: 21814ms | tok/s: 375
+XProf started...
+XProf stopped. Trace saved to '/content/log_dir'.
+step 00050/300 | loss: 7.6973 | dt: 38ms | tok/s: 217,651
+Step 00100 | Val loss: 7.3175
+step 00100/300 | loss: 7.2849 | dt: 38ms | tok/s: 217,224
+step 00150/300 | loss: 7.0465 | dt: 38ms | tok/s: 216,977
+Step 00200 | Val loss: 6.8297
+step 00200/300 | loss: 6.8145 | dt: 38ms | tok/s: 217,974
+step 00250/300 | loss: 6.7077 | dt: 38ms | tok/s: 214,757
+Step 00300 | Val loss: 6.6566
+
+MFU: 21.3% | tok/s: 215,960 | ideal tok/s (100% MFU): 1,013,278
+
+Params: 163.6M total, 130.0M non-embed
+Batch: 4 x 2048 = 8,192 tokens/step
+
+=== Quick Training: 300 steps ===
+
+Step 00000 | Val loss: 10.3978
+step 00000/300 | loss: 10.3979 | dt: 20085ms | tok/s: 407
+XProf started...
+XProf stopped. Trace saved to '/content/log_dir'.
+step 00050/300 | loss: 7.6917 | dt: 42ms | tok/s: 197,271
+Step 00100 | Val loss: 7.3354
+step 00100/300 | loss: 7.3000 | dt: 41ms | tok/s: 199,639
+step 00150/300 | loss: 7.0699 | dt: 41ms | tok/s: 197,489
+Step 00200 | Val loss: 6.8258
+step 00200/300 | loss: 6.8123 | dt: 41ms | tok/s: 200,956
+step 00250/300 | loss: 6.6974 | dt: 42ms | tok/s: 193,380
+Step 00300 | Val loss: 6.6444
+
+MFU: 21.2% | tok/s: 197,946 | ideal tok/s (100% MFU): 935,334
+
+## Feb 20 2026
+
+Agent: Debugged MFU discrepancy in 08_tpu_ablations.py — 22% MFU vs 37% expected from 05_tpu_perf.py Phase 11 benchmarks. Systematically tested hypotheses:
+- Data loading latency: ruled out (0.0ms via PrefetchDataLoader)
+- jax.named_scope overhead: ruled out (no impact on step time)
+- jax.checkpoint (remat): ruled out (model uses only 6.4 GiB / 31.25 GiB HBM)
+- **Root cause: manual AdamW per-leaf Python loop inside @jax.jit**. The `for p, g, s in zip(...)` loop traced 58 separate `adamw_step` calls into XLA graph. Switching to `optax.adamw()` fixed it: 36ms → 22ms/step, 22% → 37% MFU.
+
+Agent: Simplified 08_tpu_ablations.py after finding root cause:
+- Replaced chunked_lm_head_loss (custom_vjp + scan) with simple direct `lm_head_loss` — model is tiny, no HBM pressure
+- Removed `model_forward_remat` from train_step, using `model_forward` directly
+- Consolidated Config to single dataclass with defaults (removed separate module-level constants + make_config())
+- Added LR schedule via `optax.join_schedules` (warmup + constant + linear warmdown) built into the optimizer
+- Added TensorBoard/XProf viewer cell after quick training
+- Added data loading latency measurement (confirmed 0.0ms)
+
+Key lesson: optax.adamw uses `jax.tree.map` which decomposes into separate passes per operation (all mu updates, then all nu updates, etc.), giving XLA better fusion opportunities. A manual per-leaf loop interleaves all operations per parameter, creating a much harder graph to optimize. The overhead is fixed (~14ms for 58 params) but relative impact depends on model size — negligible for 168M/L=24 (Phase 9 benchmark config), catastrophic for 125M/L=8.
