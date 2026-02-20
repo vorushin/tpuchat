@@ -676,7 +676,7 @@ def train_step(config, params, opt_state, x, y, lr_mult):
 
     def loss_fn(trainable_params):
         full_params = merge_params(trainable_params, static)
-        hidden = model_forward(config, full_params, x)
+        hidden = model_forward_remat(config, full_params, x)
         return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
 
     loss, grads = jax.value_and_grad(loss_fn)(trainable)
