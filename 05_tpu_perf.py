@@ -502,7 +502,7 @@ def bench_attn_splash(x, params, cos, sin):
         T = x.shape[1]
         smask = splash_attention_mask.CausalMask(shape=(T, T))
         mh_mask = splash_attention_mask.MultiHeadMask(masks=[smask] * cfg.n_head)
-        bs = cfg.splash_block_size
+        bs = min(cfg.splash_block_size, T)
         block_sizes = splash_attention_kernel.BlockSizes(
             block_q=bs, block_kv=bs,
             block_q_dkv=bs, block_kv_dkv=bs,
@@ -620,7 +620,7 @@ def single_layer_forward(cfg, layer, x, cos, sin, *, attn_impl='splash',
     if attn_impl == 'splash':
         smask = splash_attention_mask.CausalMask(shape=(T, T))
         mh_mask = splash_attention_mask.MultiHeadMask(masks=[smask] * cfg.n_head)
-        bs = cfg.splash_block_size
+        bs = min(cfg.splash_block_size, T)
         block_sizes = splash_attention_kernel.BlockSizes(
             block_q=bs, block_kv=bs, block_q_dkv=bs, block_kv_dkv=bs,
             block_q_dq=bs, block_kv_dq=bs)
@@ -643,7 +643,7 @@ def single_layer_forward(cfg, layer, x, cos, sin, *, attn_impl='splash',
         k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
         attn_out = flash_attention(
             q, k_exp, v_exp, causal=True, sm_scale=cfg.head_dim ** -0.5,
-            block_sizes=make_flash_block_sizes(cfg.pallas_block_size))
+            block_sizes=make_flash_block_sizes(min(cfg.pallas_block_size, T)))
     else:
         k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
         attn_out = jax.nn.dot_product_attention(
