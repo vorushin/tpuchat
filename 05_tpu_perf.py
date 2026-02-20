@@ -939,13 +939,6 @@ def count_non_embed_params(params):
     return count_params(params) - params.wte.size
 
 
-def compute_mfu(num_params, batch_size, seq_len, wall_s):
-    """Model FLOPs Utilization: 6*P*B*T / (peak_flops * wall_s).
-    The factor 6 = 2 (fwd matmul) * 3 (fwd + 2x bwd)."""
-    flops = 6 * num_params * batch_size * seq_len
-    peak = PEAK_TFLOPS * 1e12
-    return flops / (peak * wall_s) * 100  # percentage
-
 
 # %%
 full_params = init_full_model(cfg)
@@ -1005,13 +998,10 @@ print_summary([r_fwd, r_fwd_bwd, r_remat])
 print(f"  Backward / Forward ratio:  {r_fwd_bwd['wall_ms'] / max(r_fwd['wall_ms'], 0.01):.2f}x")
 print(f"  Remat overhead vs no-remat: {r_remat['wall_ms'] / max(r_fwd_bwd['wall_ms'], 0.01):.2f}x")
 
-# Analytical MFU for fwd+bwd benchmarks
 n_params = count_params(full_params)
 print(f"\n  Trainable params: {n_params:,}")
 for r in [r_fwd_bwd, r_remat]:
-    mfu = compute_mfu(n_params, cfg.batch_size, cfg.seq_len, r['wall_ms'] / 1000)
-    r['mfu_pct'] = mfu
-    print(f"  {r['label']:<30s}  MXU {r['mxu_pct']:5.1f}%  MFU {mfu:5.1f}%")
+    print(f"  {r['label']:<30s}  MXU {r['mxu_pct']:5.1f}%")
 
 # %% [markdown]
 # ### Ideas to try
@@ -1439,8 +1429,6 @@ lr_mult = jnp.array(1.0, dtype=jnp.float32)
 r_manual = benchmark(bench_manual_adamw, manual_params, manual_opt_state,
                      opt_tokens, lr_mult, flop_count=bwd_flops,
                      label="Manual AdamW (full step)")
-r_manual['mfu_pct'] = compute_mfu(n_params, cfg.batch_size, cfg.seq_len,
-                                   r_manual['wall_ms'] / 1000)
 
 # %%
 # 9b. optax.adamw (f32 moments)
@@ -1470,8 +1458,6 @@ def bench_optax_f32(params, opt_state, tokens):
 r_optax_f32 = benchmark(bench_optax_f32, optax_params_f32, optax_state_f32,
                          opt_tokens, flop_count=bwd_flops,
                          label="optax.adamw f32 (full step)")
-r_optax_f32['mfu_pct'] = compute_mfu(n_params, cfg.batch_size, cfg.seq_len,
-                                      r_optax_f32['wall_ms'] / 1000)
 
 # %%
 # 9c. optax.adamw (bf16 moments — MaxText style)
@@ -1502,20 +1488,17 @@ def bench_optax_bf16(params, opt_state, tokens):
 r_optax_bf16 = benchmark(bench_optax_bf16, optax_params_bf16, optax_state_bf16,
                           opt_tokens, flop_count=bwd_flops,
                           label="optax.adamw bf16 (full step)")
-r_optax_bf16['mfu_pct'] = compute_mfu(n_params, cfg.batch_size, cfg.seq_len,
-                                       r_optax_bf16['wall_ms'] / 1000)
 
 # %%
 # 9d. Phase 9 Summary
 print("\n=== Phase 9 Summary ===")
 phase9_results = [r_remat, r_manual, r_optax_f32, r_optax_bf16]
-print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MXU%':>6s}  {'MFU%':>6s}  {'tok/s':>10s}")
-print("  " + "-" * 80)
+print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MXU%':>6s}  {'tok/s':>10s}")
+print("  " + "-" * 72)
 for r in phase9_results:
     tok_s = cfg.batch_size * cfg.seq_len / (r['wall_ms'] / 1000)
-    mfu = r.get('mfu_pct', 0.0)
     print(f"  {r['label']:<40s}  {r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  "
-          f"{mfu:5.1f}%  {tok_s:>10,.0f}")
+          f"{tok_s:>10,.0f}")
 
 # Optimizer overhead vs fwd+bwd only
 for r in [r_manual, r_optax_f32, r_optax_bf16]:
@@ -1579,7 +1562,6 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
 
     r = benchmark(bench_sweep, p_s, ostate_s, tok_s, flop_count=fl_s,
                   label=f"{label} (B={bs})")
-    r['mfu_pct'] = compute_mfu(n_p, bs, cfg_s.seq_len, r['wall_ms'] / 1000)
     r['n_params'] = n_p
     r['tok_per_sec'] = bs * cfg_s.seq_len / (r['wall_ms'] / 1000)
 
@@ -1593,12 +1575,12 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
 # %%
 # 10b. Phase 10 Summary
 print("\n=== Phase 10 Summary ===")
-print(f"\n  {'Label':<25s}  {'Params':>10s}  {'Wall ms':>8s}  {'MXU%':>6s}  {'MFU%':>6s}  "
+print(f"\n  {'Label':<25s}  {'Params':>10s}  {'Wall ms':>8s}  {'MXU%':>6s}  "
       f"{'tok/s':>10s}  {'20x hrs':>8s}")
-print("  " + "-" * 90)
+print("  " + "-" * 82)
 for r in results_10:
     print(f"  {r['label']:<25s}  {r['n_params']:>10,}  {r['wall_ms']:8.2f}  "
-          f"{r['mxu_pct']:5.1f}%  {r['mfu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
+          f"{r['mxu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
           f"{r['est_hours_20x']:7.1f}h")
 
 # %% [markdown]
@@ -1613,7 +1595,7 @@ for r in results_10:
 # - Non-embed params = unembed (D×V) + layer params
 # - For ~100M non-embed models at L=8, embed is 20-30% of total params
 #   (wasted budget if not tying, but tying hurts convergence)
-# - `N` in scaling laws = non-embedding params, `MFU = 6N·B·T / (peak · wall)`
+# - `N` in scaling laws = non-embedding params
 
 # %%
 # === Phase 11: ~100M non-embed param architecture sweep ===
@@ -1669,8 +1651,6 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
 
     r = benchmark(bench_sweep_11, p_s, ostate_s, tok_s, flop_count=fl_s,
                   label=f"{label} (B={bs})")
-    # MFU using non-embed params (matches 6N convention)
-    r['mfu_pct'] = compute_mfu(n_ne, bs, cfg_s.seq_len, r['wall_ms'] / 1000)
     r['n_params'] = n_p
     r['n_non_embed'] = n_ne
     r['tok_per_sec'] = bs * cfg_s.seq_len / (r['wall_ms'] / 1000)
@@ -1686,11 +1666,11 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
 # 11b. Phase 11 Summary
 print("\n=== Phase 11 Summary ===")
 print(f"\n  {'Label':<20s}  {'Non-embed':>10s}  {'Total':>10s}  {'Wall ms':>8s}  "
-      f"{'MXU%':>6s}  {'MFU%':>6s}  {'tok/s':>10s}  {'20x hrs':>8s}")
-print("  " + "-" * 100)
+      f"{'MXU%':>6s}  {'tok/s':>10s}  {'20x hrs':>8s}")
+print("  " + "-" * 92)
 for r in results_11:
     print(f"  {r['label']:<20s}  {r['n_non_embed']:>10,}  {r['n_params']:>10,}  "
-          f"{r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  {r['mfu_pct']:5.1f}%  "
+          f"{r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  "
           f"{r['tok_per_sec']:>10,.0f}  {r['est_hours_20x']:7.1f}h")
 
 # %% [markdown]
@@ -1699,9 +1679,8 @@ for r in results_11:
 # Reference: `jax-ml/scaling-book` (cloned locally in `scaling-book/`)
 #
 # **Remat FLOPs accounting** — Block remat costs ~8ND FLOPs (vs 6ND without remat)
-# because it recomputes the forward pass during backward. Our `compute_mfu` uses
-# `6 * P * B * T` which is slightly optimistic for remat benchmarks. Could add a
-# `compute_hfu` (hardware FLOPs utilization) that uses 8ND for remat runs.
+# because it recomputes the forward pass during backward. Our MXU% uses analytical
+# FLOP counts (3× forward for fwd+bwd) which correctly reflects actual MXU work.
 #
 # **Arithmetic intensity roofline** — The book defines `intensity = FLOPs / bytes`.
 # For our matmul benchmarks we already compute HBM bytes — could plot a roofline
@@ -1734,14 +1713,13 @@ print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
       f"lm_chunks={cfg.num_lm_head_chunks}")
 print(f"TPU: peak={PEAK_TFLOPS} TFLOPS, HBM={HBM_GB} GB, BW={HBM_BW_GBS} GB/s")
 print()
-print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MXU%':>6s} {'MFU%':>6s} {'BW%':>6s}")
-print("-" * 90)
+print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MXU%':>6s} {'BW%':>6s}")
+print("-" * 84)
 for i, r in enumerate(ALL_RESULTS):
     mxu = f"{r['mxu_pct']:5.1f}" if r['tflops'] > 0 else "  n/a"
     tf = f"{r['tflops']:7.1f}" if r['tflops'] > 0 else "    n/a"
     bw = f"{r['hbm_bw_pct']:5.1f}" if r['hbm_bw_pct'] > 0 else "  n/a"
-    mfu = f"{r['mfu_pct']:5.1f}" if r.get('mfu_pct', 0) > 0 else "  n/a"
-    print(f"{i:<4d} {r['label']:<45s} {r['wall_ms']:8.2f} {tf} {mxu} {mfu} {bw}")
+    print(f"{i:<4d} {r['label']:<45s} {r['wall_ms']:8.2f} {tf} {mxu} {bw}")
 print()
 print(f"Total benchmarks: {len(ALL_RESULTS)}")
 print("=" * 90)
