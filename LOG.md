@@ -472,7 +472,38 @@ Agent: Added chunked lm_head loss to 04_maxtext.py (commit 456233e). Factored fi
 ## Feb 19 2026
 Agent: Fixed 05_tpu_perf.py benchmark harness — two issues. (1) MXU was over 100% because PEAK_TFLOPS was hardcoded to 197 (wrong estimate). Updated to 918 TFLOPS from official v6e docs (https://docs.cloud.google.com/tpu/docs/v6e). (2) HBM reporting showed bytes_in_use (capacity) instead of bandwidth utilization. Replaced with HBM BW% = (bytes read+written) / wall_time / 1600 GB/s × 100. Added hbm_bytes parameter to benchmark(). Phase 1 matmuls now report both MXU% and HBM BW%. The 8192×8192 matmul at ~622 TFLOP/s should now show ~68% MXU instead of 316%.
 
+Roman: The 05_tpu_perf notebook is very helpful - I see we can reach ~45 MXU utilization for the full forward+backward passes. Getting more requires using Pallas kernels.
+
 ## Feb 20 2026
+Roman: Checking how much one can train on a modern macbook with M4 Pro 48 Gb unified memory. Flops and memory bandwidth are abismal compared to a single TPU v6e.
+
+Plans:
+1. For 05_tpu_perf -> store all outputs in a way that I can copy/paste all of them and feed into Claude Code for analysis.
+2. Get a maximally efficient TPU config for a ~100M param model. My math is that to train it on 20 tokens/param we need 1333 seconds with MXU 100% -> around an hour with a more realistic MFU/MXU usage. We don't write our own Pallas kernels for now, only use existing. Dig maxtext more as needed. Let's check that the manual AdamW we use in 02_train.py isn't slowing us down - let's see what maxtext codebase is suggesting to use instead.
+3. Don't only run XProf, also time the runs and compute the analyticals MXU usage / MFU. Because I couldn't get > 27% MXU usage on XProf, maybe the TPUs are a bit slower during profiling.
+4. Examine the best model in XProf. If no obvious issues, run hparam search on it using wanbd ans in 03_worker.py.
+5. When it's ready, try a few modeling changes and measure the compute efficiency of them.
+
+When the above is done, we can start writing a blog post. The M4 Pro/MLX training will be a side note. The Pallas insights (if any) will be side notes as well.
+
 Agent: Created 06_apple_silicon_perf.py — comprehensive performance benchmark lab for Apple M4 Pro (48 GB, 20 GPU cores, ~17.2 bf16 TFLOPS, 273 GB/s bandwidth). 8 phases: matmul sweeps, individual transformer components (RMSNorm, RoPE, SwiGLU MLP, attention), single layer, depth sweep, embedding + LM head, forward vs forward+backward, optimization experiments (batch size, seq len, head dim, GQA ratio, attention impl), and advanced topics (custom Metal kernels, quantization, mx.compile, gradient accumulation, mixed precision, memory layout, Metal GPU capture). Key findings: peak matmul 7.5 TFLOP/s (43.6% GPU) at 8192x8192, full model fwd+bwd 4.4 TFLOP/s (25.6% GPU), SDPA ~2x faster than einsum, larger head_dim = better GPU%, mx.fast.rope 2.3x speedup, mx.fast.rms_norm 1.2x speedup, remat overhead 1.17x. M4 Pro is bandwidth-limited (63 FLOPs/byte vs TPU v6e's 574).
 
 Agent: Created 07_train_mlx.py — ~99M param transformer training on Apple M4 Pro with MLX. Architecture chosen from 06 benchmarks: E=768, L=8, D=128, H=6, KV=1, MLP=2048 (SwiGLU). Wider-shallower design (vs E=512, L=22 at same param count) because bigger matmuls → higher GPU% and fewer layers = less bandwidth overhead. Full training pipeline: tokenizer + 52 FineWeb-Edu shards download, BOS-aligned packing data loader with background prefetch thread, model with mx.fast.rms_norm/rope/SDPA + remat, MLX built-in AdamW optimizer with join_schedules (warmup+constant+warmdown) + clip_grad_norm, chunked LM head loss with softcap, eval/generation/checkpointing. Target: 1B tokens (~61K steps). Verified: initial loss 10.40 (= ln(32768)), loss drops to 8.50 by step 100, ~7K tok/s, 9 GB peak memory, ~39.5h ETA.
+
+Roman: 
+We checked that the custom AdamW implementation isn't slower than the one from optax and run multiple model variants in section 11 of 05_tpu_perf.py
+
+We selected the following 125M non-ebmed params from 05_tpu_perf: (--- D1024-F3072-B4: D=1024, N=3, K=1, H=256, F=3072, L=8, B=4 ---
+  Total params: 159,383,552  Non-embed params: 125,829,120
+  D1024-F3072-B4 (B=4)                         21.97 ms   337.8 TFLOP/s  MXU  36.8%  HBM BW   n/a)
+Now prepare a new notebook for ablations based on this variant.
+Features for the 08_tpu_ablations.py:
+
+1. All the utils are in a collapsed group of blocks (to save the screen space).
+2. The main transformer part and the config are nicely visible and readable. The config only has the knobs we actually plan to change. Everything else should be in some set of constants, maybe near it (think more about it - the idea is to not overwhelm the user).
+2.1. Architecture knobs we want to have: attention einsum vs splash (and not other variants), GLU (F=3*H) vs a normal (F=4*H, no gating) MLPs, QK_norm on/off.
+3. Main modes: quick training similar to 02_train.py, hparam search similar to 03_worker (can be for less than 20 tokens per param, something where a single run finishes in 15-20 minutes), hero run where we use the whole 20 tokens per param. Double check we load enough data for the hero run.
+4. Have XProf in the quick training mode, similar to 02_train.py. Print the computed MFU in that mode as well. We can also output the expected ideal tok/s (MFU 100%).
+
+Agent: Created 08_tpu_ablations.py — ablation lab for D1024 125M non-embed model (N=3, K=1, H=256, F=3072, L=8, B=4). Three ablation knobs at the top of the Model section: ATTN_IMPL (splash/einsum), MLP_TYPE (glu with SwiGLU F=3072 / plain with ReLU² F=4096), QK_NORM (on/off). Three training modes: Quick (~300 steps with XProf capture on steps 15-20, prints MFU + ideal tok/s), Sweep (wandb Bayesian LR search, ~40k steps per run), Hero (20 tok/param ≈ 308k steps, ~1.9h). Model code adapted from 05_tpu_perf.py with mlp_type branching in init_layer_params, single_layer_forward, and layer_flops. Training loop from 02_train.py pattern with chunked lm_head loss + remat. Note: D=1024 with N=3, H=256 means D ≠ N×H (the QKV projections are rectangular, mapping between d_model=1024 and head space=768).
+Agent: Fixed update_notebooks.sh — added --update flag to jupytext to preserve cell IDs across runs (eliminates noisy diffs), and added EXCLUDE list to skip local-only notebooks (06, 07).
