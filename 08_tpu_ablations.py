@@ -680,7 +680,7 @@ def train_step(config, params, opt_state, x, y, lr_mult):
 
     def loss_fn(trainable_params):
         full_params = merge_params(trainable_params, static)
-        hidden = model_forward_remat(config, full_params, x)
+        hidden = model_forward(config, full_params, x)
         return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
 
     with jax.named_scope('forward_backward'):
@@ -818,8 +818,11 @@ for step in range(NUM_QUICK_STEPS + 1):
     # --- Train step ---
     lr_mult = jnp.array(get_lr_multiplier(step, NUM_QUICK_STEPS, config),
                          dtype=jnp.float32)
-    t0 = time.time()
+    t_data = time.time()
     x_batch, y_batch = next(train_loader)
+    dt_data = time.time() - t_data
+
+    t0 = time.time()
     loss, params, opt_state = train_step(config, params, opt_state,
                                           x_batch, y_batch, lr_mult)
     loss.block_until_ready()
@@ -836,7 +839,8 @@ for step in range(NUM_QUICK_STEPS + 1):
     if step % 50 == 0:
         tok_per_sec = int(config.batch_size * config.seq_len / dt) if dt > 0 else 0
         print(f'step {step:05d}/{NUM_QUICK_STEPS} | loss: {debiased_loss:.4f} '
-              f'| dt: {dt*1000:.0f}ms | tok/s: {tok_per_sec:,}')
+              f'| dt: {dt*1000:.0f}ms | data: {dt_data*1000:.1f}ms '
+              f'| tok/s: {tok_per_sec:,}')
 
 train_loader.stop()
 
@@ -854,6 +858,15 @@ print('\n--- Samples ---')
 for prompt in ['The capital of France is', 'Machine learning is']:
     text = generate(config, params, prompt, max_new_tokens=64)
     print(f'Prompt: {prompt}\nOutput: {text}\n')
+
+# %%
+# === View Profiling Results ===
+# Run this cell to load TensorBoard and view the trace captured in steps 15-20.
+# - If you see large gaps between "Device Execution", you are INPUT BOUND.
+# - If "Device Execution" blocks are packed tightly, you are COMPUTE BOUND (good!).
+
+%load_ext tensorboard
+%tensorboard --logdir /content/log_dir
 
 # %% [markdown]
 # ## Sweep (wandb)
