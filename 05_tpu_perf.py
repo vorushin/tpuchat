@@ -870,6 +870,76 @@ def model_forward_remat(cfg, params, tokens):
     return rms_norm(x)
 
 
+# %%
+# === Utilities for optimizer benchmarks ===
+
+def split_trainable(params):
+    """Split params into trainable and static (non-differentiable).
+    From 02_train.py — rope_cos/rope_sin are precomputed, not trained."""
+    trainable = dot_dict()
+    static = dot_dict()
+    for k, v in params.items():
+        if k in ('rope_cos', 'rope_sin'):
+            static[k] = v
+        else:
+            trainable[k] = v
+    return trainable, static
+
+
+def merge_params(trainable, static):
+    """Merge trainable and static params back together."""
+    merged = dot_dict()
+    merged.update(trainable)
+    merged.update(static)
+    return merged
+
+
+def init_adam_state(param):
+    """Initialize Adam optimizer state for a single parameter."""
+    return dot_dict(
+        mu=jnp.zeros_like(param),
+        nu=jnp.zeros_like(param),
+        count=jnp.array(0, dtype=jnp.int32),
+    )
+
+
+def adamw_step(lr, beta1, beta2, eps, wd, lr_mult, param, grad, state):
+    """AdamW update with explicit hyperparams. Returns (new_param, new_state).
+    Note: weight_decay applied only to 2D+ params (matching 02_train.py).
+    optax applies weight_decay uniformly — minor semantic difference on bias/scalar params."""
+    new_count = state.count + 1
+    new_mu = beta1 * state.mu + (1 - beta1) * grad
+    new_nu = beta2 * state.nu + (1 - beta2) * grad ** 2
+
+    mu_hat = new_mu / (1 - beta1 ** new_count)
+    nu_hat = new_nu / (1 - beta2 ** new_count)
+
+    lr_eff = lr * lr_mult
+    update = mu_hat / (jnp.sqrt(nu_hat) + eps)
+
+    # Weight decay for 2D+ params only (matches 02_train.py)
+    wd_eff = jnp.where(param.ndim >= 2, wd, 0.0)
+    new_param = param - lr_eff * (update + wd_eff * param)
+
+    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
+    return new_param, new_state
+
+
+def count_params(params):
+    """Count total trainable parameters (excludes rope_cos/rope_sin)."""
+    trainable, _ = split_trainable(params)
+    return sum(p.size for p in jax.tree.leaves(trainable) if isinstance(p, jax.Array))
+
+
+def compute_mfu(num_params, batch_size, seq_len, wall_s):
+    """Model FLOPs Utilization: 6*P*B*T / (peak_flops * wall_s).
+    The factor 6 = 2 (fwd matmul) * 3 (fwd + 2x bwd)."""
+    flops = 6 * num_params * batch_size * seq_len
+    peak = PEAK_TFLOPS * 1e12
+    return flops / (peak * wall_s) * 100  # percentage
+
+
+# %%
 full_params = init_full_model(cfg)
 tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
 labels = fake_tokens(cfg.batch_size, cfg.seq_len)
@@ -926,6 +996,14 @@ print("\n=== Phase 6 Summary ===")
 print_summary([r_fwd, r_fwd_bwd, r_remat])
 print(f"  Backward / Forward ratio:  {r_fwd_bwd['wall_ms'] / max(r_fwd['wall_ms'], 0.01):.2f}x")
 print(f"  Remat overhead vs no-remat: {r_remat['wall_ms'] / max(r_fwd_bwd['wall_ms'], 0.01):.2f}x")
+
+# Analytical MFU for fwd+bwd benchmarks
+n_params = count_params(full_params)
+print(f"\n  Trainable params: {n_params:,}")
+for r in [r_fwd_bwd, r_remat]:
+    mfu = compute_mfu(n_params, cfg.batch_size, cfg.seq_len, r['wall_ms'] / 1000)
+    r['mfu_pct'] = mfu
+    print(f"  {r['label']:<30s}  MXU {r['mxu_pct']:5.1f}%  MFU {mfu:5.1f}%")
 
 # %% [markdown]
 # ### Ideas to try
@@ -1287,6 +1365,234 @@ print_summary(results_7f)
 # - Op-level breakdown (which ops are slowest)
 # - Idle gaps (input-bound vs compute-bound)
 
+# %% [markdown]
+# ## Phase 9 — Optimizer Step Benchmarks
+#
+# Measure full train step (fwd + bwd with remat + optimizer update).
+# Compare manual AdamW (matching 02_train.py) vs optax.adamw variants.
+
+# %%
+# === Phase 9: Optimizer step benchmarks ===
+print("=== Phase 9: Optimizer Step Benchmarks ===")
+print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, L={cfg.n_layer}")
+
+n_params = count_params(full_params)
+print(f"Trainable params: {n_params:,}")
+
+# Shared: tokens and labels for all optimizer benchmarks
+opt_tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
+opt_labels = fake_tokens(cfg.batch_size, cfg.seq_len)
+
+# Optimizer hyperparams (matching 02_train.py defaults)
+OPT_LR = 3e-4
+OPT_BETA1 = 0.9
+OPT_BETA2 = 0.95
+OPT_EPS = 1e-8
+OPT_WD = 0.1
+
+# %%
+# 9a. Manual AdamW (per-leaf loop, matching 02_train.py)
+print("\n--- 9a. Manual AdamW ---")
+
+manual_params = init_full_model(cfg)
+manual_trainable, manual_static = split_trainable(manual_params)
+manual_opt_state = jax.tree.map(init_adam_state, manual_trainable)
+
+@jax.jit
+def bench_manual_adamw(params, opt_state, tokens, lr_mult):
+    trainable, static = split_trainable(params)
+
+    def loss_fn(t):
+        full = merge_params(t, static)
+        hidden = model_forward_remat(cfg, full, tokens)
+        return chunked_lm_head_loss(hidden, full.lm_head, opt_labels, cfg)
+
+    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+
+    # Per-leaf AdamW update (matching 02_train.py pattern)
+    is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
+    t_leaves, t_treedef = jax.tree.flatten(trainable)
+    g_leaves, _ = jax.tree.flatten(grads)
+    o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
+
+    new_t_leaves, new_o_leaves = [], []
+    for p, g, s in zip(t_leaves, g_leaves, o_leaves):
+        new_p, new_s = adamw_step(OPT_LR, OPT_BETA1, OPT_BETA2, OPT_EPS,
+                                   OPT_WD, lr_mult, p, g, s)
+        new_t_leaves.append(new_p)
+        new_o_leaves.append(new_s)
+
+    new_trainable = t_treedef.unflatten(new_t_leaves)
+    new_opt_state = o_treedef.unflatten(new_o_leaves)
+    new_params = merge_params(new_trainable, static)
+    return loss, new_params, new_opt_state
+
+lr_mult = jnp.array(1.0, dtype=jnp.float32)
+r_manual = benchmark(bench_manual_adamw, manual_params, manual_opt_state,
+                     opt_tokens, lr_mult, flop_count=bwd_flops,
+                     label="Manual AdamW (full step)")
+r_manual['mfu_pct'] = compute_mfu(n_params, cfg.batch_size, cfg.seq_len,
+                                   r_manual['wall_ms'] / 1000)
+
+# %%
+# 9b. optax.adamw (f32 moments)
+print("\n--- 9b. optax.adamw (f32 mu) ---")
+
+optax_params_f32 = init_full_model(cfg)
+optax_trainable_f32, optax_static_f32 = split_trainable(optax_params_f32)
+schedule_f32 = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
+                            eps=OPT_EPS, weight_decay=OPT_WD)
+optax_state_f32 = schedule_f32.init(optax_trainable_f32)
+
+@jax.jit
+def bench_optax_f32(params, opt_state, tokens):
+    trainable, static = split_trainable(params)
+
+    def loss_fn(t):
+        full = merge_params(t, static)
+        hidden = model_forward_remat(cfg, full, tokens)
+        return chunked_lm_head_loss(hidden, full.lm_head, opt_labels, cfg)
+
+    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    updates, new_opt_state = schedule_f32.update(grads, opt_state, trainable)
+    new_trainable = optax.apply_updates(trainable, updates)
+    new_params = merge_params(new_trainable, static)
+    return loss, new_params, new_opt_state
+
+r_optax_f32 = benchmark(bench_optax_f32, optax_params_f32, optax_state_f32,
+                         opt_tokens, flop_count=bwd_flops,
+                         label="optax.adamw f32 (full step)")
+r_optax_f32['mfu_pct'] = compute_mfu(n_params, cfg.batch_size, cfg.seq_len,
+                                      r_optax_f32['wall_ms'] / 1000)
+
+# %%
+# 9c. optax.adamw (bf16 moments — MaxText style)
+print("\n--- 9c. optax.adamw (bf16 mu) ---")
+
+optax_params_bf16 = init_full_model(cfg)
+optax_trainable_bf16, optax_static_bf16 = split_trainable(optax_params_bf16)
+schedule_bf16 = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
+                             eps=OPT_EPS, weight_decay=OPT_WD,
+                             mu_dtype=jnp.bfloat16)
+optax_state_bf16 = schedule_bf16.init(optax_trainable_bf16)
+
+@jax.jit
+def bench_optax_bf16(params, opt_state, tokens):
+    trainable, static = split_trainable(params)
+
+    def loss_fn(t):
+        full = merge_params(t, static)
+        hidden = model_forward_remat(cfg, full, tokens)
+        return chunked_lm_head_loss(hidden, full.lm_head, opt_labels, cfg)
+
+    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    updates, new_opt_state = schedule_bf16.update(grads, opt_state, trainable)
+    new_trainable = optax.apply_updates(trainable, updates)
+    new_params = merge_params(new_trainable, static)
+    return loss, new_params, new_opt_state
+
+r_optax_bf16 = benchmark(bench_optax_bf16, optax_params_bf16, optax_state_bf16,
+                          opt_tokens, flop_count=bwd_flops,
+                          label="optax.adamw bf16 (full step)")
+r_optax_bf16['mfu_pct'] = compute_mfu(n_params, cfg.batch_size, cfg.seq_len,
+                                       r_optax_bf16['wall_ms'] / 1000)
+
+# %%
+# 9d. Phase 9 Summary
+print("\n=== Phase 9 Summary ===")
+phase9_results = [r_remat, r_manual, r_optax_f32, r_optax_bf16]
+print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MXU%':>6s}  {'MFU%':>6s}  {'tok/s':>10s}")
+print("  " + "-" * 80)
+for r in phase9_results:
+    tok_s = cfg.batch_size * cfg.seq_len / (r['wall_ms'] / 1000)
+    mfu = r.get('mfu_pct', 0.0)
+    print(f"  {r['label']:<40s}  {r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  "
+          f"{mfu:5.1f}%  {tok_s:>10,.0f}")
+
+# Optimizer overhead vs fwd+bwd only
+for r in [r_manual, r_optax_f32, r_optax_bf16]:
+    overhead = r['wall_ms'] - r_remat['wall_ms']
+    pct = overhead / r_remat['wall_ms'] * 100
+    print(f"  {r['label']:<40s}  optimizer overhead: {overhead:+.2f} ms ({pct:+.1f}%)")
+
+# %% [markdown]
+# ## Phase 10 — ~100M Param Config Sweep
+#
+# Full train step (fwd+bwd+remat+optimizer) for configs targeting ~100M params.
+# Uses batch_size=16 (smaller model → more batch fits in HBM).
+
+# %%
+# === Phase 10: ~100M param config sweep ===
+print("=== Phase 10: ~100M Param Config Sweep ===")
+
+sweep_configs = [
+    # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
+    ("E768 H3 L8",   3, 1, 256, 768,  2048, 8,  16),
+    ("E512 H2 L16",  2, 1, 256, 512,  1536, 16, 16),
+    ("E512 H2 L24",  2, 1, 256, 512,  1536, 24, 16),
+]
+
+results_10 = []
+for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
+    print(f"\n--- {label}: E={ne}, H={nh}, KV={nkv}, D={hd}, MLP={mlp}, L={nl}, B={bs} ---")
+    cfg_s = PerfConfig(batch_size=bs, n_head=nh, n_kv_head=nkv, head_dim=hd,
+                       n_embd=ne, mlp_dim=mlp, n_layer=nl)
+    p_s = init_full_model(cfg_s)
+    n_p = count_params(p_s)
+    print(f"  Trainable params: {n_p:,}")
+
+    tok_s = fake_tokens(bs, cfg_s.seq_len)
+    lab_s = fake_tokens(bs, cfg_s.seq_len)
+
+    # Use optax.adamw f32 (likely best from Phase 9)
+    tr_s, st_s = split_trainable(p_s)
+    sched_s = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
+                           eps=OPT_EPS, weight_decay=OPT_WD)
+    ostate_s = sched_s.init(tr_s)
+
+    fl_s = 3 * (cfg_s.n_layer * layer_flops(bs, cfg_s.seq_len, cfg_s.n_embd,
+                cfg_s.n_head, cfg_s.n_kv_head, cfg_s.head_dim, cfg_s.mlp_dim) +
+                matmul_flops(bs * cfg_s.seq_len, cfg_s.padded_vocab, cfg_s.n_embd))
+
+    @jax.jit
+    def bench_sweep(params, opt_state, tokens, _cfg=cfg_s, _sched=sched_s, _lab=lab_s):
+        trainable, static = split_trainable(params)
+
+        def loss_fn(t):
+            full = merge_params(t, static)
+            hidden = model_forward_remat(_cfg, full, tokens)
+            return chunked_lm_head_loss(hidden, full.lm_head, _lab, _cfg)
+
+        loss, grads = jax.value_and_grad(loss_fn)(trainable)
+        updates, new_opt_state = _sched.update(grads, opt_state, trainable)
+        new_trainable = optax.apply_updates(trainable, updates)
+        new_params = merge_params(new_trainable, static)
+        return loss, new_params, new_opt_state
+
+    r = benchmark(bench_sweep, p_s, ostate_s, tok_s, flop_count=fl_s,
+                  label=f"{label} (B={bs})")
+    r['mfu_pct'] = compute_mfu(n_p, bs, cfg_s.seq_len, r['wall_ms'] / 1000)
+    r['n_params'] = n_p
+    r['tok_per_sec'] = bs * cfg_s.seq_len / (r['wall_ms'] / 1000)
+
+    # Estimated wall time for 20 tokens/param training run
+    total_tokens = 20 * n_p
+    total_steps = total_tokens / (bs * cfg_s.seq_len)
+    est_hours = total_steps * (r['wall_ms'] / 1000) / 3600
+    r['est_hours_20x'] = est_hours
+    results_10.append(r)
+
+# %%
+# 10b. Phase 10 Summary
+print("\n=== Phase 10 Summary ===")
+print(f"\n  {'Label':<25s}  {'Params':>10s}  {'Wall ms':>8s}  {'MXU%':>6s}  {'MFU%':>6s}  "
+      f"{'tok/s':>10s}  {'20x hrs':>8s}")
+print("  " + "-" * 90)
+for r in results_10:
+    print(f"  {r['label']:<25s}  {r['n_params']:>10,}  {r['wall_ms']:8.2f}  "
+          f"{r['mxu_pct']:5.1f}%  {r['mfu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
+          f"{r['est_hours_20x']:7.1f}h")
+
 # %%
 # === All outputs — copy/paste this cell's output into Claude Code ===
 print("=" * 90)
@@ -1300,13 +1606,14 @@ print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, "
       f"lm_chunks={cfg.num_lm_head_chunks}")
 print(f"TPU: peak={PEAK_TFLOPS} TFLOPS, HBM={HBM_GB} GB, BW={HBM_BW_GBS} GB/s")
 print()
-print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MXU%':>6s} {'BW%':>6s}")
-print("-" * 82)
+print(f"{'#':<4s} {'Label':<45s} {'Wall ms':>8s} {'TFLOP/s':>8s} {'MXU%':>6s} {'MFU%':>6s} {'BW%':>6s}")
+print("-" * 90)
 for i, r in enumerate(ALL_RESULTS):
     mxu = f"{r['mxu_pct']:5.1f}" if r['tflops'] > 0 else "  n/a"
     tf = f"{r['tflops']:7.1f}" if r['tflops'] > 0 else "    n/a"
     bw = f"{r['hbm_bw_pct']:5.1f}" if r['hbm_bw_pct'] > 0 else "  n/a"
-    print(f"{i:<4d} {r['label']:<45s} {r['wall_ms']:8.2f} {tf} {mxu} {bw}")
+    mfu = f"{r['mfu_pct']:5.1f}" if r.get('mfu_pct', 0) > 0 else "  n/a"
+    print(f"{i:<4d} {r['label']:<45s} {r['wall_ms']:8.2f} {tf} {mxu} {mfu} {bw}")
 print()
 print(f"Total benchmarks: {len(ALL_RESULTS)}")
 print("=" * 90)
