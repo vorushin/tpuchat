@@ -716,7 +716,8 @@ fwd_flops = (config.n_layer * layer_flops(
 step_flops = 3 * fwd_flops  # fwd + 2x bwd
 
 smooth_loss = 0.0
-step_times = []
+mfu_t0 = None
+mfu_tokens = 0
 report_t0 = time.time()
 report_tokens = 0
 
@@ -760,7 +761,9 @@ for step in range(NUM_QUICK_STEPS + 1):
     dt = time.time() - t0
 
     if step > XPROF_END:
-        step_times.append(dt)
+        if mfu_t0 is None:
+            mfu_t0 = time.time()
+        mfu_tokens += config.batch_size * config.seq_len
     report_tokens += config.batch_size * config.seq_len
 
     loss_val = float(loss)
@@ -778,12 +781,13 @@ for step in range(NUM_QUICK_STEPS + 1):
 
 train_loader.stop()
 
-# --- MFU report ---
-if step_times:
-    avg_dt = sum(step_times) / len(step_times)
-    mfu_pct = step_flops / (PEAK_TFLOPS * 1e12 * avg_dt) * 100
-    tok_per_s = int(config.batch_size * config.seq_len / avg_dt)
-    ideal_tok_s = PEAK_TFLOPS * 1e12 / (step_flops / (config.batch_size * config.seq_len))
+# --- MFU report (wall clock, steps 21-300) ---
+if mfu_t0 is not None:
+    mfu_wall = time.time() - mfu_t0
+    tok_per_s = int(mfu_tokens / mfu_wall)
+    flops_per_tok = step_flops / (config.batch_size * config.seq_len)
+    mfu_pct = (tok_per_s * flops_per_tok) / (PEAK_TFLOPS * 1e12) * 100
+    ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
     print(f'\nMFU: {mfu_pct:.1f}% | tok/s: {tok_per_s:,} | '
           f'ideal tok/s (100% MFU): {int(ideal_tok_s):,}')
 
