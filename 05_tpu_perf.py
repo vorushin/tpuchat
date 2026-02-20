@@ -1037,7 +1037,7 @@ for r in results_7a:
 print("\n=== Sequence length sweep ===")
 results_7b = []
 
-for sl in [512, 1024, 2048]:
+for sl in [1024, 2048]:
     cfg_sl = PerfConfig(seq_len=sl)
     p = init_full_model(cfg_sl)
     tok = fake_tokens(cfg_sl.batch_size, sl)
