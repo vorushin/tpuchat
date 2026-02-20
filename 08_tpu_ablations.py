@@ -740,7 +740,8 @@ for step in range(NUM_QUICK_STEPS + 1):
             val_losses.append(float(vl))
         avg_val_loss = sum(val_losses) / len(val_losses)
         eval_dt = time.time() - eval_t0
-        mfu_eval_time += eval_dt
+        if mfu_t0 is not None:
+            mfu_eval_time += eval_dt
         report_eval_time += eval_dt
         print(f'Step {step:05d} | Val loss: {avg_val_loss:.4f}')
 
