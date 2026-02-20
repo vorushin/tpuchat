@@ -718,8 +718,10 @@ step_flops = 3 * fwd_flops  # fwd + 2x bwd
 smooth_loss = 0.0
 mfu_t0 = None
 mfu_tokens = 0
+mfu_eval_time = 0.0
 report_t0 = time.time()
 report_tokens = 0
+report_eval_time = 0.0
 
 print(f'\n=== Quick Training: {NUM_QUICK_STEPS} steps ===\n')
 
@@ -728,6 +730,7 @@ for step in range(NUM_QUICK_STEPS + 1):
 
     # --- Eval ---
     if step % EVAL_EVERY == 0 or last_step:
+        eval_t0 = time.time()
         val_loader = val_loader_fn()
         val_losses = []
         for ei in range(config.eval_steps):
@@ -736,6 +739,9 @@ for step in range(NUM_QUICK_STEPS + 1):
             vl = eval_step(config, params, vx, vy)
             val_losses.append(float(vl))
         avg_val_loss = sum(val_losses) / len(val_losses)
+        eval_dt = time.time() - eval_t0
+        mfu_eval_time += eval_dt
+        report_eval_time += eval_dt
         print(f'Step {step:05d} | Val loss: {avg_val_loss:.4f}')
 
     if last_step:
@@ -772,18 +778,19 @@ for step in range(NUM_QUICK_STEPS + 1):
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
 
     if step % 50 == 0:
-        report_wall = time.time() - report_t0
+        report_wall = time.time() - report_t0 - report_eval_time
         tok_per_sec = int(report_tokens / report_wall) if report_wall > 0 else 0
         print(f'step {step:05d}/{NUM_QUICK_STEPS} | loss: {debiased_loss:.4f} '
               f'| tok/s: {tok_per_sec:,}')
         report_t0 = time.time()
         report_tokens = 0
+        report_eval_time = 0.0
 
 train_loader.stop()
 
-# --- MFU report (wall clock, steps 21-300) ---
+# --- MFU report (wall clock excl. eval, steps 21-300) ---
 if mfu_t0 is not None:
-    mfu_wall = time.time() - mfu_t0
+    mfu_wall = time.time() - mfu_t0 - mfu_eval_time
     tok_per_s = int(mfu_tokens / mfu_wall)
     flops_per_tok = step_flops / (config.batch_size * config.seq_len)
     mfu_pct = (tok_per_s * flops_per_tok) / (PEAK_TFLOPS * 1e12) * 100
