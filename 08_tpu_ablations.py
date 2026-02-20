@@ -371,58 +371,40 @@ def count_non_embed_params(params):
 # ## Model
 
 # %%
-# === Ablation knobs + fixed constants + Config ===
-
-# ── Ablation knobs ─────────────────────────────────────────────
-ATTN_IMPL = 'splash'    # 'splash' | 'einsum'
-MLP_TYPE  = 'glu'       # 'glu' (SwiGLU, F=3D=3072) | 'plain' (ReLU², F=4D=4096)
-QK_NORM   = True         # QK-norm on queries and keys
-
-# ── Fixed architecture (D1024, 125M non-embed) ────────────────
-D, L, T, V = 1024, 8, 2048, 32768
-N_HEAD, N_KV_HEAD, HEAD_DIM = 3, 1, 256
-F_GLU, F_PLAIN = 3072, 4096     # MLP width depends on MLP_TYPE
-SOFTCAP = 15.0
-SPLASH_BS = 1024
-BATCH_SIZE = 4
-
-# ── Training defaults ─────────────────────────────────────────
-LR = 3e-4
-BETA1, BETA2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
-WARMUP_RATIO, WARMDOWN_RATIO = 0.02, 0.5
-NUM_SHARDS = 50
-
+# === Config ===
 
 @jax.tree_util.register_static
 @dataclass(kw_only=True, frozen=True)
 class Config:
-    # Architecture
-    n_embd: int
-    n_layer: int
-    seq_len: int
-    vocab_size: int
-    n_head: int
-    n_kv_head: int
-    head_dim: int
-    mlp_dim: int
-    mlp_type: str
-    attn_impl: str
-    qk_norm: bool
-    softcap: float
-    splash_block_size: int
-    batch_size: int
+    # ── Ablation knobs ─────────────────────────────────────────
+    attn_impl: str = 'splash'       # 'splash' | 'einsum'
+    mlp_type: str = 'glu'           # 'glu' (SwiGLU, F=3072) | 'plain' (ReLU², F=4096)
+    qk_norm: bool = True            # QK-norm on queries and keys
 
-    # Training
-    learning_rate: float
-    beta1: float
-    beta2: float
-    eps: float
-    weight_decay: float
-    warmup_ratio: float
-    warmdown_ratio: float
+    # ── Architecture (D1024, 125M non-embed) ───────────────────
+    n_embd: int = 1024
+    n_layer: int = 8
+    seq_len: int = 2048
+    vocab_size: int = 32768
+    n_head: int = 3
+    n_kv_head: int = 1
+    head_dim: int = 256
+    mlp_dim: int = 3072             # 3072 for glu, 4096 for plain
+    softcap: float = 15.0
+    splash_block_size: int = 1024
+    batch_size: int = 4
+
+    # ── Training ───────────────────────────────────────────────
+    learning_rate: float = 3e-4
+    beta1: float = 0.9
+    beta2: float = 0.95
+    eps: float = 1e-8
+    weight_decay: float = 0.1
+    warmup_ratio: float = 0.02
+    warmdown_ratio: float = 0.5
     final_lr_frac: float = 0.0
 
-    # Eval / Data
+    # ── Eval / Data ────────────────────────────────────────────
     eval_steps: int = 10
     param_seed: int = 42
 
@@ -431,24 +413,7 @@ class Config:
         return ((self.vocab_size + 63) // 64) * 64
 
 
-def make_config(lr=LR, **overrides):
-    """Build Config from module-level constants + optional overrides."""
-    defaults = dict(
-        n_embd=D, n_layer=L, seq_len=T, vocab_size=V,
-        n_head=N_HEAD, n_kv_head=N_KV_HEAD, head_dim=HEAD_DIM,
-        mlp_dim=F_GLU if MLP_TYPE == 'glu' else F_PLAIN,
-        mlp_type=MLP_TYPE, attn_impl=ATTN_IMPL, qk_norm=QK_NORM,
-        softcap=SOFTCAP, splash_block_size=SPLASH_BS,
-        batch_size=BATCH_SIZE,
-        learning_rate=lr, beta1=BETA1, beta2=BETA2, eps=EPS,
-        weight_decay=WD, warmup_ratio=WARMUP_RATIO,
-        warmdown_ratio=WARMDOWN_RATIO,
-    )
-    defaults.update(overrides)
-    return Config(**defaults)
-
-
-config = make_config()
+config = Config()
 print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
       f'V={config.vocab_size}, N={config.n_head}, K={config.n_kv_head}, '
       f'H={config.head_dim}, F={config.mlp_dim}')
@@ -813,14 +778,14 @@ for prompt in ['The capital of France is', 'Machine learning is']:
 
 # %%
 # === wandb LR sweep ===
-# Workflow: set ATTN_IMPL, MLP_TYPE, QK_NORM in the Model section above,
+# Workflow: set attn_impl, mlp_type, qk_norm in Config above,
 # re-run Model cells, then run this cell to sweep LR for that config.
 import wandb
 
 wandb.login()
 
 sweep_config = {
-    "name": f"ablation-{MLP_TYPE}-{ATTN_IMPL}-qknorm{QK_NORM}",
+    "name": f"ablation-{config.mlp_type}-{config.attn_impl}-qknorm{config.qk_norm}",
     "method": "bayes",
     "metric": {"goal": "minimize", "name": "val_loss"},
     "parameters": {
@@ -838,7 +803,7 @@ def sweep_train_fn():
     run = wandb.init()
     lr = wandb.config.learning_rate
 
-    cfg = make_config(lr=lr)
+    cfg = Config(learning_rate=lr)
     print(f'Sweep run: lr={lr:.2e}, attn={cfg.attn_impl}, '
           f'mlp={cfg.mlp_type}, qk_norm={cfg.qk_norm}')
 
@@ -942,7 +907,7 @@ SAVE_CHECKPOINTS = False   # save params to disk every 50k steps
 CHECKPOINT_DIR = '/content/checkpoints'
 
 # Compute steps from tok/param ratio
-hero_config = make_config()
+hero_config = Config()
 hero_params = init_full_model(hero_config, seed=hero_config.param_seed)
 hero_non_embed = count_non_embed_params(hero_params)
 hero_total_p = count_params(hero_params)
@@ -982,9 +947,9 @@ step_flops = 3 * fwd_flops
 # wandb
 wandb.login()
 wandb.init(project="tpuchat-ablations",
-           name=f"hero-{MLP_TYPE}-{ATTN_IMPL}-qknorm{QK_NORM}",
+           name=f"hero-{hero_config.mlp_type}-{hero_config.attn_impl}-qknorm{hero_config.qk_norm}",
            config={
-               "mlp_type": MLP_TYPE, "attn_impl": ATTN_IMPL, "qk_norm": QK_NORM,
+               "mlp_type": hero_config.mlp_type, "attn_impl": hero_config.attn_impl, "qk_norm": hero_config.qk_norm,
                "learning_rate": hero_config.learning_rate,
                "non_embed_params": hero_non_embed,
                "target_tokens": target_tokens, "steps": HERO_STEPS,
