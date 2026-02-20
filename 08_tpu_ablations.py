@@ -717,6 +717,7 @@ step_flops = 3 * fwd_flops  # fwd + 2x bwd
 
 smooth_loss = 0.0
 step_times = []
+report_step_times = []
 
 print(f'\n=== Quick Training: {NUM_QUICK_STEPS} steps ===\n')
 
@@ -759,6 +760,7 @@ for step in range(NUM_QUICK_STEPS + 1):
 
     if step > XPROF_END:
         step_times.append(dt)
+    report_step_times.append(dt)
 
     loss_val = float(loss)
     ema_beta = 0.9
@@ -766,10 +768,12 @@ for step in range(NUM_QUICK_STEPS + 1):
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
 
     if step % 50 == 0:
-        tok_per_sec = int(config.batch_size * config.seq_len / dt) if dt > 0 else 0
+        avg_report_dt = sum(report_step_times) / len(report_step_times)
+        tok_per_sec = int(config.batch_size * config.seq_len / avg_report_dt)
         print(f'step {step:05d}/{NUM_QUICK_STEPS} | loss: {debiased_loss:.4f} '
-              f'| dt: {dt*1000:.0f}ms | data: {dt_data*1000:.1f}ms '
+              f'| dt: {avg_report_dt*1000:.0f}ms | data: {dt_data*1000:.1f}ms '
               f'| tok/s: {tok_per_sec:,}')
+        report_step_times = []
 
 train_loader.stop()
 
