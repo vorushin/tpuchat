@@ -292,47 +292,23 @@ class PrefetchDataLoader:
 # %%
 # === Optimizer: AdamW with warmup + linear warmdown ===
 
-def init_adam_state(param):
-    """Initialize Adam optimizer state for a single parameter."""
-    return dot_dict(
-        mu=jnp.zeros_like(param),
-        nu=jnp.zeros_like(param),
-        count=jnp.array(0, dtype=jnp.int32),
-    )
+def make_optimizer(config, num_steps):
+    """Create optax AdamW with linear warmup + constant + linear warmdown."""
+    lr = config.learning_rate
+    warmup_steps = int(config.warmup_ratio * num_steps)
+    warmdown_steps = int(config.warmdown_ratio * num_steps)
+    constant_steps = num_steps - warmup_steps - warmdown_steps
+    end_lr = lr * config.final_lr_frac
 
+    schedule_fn = optax.join_schedules([
+        optax.linear_schedule(0.0, lr, warmup_steps),
+        optax.constant_schedule(lr),
+        optax.linear_schedule(lr, end_lr, warmdown_steps),
+    ], boundaries=[warmup_steps, warmup_steps + constant_steps])
 
-def adamw_step(config, lr_mult, param, grad, state):
-    """AdamW update. Returns (new_param, new_state)."""
-    new_count = state.count + 1
-    new_mu = config.beta1 * state.mu + (1 - config.beta1) * grad
-    new_nu = config.beta2 * state.nu + (1 - config.beta2) * grad ** 2
-
-    mu_hat = new_mu / (1 - config.beta1 ** new_count)
-    nu_hat = new_nu / (1 - config.beta2 ** new_count)
-
-    lr = config.learning_rate * lr_mult
-    update = mu_hat / (jnp.sqrt(nu_hat) + config.eps)
-
-    # Weight decay for 2D+ params
-    wd = jnp.where(param.ndim >= 2, config.weight_decay, 0.0)
-    new_param = param - lr * (update + wd * param)
-
-    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
-    return new_param, new_state
-
-
-def get_lr_multiplier(step, num_iterations, config):
-    """Linear warmup, constant, linear warmdown schedule."""
-    warmup_iters = int(config.warmup_ratio * num_iterations)
-    warmdown_iters = int(config.warmdown_ratio * num_iterations)
-
-    if step < warmup_iters:
-        return (step + 1) / max(warmup_iters, 1)
-    elif step <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - step) / max(warmdown_iters, 1)
-        return progress * 1.0 + (1 - progress) * config.final_lr_frac
+    return optax.adamw(learning_rate=schedule_fn, b1=config.beta1,
+                       b2=config.beta2, eps=config.eps,
+                       weight_decay=config.weight_decay)
 
 # %%
 # === split_trainable, merge_params, count_params, count_non_embed_params ===
@@ -672,8 +648,7 @@ print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
 trainable_params, static_params = split_trainable(params)
-optimizer = optax.adamw(config.learning_rate, b1=config.beta1, b2=config.beta2,
-                        eps=config.eps, weight_decay=config.weight_decay)
+optimizer = make_optimizer(config, NUM_QUICK_STEPS)
 opt_state = optimizer.init(trainable_params)
 train_step = make_train_step(optimizer)
 
@@ -819,8 +794,7 @@ def sweep_train_fn():
     print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 
     trainable, static = split_trainable(params)
-    sweep_opt = optax.adamw(lr, b1=cfg.beta1, b2=cfg.beta2,
-                            eps=cfg.eps, weight_decay=cfg.weight_decay)
+    sweep_opt = make_optimizer(cfg, SWEEP_STEPS)
     opt_state = sweep_opt.init(trainable)
     sweep_train_step = make_train_step(sweep_opt)
 
@@ -924,9 +898,7 @@ print(f'Estimated time: {HERO_STEPS * 0.022 / 3600:.1f} hours (at 22ms/step)')
 
 # Init optimizer
 trainable, static = split_trainable(hero_params)
-hero_opt = optax.adamw(hero_config.learning_rate, b1=hero_config.beta1,
-                       b2=hero_config.beta2, eps=hero_config.eps,
-                       weight_decay=hero_config.weight_decay)
+hero_opt = make_optimizer(hero_config, HERO_STEPS)
 opt_state = hero_opt.init(trainable)
 hero_train_step = make_train_step(hero_opt)
 
