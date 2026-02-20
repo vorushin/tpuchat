@@ -1,2 +1,5 @@
 nanochat
 maxtext
+.venv
+uv.lock
+__pycache__
