@@ -162,21 +162,24 @@ def fake_hidden(batch_size, seq_len, n_embd, seed=0):
 
 # %%
 # === FLOP counting helpers ===
+# Dimension notation follows "How to Scale Your Model" (jax-ml/scaling-book):
+#   B=batch, T=seq_len, D=d_model, N=n_heads, K=n_kv_heads,
+#   H=head_dim, F=d_ff, L=n_layers, V=vocab_size
 
 def matmul_flops(M, N, K, batch=1):
     """FLOPs for [M,K] @ [K,N].  2*M*N*K per batch element."""
     return 2 * batch * M * N * K
 
-def attention_flops(B, H, T, D):
+def attention_flops(B, N, T, H):
     """FLOPs for QK^T + AV (full T×T, not causal-halved).
 
     Counts full attention matrix. Causal kernels (e.g. splash) skip the
     upper triangle, so actual MXU work is ~half this — meaning MXU% for
     attention is overestimated by ~2x.
     """
-    return 2 * (2 * B * H * T * T * D)   # QK^T + AV
+    return 2 * (2 * B * N * T * T * H)   # QK^T + AV
 
-def layer_flops(B, T, E, H, KV, D, MLP):
+def layer_flops(B, T, D, N, K, H, F):
     """MXU-relevant FLOPs for one transformer layer.
 
     Counts only matmul FLOPs (projections + attention core + MLP).
@@ -184,14 +187,14 @@ def layer_flops(B, T, E, H, KV, D, MLP):
     run on the vector unit, not the MXU.
     """
     tok = B * T
-    q  = 2 * tok * E * H * D             # Q projection
-    k  = 2 * tok * E * KV * D            # K projection
-    v  = 2 * tok * E * KV * D            # V projection
-    att = attention_flops(B, H, T, D)     # core attention
-    proj = 2 * tok * H * D * E           # output projection
-    gate = 2 * tok * E * MLP             # SwiGLU gate
-    up   = 2 * tok * E * MLP             # SwiGLU up
-    down = 2 * tok * MLP * E             # SwiGLU down
+    q  = 2 * tok * D * N * H             # Q projection
+    k  = 2 * tok * D * K * H             # K projection
+    v  = 2 * tok * D * K * H             # V projection
+    att = attention_flops(B, N, T, H)     # core attention
+    proj = 2 * tok * N * H * D           # output projection
+    gate = 2 * tok * D * F               # SwiGLU gate
+    up   = 2 * tok * D * F               # SwiGLU up
+    down = 2 * tok * F * D               # SwiGLU down
     return q + k + v + att + proj + gate + up + down
 
 # %% [markdown]
@@ -322,9 +325,9 @@ class PerfConfig:
 cfg = PerfConfig()
 assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
     f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, "
-      f"H={cfg.n_head}, KV={cfg.n_kv_head}, D={cfg.head_dim}, "
-      f"MLP={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
+print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
+      f"N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
+      f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
 
 # %%
 # 2a. RMSNorm — pure elementwise, expect ~0% MXU
@@ -931,6 +934,11 @@ def count_params(params):
     return sum(p.size for p in jax.tree.leaves(trainable) if isinstance(p, jax.Array))
 
 
+def count_non_embed_params(params):
+    """Non-embedding params (unembed + layers). Excludes wte (lookup table)."""
+    return count_params(params) - params.wte.size
+
+
 def compute_mfu(num_params, batch_size, seq_len, wall_s):
     """Model FLOPs Utilization: 6*P*B*T / (peak_flops * wall_s).
     The factor 6 = 2 (fwd matmul) * 3 (fwd + 2x bwd)."""
@@ -1101,7 +1109,7 @@ for hd, nh in [(128, 8), (256, 4)]:
         return jax.value_and_grad(loss_fn)(p)
 
     r = benchmark(bench, p, tok, flop_count=fl,
-                  label=f"head_dim={hd}, n_head={nh}, E={nh*hd}")
+                  label=f"head_dim={hd}, n_head={nh}, D={nh*hd}")
     r['tok_per_sec'] = cfg_hd.batch_size * cfg_hd.seq_len / (r['wall_ms'] / 1000)
     results_7c.append(r)
 
@@ -1374,7 +1382,7 @@ print_summary(results_7f)
 # %%
 # === Phase 9: Optimizer step benchmarks ===
 print("=== Phase 9: Optimizer Step Benchmarks ===")
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, L={cfg.n_layer}")
+print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, L={cfg.n_layer}")
 
 n_params = count_params(full_params)
 print(f"Trainable params: {n_params:,}")
@@ -1527,14 +1535,14 @@ print("=== Phase 10: ~100M Param Config Sweep ===")
 
 sweep_configs = [
     # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
-    ("E768 H3 L8",   3, 1, 256, 768,  2048, 8,  16),
-    ("E512 H2 L16",  2, 1, 256, 512,  1536, 16, 16),
-    ("E512 H2 L24",  2, 1, 256, 512,  1536, 24, 16),
+    ("D768 N3 L8",   3, 1, 256, 768,  2048, 8,  16),
+    ("D512 N2 L16",  2, 1, 256, 512,  1536, 16, 16),
+    ("D512 N2 L24",  2, 1, 256, 512,  1536, 24, 16),
 ]
 
 results_10 = []
 for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
-    print(f"\n--- {label}: E={ne}, H={nh}, KV={nkv}, D={hd}, MLP={mlp}, L={nl}, B={bs} ---")
+    print(f"\n--- {label}: D={ne}, N={nh}, K={nkv}, H={hd}, F={mlp}, L={nl}, B={bs} ---")
     cfg_s = PerfConfig(batch_size=bs, n_head=nh, n_kv_head=nkv, head_dim=hd,
                        n_embd=ne, mlp_dim=mlp, n_layer=nl)
     p_s = init_full_model(cfg_s)
@@ -1593,15 +1601,136 @@ for r in results_10:
           f"{r['mxu_pct']:5.1f}%  {r['mfu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
           f"{r['est_hours_20x']:7.1f}h")
 
+# %% [markdown]
+# ## Phase 11 — ~100M Non-Embed Param Architecture Sweep
+#
+# Fix L=8 and systematically vary D, H, F, and K to find what architecture
+# choices matter most for ~100M non-embedding parameter models on TPU v6e.
+#
+# **Parameter counting convention (Chinchilla/Kaplan):**
+# - **Embedding** (V×D) is a pure lookup table — 0 MXU FLOPs, **not counted**
+# - **Unembedding** (D×V) is a real matmul (our biggest at ~78% MXU) — **counted**
+# - Non-embed params = unembed (D×V) + layer params
+# - For ~100M non-embed models at L=8, embed is 20-30% of total params
+#   (wasted budget if not tying, but tying hurts convergence)
+# - `N` in scaling laws = non-embedding params, `MFU = 6N·B·T / (peak · wall)`
+
+# %%
+# === Phase 11: ~100M non-embed param architecture sweep ===
+print("=== Phase 11: ~100M Non-Embed Param Architecture Sweep ===")
+
+sweep_configs_11 = [
+    # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
+    ("D768-F3328",     3, 1, 256, 768,  3328, 8, 16),   # Balanced baseline
+    ("D1024-F1792",    4, 1, 256, 1024, 1792, 8, 16),   # Wider D, slimmer F
+    ("D768-H128",      6, 2, 128, 768,  3328, 8, 16),   # head_dim=128 (same params as #1)
+    ("D768-MHA",       3, 3, 256, 768,  3072, 8, 16),   # MHA vs MQA
+    ("D1280-F1024",    5, 1, 256, 1280, 1024, 8, 16),   # Very wide D, very slim F
+    ("D768-F4096",     3, 1, 256, 768,  4096, 8, 16),   # Large MLP (5.3×D)
+    ("D768-F3328-B32", 3, 1, 256, 768,  3328, 8, 32),   # B=32 batch effect
+]
+
+results_11 = []
+for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
+    print(f"\n--- {label}: D={ne}, N={nh}, K={nkv}, H={hd}, F={mlp}, L={nl}, B={bs} ---")
+    cfg_s = PerfConfig(batch_size=bs, n_head=nh, n_kv_head=nkv, head_dim=hd,
+                       n_embd=ne, mlp_dim=mlp, n_layer=nl)
+    p_s = init_full_model(cfg_s)
+    n_p = count_params(p_s)
+    n_ne = count_non_embed_params(p_s)
+    print(f"  Total params: {n_p:,}  Non-embed params: {n_ne:,}")
+
+    tok_s = fake_tokens(bs, cfg_s.seq_len)
+    lab_s = fake_tokens(bs, cfg_s.seq_len)
+
+    # Use optax.adamw f32 (best from Phase 9)
+    tr_s, st_s = split_trainable(p_s)
+    sched_s = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
+                           eps=OPT_EPS, weight_decay=OPT_WD)
+    ostate_s = sched_s.init(tr_s)
+
+    fl_s = 3 * (cfg_s.n_layer * layer_flops(bs, cfg_s.seq_len, cfg_s.n_embd,
+                cfg_s.n_head, cfg_s.n_kv_head, cfg_s.head_dim, cfg_s.mlp_dim) +
+                matmul_flops(bs * cfg_s.seq_len, cfg_s.padded_vocab, cfg_s.n_embd))
+
+    @jax.jit
+    def bench_sweep_11(params, opt_state, tokens, _cfg=cfg_s, _sched=sched_s, _lab=lab_s):
+        trainable, static = split_trainable(params)
+
+        def loss_fn(t):
+            full = merge_params(t, static)
+            hidden = model_forward_remat(_cfg, full, tokens)
+            return chunked_lm_head_loss(hidden, full.lm_head, _lab, _cfg)
+
+        loss, grads = jax.value_and_grad(loss_fn)(trainable)
+        updates, new_opt_state = _sched.update(grads, opt_state, trainable)
+        new_trainable = optax.apply_updates(trainable, updates)
+        new_params = merge_params(new_trainable, static)
+        return loss, new_params, new_opt_state
+
+    r = benchmark(bench_sweep_11, p_s, ostate_s, tok_s, flop_count=fl_s,
+                  label=f"{label} (B={bs})")
+    # MFU using non-embed params (matches 6N convention)
+    r['mfu_pct'] = compute_mfu(n_ne, bs, cfg_s.seq_len, r['wall_ms'] / 1000)
+    r['n_params'] = n_p
+    r['n_non_embed'] = n_ne
+    r['tok_per_sec'] = bs * cfg_s.seq_len / (r['wall_ms'] / 1000)
+
+    # Estimated wall time for 20 tokens/param training run (using non-embed count)
+    total_tokens = 20 * n_ne
+    total_steps = total_tokens / (bs * cfg_s.seq_len)
+    est_hours = total_steps * (r['wall_ms'] / 1000) / 3600
+    r['est_hours_20x'] = est_hours
+    results_11.append(r)
+
+# %%
+# 11b. Phase 11 Summary
+print("\n=== Phase 11 Summary ===")
+print(f"\n  {'Label':<20s}  {'Non-embed':>10s}  {'Total':>10s}  {'Wall ms':>8s}  "
+      f"{'MXU%':>6s}  {'MFU%':>6s}  {'tok/s':>10s}  {'20x hrs':>8s}")
+print("  " + "-" * 100)
+for r in results_11:
+    print(f"  {r['label']:<20s}  {r['n_non_embed']:>10,}  {r['n_params']:>10,}  "
+          f"{r['wall_ms']:8.2f}  {r['mxu_pct']:5.1f}%  {r['mfu_pct']:5.1f}%  "
+          f"{r['tok_per_sec']:>10,.0f}  {r['est_hours_20x']:7.1f}h")
+
+# %% [markdown]
+# ## Ideas from scaling-book
+#
+# Reference: `jax-ml/scaling-book` (cloned locally in `scaling-book/`)
+#
+# **Remat FLOPs accounting** — Block remat costs ~8ND FLOPs (vs 6ND without remat)
+# because it recomputes the forward pass during backward. Our `compute_mfu` uses
+# `6 * P * B * T` which is slightly optimistic for remat benchmarks. Could add a
+# `compute_hfu` (hardware FLOPs utilization) that uses 8ND for remat runs.
+#
+# **Arithmetic intensity roofline** — The book defines `intensity = FLOPs / bytes`.
+# For our matmul benchmarks we already compute HBM bytes — could plot a roofline
+# diagram showing which ops are compute-bound vs memory-bound. Critical intensity
+# for v6e = 918e12 / 1600e9 ≈ 574 FLOPs/byte. Ops above this line are compute-bound.
+#
+# **Attention dominance threshold** — Book says attention FLOPs dominate when
+# `T > 8D` (assuming standard `F=4D` and `D=NH`). For our default config (D=1024),
+# that's `T > 8192`. Our T=2048 is well below — attention is a small fraction of
+# total FLOPs, MLP and projections dominate.
+#
+# **`jax.checkpoint` policies** — `dots_with_no_batch_dims_saveable` saves only
+# big matmul outputs (~7 checkpoints/layer vs 1 for block remat, ~20 for no remat).
+# This trades off between the 6ND and 8ND extremes — worth benchmarking.
+#
+# **int8 inference matmuls** — TPU v6e int8 = 2× bf16 throughput. The critical
+# batch size for compute-bound regime stays the same (proportional reduction in
+# both FLOPs and bytes).
+
 # %%
 # === All outputs — copy/paste this cell's output into Claude Code ===
 print("=" * 90)
 print("  ALL BENCHMARK RESULTS")
 print("=" * 90)
 print()
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, "
-      f"H={cfg.n_head}, KV={cfg.n_kv_head}, D={cfg.head_dim}, "
-      f"MLP={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}, "
+print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
+      f"N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
+      f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}, "
       f"softcap={cfg.softcap}, splash_bs={cfg.splash_block_size}, "
       f"lm_chunks={cfg.num_lm_head_chunks}")
 print(f"TPU: peak={PEAK_TFLOPS} TFLOPS, HBM={HBM_GB} GB, BW={HBM_BW_GBS} GB/s")
