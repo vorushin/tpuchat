@@ -494,69 +494,67 @@ def init_layer_params(config, seed=42):
 # %%
 # === single_layer_forward (uses attn_impl, qk_norm, mlp_type from config) ===
 
-def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
+def single_layer_forward(config, layer, x, cos, sin):
     """Forward pass for one transformer layer."""
     h = rms_norm(x)
 
-    with jax.named_scope(f'layer_{layer_idx}/attention'):
-        # --- Attention ---
-        q = jnp.einsum('btd,dhk->bhtk', h, layer.c_q)
-        k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)
-        v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)
+    # --- Attention ---
+    q = jnp.einsum('btd,dhk->bhtk', h, layer.c_q)
+    k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)
+    v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)
 
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+    q = apply_rope(q, cos, sin)
+    k = apply_rope(k, cos, sin)
 
-        if config.qk_norm:
-            q = rms_norm(q)
-            k = rms_norm(k)
+    if config.qk_norm:
+        q = rms_norm(q)
+        k = rms_norm(k)
 
-        seq_len = x.shape[1]
+    seq_len = x.shape[1]
 
-        if config.attn_impl == 'splash':
-            from jax.experimental.pallas.ops.tpu.splash_attention import (
-                splash_attention_mask, splash_attention_kernel)
+    if config.attn_impl == 'splash':
+        from jax.experimental.pallas.ops.tpu.splash_attention import (
+            splash_attention_mask, splash_attention_kernel)
 
-            smask = splash_attention_mask.CausalMask(shape=(seq_len, seq_len))
-            mh_mask = splash_attention_mask.MultiHeadMask(
-                masks=[smask] * config.n_head)
-            bs = min(config.splash_block_size, seq_len)
-            block_sizes = splash_attention_kernel.BlockSizes(
-                block_q=bs, block_kv=bs,
-                block_q_dkv=bs, block_kv_dkv=bs,
-                block_q_dq=bs, block_kv_dq=bs)
-            kernel = splash_attention_kernel.make_splash_mha(
-                mask=mh_mask, head_shards=1, q_seq_shards=1,
-                block_sizes=block_sizes)
-            attn_out = jax.vmap(kernel)(q, k, v)
+        smask = splash_attention_mask.CausalMask(shape=(seq_len, seq_len))
+        mh_mask = splash_attention_mask.MultiHeadMask(
+            masks=[smask] * config.n_head)
+        bs = min(config.splash_block_size, seq_len)
+        block_sizes = splash_attention_kernel.BlockSizes(
+            block_q=bs, block_kv=bs,
+            block_q_dkv=bs, block_kv_dkv=bs,
+            block_q_dq=bs, block_kv_dq=bs)
+        kernel = splash_attention_kernel.make_splash_mha(
+            mask=mh_mask, head_shards=1, q_seq_shards=1,
+            block_sizes=block_sizes)
+        attn_out = jax.vmap(kernel)(q, k, v)
 
-        elif config.attn_impl == 'einsum':
-            k_exp, v_exp = _expand_kv(k, v, config.n_head, config.n_kv_head)
-            scale = config.head_dim ** -0.5
-            scores = jnp.einsum('bhtd,bhsd->bhts', q, k_exp) * scale
-            rows = jnp.arange(seq_len)[:, None]
-            cols = jnp.arange(seq_len)[None, :]
-            mask = cols <= rows
-            scores = jnp.where(mask[None, None, :, :], scores,
-                               jnp.finfo(scores.dtype).min)
-            attn_weights = jax.nn.softmax(scores, axis=-1)
-            attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
+    elif config.attn_impl == 'einsum':
+        k_exp, v_exp = _expand_kv(k, v, config.n_head, config.n_kv_head)
+        scale = config.head_dim ** -0.5
+        scores = jnp.einsum('bhtd,bhsd->bhts', q, k_exp) * scale
+        rows = jnp.arange(seq_len)[:, None]
+        cols = jnp.arange(seq_len)[None, :]
+        mask = cols <= rows
+        scores = jnp.where(mask[None, None, :, :], scores,
+                           jnp.finfo(scores.dtype).min)
+        attn_weights = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
 
-        attn_out = jnp.einsum('bhtd,hde->bte', attn_out, layer.c_proj)
+    attn_out = jnp.einsum('bhtd,hde->bte', attn_out, layer.c_proj)
 
     x = x + attn_out
 
-    with jax.named_scope(f'layer_{layer_idx}/mlp'):
-        # --- MLP ---
-        h2 = rms_norm(x)
-        if config.mlp_type == 'glu':
-            gate = jax.nn.silu(jnp.einsum('btd,dh->bth', h2, layer.w_gate))
-            up = jnp.einsum('btd,dh->bth', h2, layer.w_up)
-            mlp_out = jnp.einsum('bth,hd->btd', gate * up, layer.w_down)
-        else:  # plain (ReLU²)
-            mlp_out = jnp.einsum('btd,dh->bth', h2, layer.w_up)
-            mlp_out = jax.nn.relu(mlp_out) ** 2
-            mlp_out = jnp.einsum('bth,hd->btd', mlp_out, layer.w_down)
+    # --- MLP ---
+    h2 = rms_norm(x)
+    if config.mlp_type == 'glu':
+        gate = jax.nn.silu(jnp.einsum('btd,dh->bth', h2, layer.w_gate))
+        up = jnp.einsum('btd,dh->bth', h2, layer.w_up)
+        mlp_out = jnp.einsum('bth,hd->btd', gate * up, layer.w_down)
+    else:  # plain (ReLU²)
+        mlp_out = jnp.einsum('btd,dh->bth', h2, layer.w_up)
+        mlp_out = jax.nn.relu(mlp_out) ** 2
+        mlp_out = jnp.einsum('bth,hd->btd', mlp_out, layer.w_down)
 
     x = x + mlp_out
     return x
@@ -590,10 +588,9 @@ def model_forward(config, params, tokens):
     B, T = tokens.shape
     cos = params.rope_cos[:T][None, None, :, :]
     sin = params.rope_sin[:T][None, None, :, :]
-    with jax.named_scope('embedding'):
-        x = rms_norm(params.wte[tokens])
+    x = rms_norm(params.wte[tokens])
     for i in range(config.n_layer):
-        x = single_layer_forward(config, params.layers[i], x, cos, sin, layer_idx=i)
+        x = single_layer_forward(config, params.layers[i], x, cos, sin)
     return rms_norm(x)
 
 
@@ -602,10 +599,9 @@ def model_forward_remat(config, params, tokens):
     B, T = tokens.shape
     cos = params.rope_cos[:T][None, None, :, :]
     sin = params.rope_sin[:T][None, None, :, :]
-    with jax.named_scope('embedding'):
-        x = rms_norm(params.wte[tokens])
+    x = rms_norm(params.wte[tokens])
+    layer_fn = ft.partial(single_layer_forward, config)
     for i in range(config.n_layer):
-        layer_fn = ft.partial(single_layer_forward, config, layer_idx=i)
         x = jax.checkpoint(layer_fn)(params.layers[i], x, cos, sin)
     return rms_norm(x)
 
@@ -683,24 +679,22 @@ def train_step(config, params, opt_state, x, y, lr_mult):
         hidden = model_forward(config, full_params, x)
         return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
 
-    with jax.named_scope('forward_backward'):
-        loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    loss, grads = jax.value_and_grad(loss_fn)(trainable)
 
-    with jax.named_scope('optimizer'):
-        is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
-        t_leaves, t_treedef = jax.tree.flatten(trainable)
-        g_leaves, _ = jax.tree.flatten(grads)
-        o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
+    is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
+    t_leaves, t_treedef = jax.tree.flatten(trainable)
+    g_leaves, _ = jax.tree.flatten(grads)
+    o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
 
-        new_t_leaves, new_o_leaves = [], []
-        for p, g, s in zip(t_leaves, g_leaves, o_leaves):
-            new_p, new_s = adamw_step(config, lr_mult, p, g, s)
-            new_t_leaves.append(new_p)
-            new_o_leaves.append(new_s)
+    new_t_leaves, new_o_leaves = [], []
+    for p, g, s in zip(t_leaves, g_leaves, o_leaves):
+        new_p, new_s = adamw_step(config, lr_mult, p, g, s)
+        new_t_leaves.append(new_p)
+        new_o_leaves.append(new_s)
 
-        new_trainable = t_treedef.unflatten(new_t_leaves)
-        new_opt_state = o_treedef.unflatten(new_o_leaves)
-        new_params = merge_params(new_trainable, static)
+    new_trainable = t_treedef.unflatten(new_t_leaves)
+    new_opt_state = o_treedef.unflatten(new_o_leaves)
+    new_params = merge_params(new_trainable, static)
 
     return loss, new_params, new_opt_state
 
@@ -716,11 +710,10 @@ def eval_step(config, params, x, y):
 def predict_step(config, params, x):
     """JIT-compiled single step inference: returns logits."""
     hidden = model_forward(config, params, x)
-    with jax.named_scope('lm_head'):
-        logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head)
-        logits = logits[:, :, :config.vocab_size]
-        logits = logits.astype(jnp.float32)
-        logits = config.softcap * jnp.tanh(logits / config.softcap)
+    logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head)
+    logits = logits[:, :, :config.vocab_size]
+    logits = logits.astype(jnp.float32)
+    logits = config.softcap * jnp.tanh(logits / config.softcap)
     return logits
 
 
