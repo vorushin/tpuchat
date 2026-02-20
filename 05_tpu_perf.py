@@ -44,7 +44,10 @@
 # !pip install -q "jax[tpu]" optax
 
 # %% [markdown]
-# ## Phase 0 — Setup & Utilities
+# ## Phase 0 — Prerequisites
+#
+# All imports, constants, utility classes, model primitives, and function
+# definitions live here. Run this section first, then jump to any phase.
 
 # %%
 import functools as ft
@@ -56,6 +59,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_mask, splash_attention_kernel)
 
 # TPU v6e-1 constants (from https://docs.cloud.google.com/tpu/docs/v6e)
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
@@ -204,6 +210,375 @@ def layer_flops(B, T, D, N, K, H, F):
     down = 2 * tok * F * D               # SwiGLU down
     return q + k + v + att + proj + gate + up + down
 
+# %%
+# === Model primitives ===
+
+def rms_norm(x):
+    """RMSNorm with no learnable parameters."""
+    return x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6)
+
+
+def precompute_rope(seq_len, head_dim, base=10000):
+    """Precompute rotary embedding cos/sin tables."""
+    channel_range = jnp.arange(0, head_dim, 2, dtype=jnp.float32)
+    inv_freq = 1.0 / (base ** (channel_range / head_dim))
+    t = jnp.arange(seq_len, dtype=jnp.float32)
+    freqs = jnp.outer(t, inv_freq)
+    cos = jnp.cos(freqs).astype(jnp.bfloat16)
+    sin = jnp.sin(freqs).astype(jnp.bfloat16)
+    return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    """Apply rotary embeddings. x: (B, H, T, D), cos/sin: (1, 1, T, D/2)"""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return jnp.concatenate([y1, y2], axis=-1)
+
+
+def _expand_kv(k, v, n_head, n_kv_head):
+    """Repeat KV heads to match Q head count for non-splash backends."""
+    if n_kv_head == n_head:
+        return k, v
+    ratio = n_head // n_kv_head
+    return jnp.repeat(k, ratio, axis=1), jnp.repeat(v, ratio, axis=1)
+
+# %%
+# === PerfConfig ===
+
+@jax.tree_util.register_static
+@dataclass(kw_only=True, frozen=True)
+class PerfConfig:
+    """All dims 256-aligned for MXU.  Matches 04_maxtext.py defaults."""
+    batch_size: int = 8
+    seq_len: int = 2048
+    n_head: int = 4
+    n_kv_head: int = 2
+    head_dim: int = 256
+    n_embd: int = 1024       # n_head * head_dim
+    mlp_dim: int = 3072      # 3x expansion for SwiGLU
+    vocab_size: int = 32768
+    n_layer: int = 24
+    softcap: float = 15.0
+    splash_block_size: int = 1024
+    num_lm_head_chunks: int = 8
+
+    @property
+    def padded_vocab(self):
+        return ((self.vocab_size + 63) // 64) * 64
+
+cfg = PerfConfig()
+assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
+    f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
+print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
+      f"N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
+      f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
+
+# %%
+# === Precomputed RoPE tables (used by multiple phases) ===
+cos, sin = precompute_rope(cfg.seq_len, cfg.head_dim)
+cos_b = cos[None, None, :, :]
+sin_b = sin[None, None, :, :]
+
+# %%
+# === Param initializers ===
+
+def init_mlp_params(cfg, seed=42):
+    key = jax.random.key(seed)
+    k1, k2, k3 = jax.random.split(key, 3)
+    s = (3.0 ** 0.5) * (cfg.n_embd ** -0.5)
+    return dot_dict(
+        w_gate=jax.random.uniform(k1, (cfg.n_embd, cfg.mlp_dim),
+                                   dtype=jnp.bfloat16, minval=-s, maxval=s),
+        w_up=jax.random.uniform(k2, (cfg.n_embd, cfg.mlp_dim),
+                                 dtype=jnp.bfloat16, minval=-s, maxval=s),
+        w_down=jnp.zeros((cfg.mlp_dim, cfg.n_embd), dtype=jnp.bfloat16),
+    )
+
+
+def init_attn_params(cfg, seed=42):
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 4)
+    s = (3.0 ** 0.5) * (cfg.n_embd ** -0.5)
+    return dot_dict(
+        c_q=jax.random.uniform(keys[0], (cfg.n_embd, cfg.n_head, cfg.head_dim),
+                                dtype=jnp.bfloat16, minval=-s, maxval=s),
+        c_k=jax.random.uniform(keys[1], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
+                                dtype=jnp.bfloat16, minval=-s, maxval=s),
+        c_v=jax.random.uniform(keys[2], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
+                                dtype=jnp.bfloat16, minval=-s, maxval=s),
+        c_proj=jnp.zeros((cfg.n_head, cfg.head_dim, cfg.n_embd), dtype=jnp.bfloat16),
+    )
+
+
+def init_layer_params(cfg, seed=42):
+    """Initialize params for one transformer layer."""
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 7)
+    s = (3.0 ** 0.5) * (cfg.n_embd ** -0.5)
+    layer = dot_dict()
+    layer.c_q = jax.random.uniform(keys[0], (cfg.n_embd, cfg.n_head, cfg.head_dim),
+                                    dtype=jnp.bfloat16, minval=-s, maxval=s)
+    layer.c_k = jax.random.uniform(keys[1], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
+                                    dtype=jnp.bfloat16, minval=-s, maxval=s)
+    layer.c_v = jax.random.uniform(keys[2], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
+                                    dtype=jnp.bfloat16, minval=-s, maxval=s)
+    layer.c_proj = jnp.zeros((cfg.n_head, cfg.head_dim, cfg.n_embd), dtype=jnp.bfloat16)
+    layer.w_gate = jax.random.uniform(keys[3], (cfg.n_embd, cfg.mlp_dim),
+                                       dtype=jnp.bfloat16, minval=-s, maxval=s)
+    layer.w_up = jax.random.uniform(keys[4], (cfg.n_embd, cfg.mlp_dim),
+                                     dtype=jnp.bfloat16, minval=-s, maxval=s)
+    layer.w_down = jnp.zeros((cfg.mlp_dim, cfg.n_embd), dtype=jnp.bfloat16)
+    return layer
+
+
+def init_all_layers(cfg, n_layers, seed=42):
+    layers = dot_dict()
+    for i in range(n_layers):
+        layers[i] = init_layer_params(cfg, seed=seed + i * 7)
+    return layers
+
+# %%
+# === Single layer forward ===
+
+def single_layer_forward(cfg, layer, x, cos, sin, *, attn_impl='splash',
+                         use_rope=True, use_qk_norm=True):
+    """Forward pass for one transformer layer."""
+    h = rms_norm(x)
+
+    # --- Attention ---
+    q = jnp.einsum('btd,dhk->bhtk', h, layer.c_q)
+    k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)
+    v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)
+
+    if use_rope:
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+    if use_qk_norm:
+        q = rms_norm(q)
+        k = rms_norm(k)
+
+    T = x.shape[1]
+    if attn_impl == 'splash':
+        smask = splash_attention_mask.CausalMask(shape=(T, T))
+        mh_mask = splash_attention_mask.MultiHeadMask(masks=[smask] * cfg.n_head)
+        bs = min(cfg.splash_block_size, T)
+        block_sizes = splash_attention_kernel.BlockSizes(
+            block_q=bs, block_kv=bs, block_q_dkv=bs, block_kv_dkv=bs,
+            block_q_dq=bs, block_kv_dq=bs)
+        kernel = splash_attention_kernel.make_splash_mha(
+            mask=mh_mask, head_shards=1, q_seq_shards=1,
+            block_sizes=block_sizes)
+        attn_out = jax.vmap(kernel)(q, k, v)
+    elif attn_impl == 'einsum':
+        k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
+        scale = cfg.head_dim ** -0.5
+        scores = jnp.einsum('bhtd,bhsd->bhts', q, k_exp) * scale
+        rows = jnp.arange(T)[:, None]
+        cols = jnp.arange(T)[None, :]
+        mask = cols <= rows
+        scores = jnp.where(mask[None, None, :, :], scores,
+                           jnp.finfo(scores.dtype).min)
+        attn_weights = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
+    else:
+        k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
+        attn_out = jax.nn.dot_product_attention(
+            q, k_exp, v_exp, is_causal=True, implementation='xla')
+
+    attn_out = jnp.einsum('bhtd,hde->bte', attn_out, layer.c_proj)
+    x = x + attn_out
+
+    # --- SwiGLU MLP ---
+    h2 = rms_norm(x)
+    gate = jax.nn.silu(jnp.einsum('btd,dh->bth', h2, layer.w_gate))
+    up = jnp.einsum('btd,dh->bth', h2, layer.w_up)
+    mlp_out = jnp.einsum('bth,hd->btd', gate * up, layer.w_down)
+    x = x + mlp_out
+    return x
+
+# %%
+# === Multi-layer model ===
+
+def multi_layer_forward(cfg, layers, n_layers, x, cos, sin, attn_impl='splash'):
+    for i in range(n_layers):
+        x = single_layer_forward(cfg, layers[i], x, cos, sin, attn_impl=attn_impl)
+    return rms_norm(x)
+
+# %%
+# === Chunked LM head loss ===
+
+def _logits_from_chunk(h_chunk, lm_head, config):
+    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
+    logits = logits[:, :config.vocab_size]
+    logits = logits.astype(jnp.float32)
+    return config.softcap * jnp.tanh(logits / config.softcap)
+
+
+@ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def chunked_lm_head_loss(hidden, lm_head, labels, config):
+    B, T, D = hidden.shape
+    N = config.num_lm_head_chunks
+    S = B * T // N
+    hidden_chunks = hidden.reshape(N, S, D)
+    labels_chunks = labels.reshape(N, S)
+
+    def fwd_body(_, data):
+        h_chunk, l_chunk = data
+        return None, jnp.sum(
+            optax.softmax_cross_entropy_with_integer_labels(
+                _logits_from_chunk(h_chunk, lm_head, config), l_chunk))
+
+    _, chunk_losses = jax.lax.scan(fwd_body, None, (hidden_chunks, labels_chunks))
+    return jnp.sum(chunk_losses) / (B * T)
+
+
+def _chunked_loss_fwd(hidden, lm_head, labels, config):
+    loss = chunked_lm_head_loss(hidden, lm_head, labels, config)
+    return loss, (hidden, lm_head, labels)
+
+
+def _chunked_loss_bwd(config, residuals, g):
+    hidden, lm_head, labels = residuals
+    B, T, D = hidden.shape
+    N = config.num_lm_head_chunks
+    S = B * T // N
+    hidden_chunks = hidden.reshape(N, S, D)
+    labels_chunks = labels.reshape(N, S)
+
+    def bwd_body(d_lm_head_acc, data):
+        h_chunk, l_chunk = data
+
+        def chunk_loss(h, w):
+            return jnp.sum(
+                optax.softmax_cross_entropy_with_integer_labels(
+                    _logits_from_chunk(h, w, config), l_chunk))
+
+        _, vjp_fn = jax.vjp(chunk_loss, h_chunk, lm_head)
+        d_h, d_w = vjp_fn(g / (B * T))
+        return d_lm_head_acc + d_w, d_h
+
+    d_lm_head_init = jnp.zeros_like(lm_head)
+    d_lm_head, d_hidden_chunks = jax.lax.scan(
+        bwd_body, d_lm_head_init, (hidden_chunks, labels_chunks))
+    return d_hidden_chunks.reshape(B, T, D), d_lm_head, jnp.zeros_like(labels)
+
+
+chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
+
+# %%
+# === Full model ===
+
+def init_full_model(cfg, seed=42):
+    """Initialize all model params (embed + layers + lm_head + rope)."""
+    key = jax.random.key(seed)
+    params = dot_dict()
+    key, k1, k2 = jax.random.split(key, 3)
+    params.wte = jax.random.normal(k1, (cfg.padded_vocab, cfg.n_embd), dtype=jnp.bfloat16)
+    params.lm_head = jax.random.normal(k2, (cfg.n_embd, cfg.padded_vocab),
+                                        dtype=jnp.bfloat16) * 0.001
+    params.rope_cos, params.rope_sin = precompute_rope(cfg.seq_len, cfg.head_dim)
+    params.layers = init_all_layers(cfg, cfg.n_layer, seed=seed + 100)
+    return params
+
+
+def model_forward(cfg, params, tokens):
+    """Full forward: embed -> layers -> final_norm.  Returns hidden (B,T,E)."""
+    B, T = tokens.shape
+    cos = params.rope_cos[:T][None, None, :, :]
+    sin = params.rope_sin[:T][None, None, :, :]
+    x = rms_norm(params.wte[tokens])
+    for i in range(cfg.n_layer):
+        x = single_layer_forward(cfg, params.layers[i], x, cos, sin, attn_impl='splash')
+    return rms_norm(x)
+
+
+def model_forward_remat(cfg, params, tokens):
+    """Same as model_forward but with jax.checkpoint on each layer."""
+    B, T = tokens.shape
+    cos = params.rope_cos[:T][None, None, :, :]
+    sin = params.rope_sin[:T][None, None, :, :]
+    x = rms_norm(params.wte[tokens])
+    layer_fn = ft.partial(single_layer_forward, cfg, attn_impl='splash')
+    for i in range(cfg.n_layer):
+        x = jax.checkpoint(layer_fn)(params.layers[i], x, cos, sin)
+    return rms_norm(x)
+
+# %%
+# === Optimizer utilities ===
+
+def split_trainable(params):
+    """Split params into trainable and static (non-differentiable).
+    From 02_train.py — rope_cos/rope_sin are precomputed, not trained."""
+    trainable = dot_dict()
+    static = dot_dict()
+    for k, v in params.items():
+        if k in ('rope_cos', 'rope_sin'):
+            static[k] = v
+        else:
+            trainable[k] = v
+    return trainable, static
+
+
+def merge_params(trainable, static):
+    """Merge trainable and static params back together."""
+    merged = dot_dict()
+    merged.update(trainable)
+    merged.update(static)
+    return merged
+
+
+def init_adam_state(param):
+    """Initialize Adam optimizer state for a single parameter."""
+    return dot_dict(
+        mu=jnp.zeros_like(param),
+        nu=jnp.zeros_like(param),
+        count=jnp.array(0, dtype=jnp.int32),
+    )
+
+
+def adamw_step(lr, beta1, beta2, eps, wd, lr_mult, param, grad, state):
+    """AdamW update with explicit hyperparams. Returns (new_param, new_state).
+    Note: weight_decay applied only to 2D+ params (matching 02_train.py).
+    optax applies weight_decay uniformly — minor semantic difference on bias/scalar params."""
+    new_count = state.count + 1
+    new_mu = beta1 * state.mu + (1 - beta1) * grad
+    new_nu = beta2 * state.nu + (1 - beta2) * grad ** 2
+
+    mu_hat = new_mu / (1 - beta1 ** new_count)
+    nu_hat = new_nu / (1 - beta2 ** new_count)
+
+    lr_eff = lr * lr_mult
+    update = mu_hat / (jnp.sqrt(nu_hat) + eps)
+
+    # Weight decay for 2D+ params only (matches 02_train.py)
+    wd_eff = jnp.where(param.ndim >= 2, wd, 0.0)
+    new_param = param - lr_eff * (update + wd_eff * param)
+
+    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
+    return new_param, new_state
+
+
+def count_params(params):
+    """Count total trainable parameters (excludes rope_cos/rope_sin)."""
+    trainable, _ = split_trainable(params)
+    return sum(p.size for p in jax.tree.leaves(trainable) if isinstance(p, jax.Array))
+
+
+def count_non_embed_params(params):
+    """Non-embedding params (unembed + layers). Excludes wte (lookup table)."""
+    return count_params(params) - params.wte.size
+
+# %%
+# === Optimizer hyperparams (matching 02_train.py defaults) ===
+OPT_LR = 3e-4
+OPT_BETA1 = 0.9
+OPT_BETA2 = 0.95
+OPT_EPS = 1e-8
+OPT_WD = 0.1
+
 # %% [markdown]
 # ## Phase 1 — Matmul Baseline
 #
@@ -271,72 +646,6 @@ print_summary(results_1c)
 # - **Attention**: mixed (projections = compute, softmax = memory)
 
 # %%
-# === Model primitives (from 04_maxtext.py) ===
-
-def rms_norm(x):
-    """RMSNorm with no learnable parameters."""
-    return x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6)
-
-
-def precompute_rope(seq_len, head_dim, base=10000):
-    """Precompute rotary embedding cos/sin tables."""
-    channel_range = jnp.arange(0, head_dim, 2, dtype=jnp.float32)
-    inv_freq = 1.0 / (base ** (channel_range / head_dim))
-    t = jnp.arange(seq_len, dtype=jnp.float32)
-    freqs = jnp.outer(t, inv_freq)
-    cos = jnp.cos(freqs).astype(jnp.bfloat16)
-    sin = jnp.sin(freqs).astype(jnp.bfloat16)
-    return cos, sin
-
-
-def apply_rope(x, cos, sin):
-    """Apply rotary embeddings. x: (B, H, T, D), cos/sin: (1, 1, T, D/2)"""
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return jnp.concatenate([y1, y2], axis=-1)
-
-
-def _expand_kv(k, v, n_head, n_kv_head):
-    """Repeat KV heads to match Q head count for non-splash backends."""
-    if n_kv_head == n_head:
-        return k, v
-    ratio = n_head // n_kv_head
-    return jnp.repeat(k, ratio, axis=1), jnp.repeat(v, ratio, axis=1)
-
-# %%
-# === PerfConfig ===
-
-@jax.tree_util.register_static
-@dataclass(kw_only=True, frozen=True)
-class PerfConfig:
-    """All dims 256-aligned for MXU.  Matches 04_maxtext.py defaults."""
-    batch_size: int = 8
-    seq_len: int = 2048
-    n_head: int = 4
-    n_kv_head: int = 2
-    head_dim: int = 256
-    n_embd: int = 1024       # n_head * head_dim
-    mlp_dim: int = 3072      # 3x expansion for SwiGLU
-    vocab_size: int = 32768
-    n_layer: int = 24
-    softcap: float = 15.0
-    splash_block_size: int = 1024
-    num_lm_head_chunks: int = 8
-
-    @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
-cfg = PerfConfig()
-assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
-    f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
-      f"N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
-      f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
-
-# %%
 # 2a. RMSNorm — pure elementwise, expect ~0% MFU
 print("=== RMSNorm ===")
 x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
@@ -350,9 +659,6 @@ r_norm = benchmark(bench_rmsnorm, x, flop_count=None, label="RMSNorm")
 # %%
 # 2b. RoPE — elementwise multiply/concat, expect ~0% MFU
 print("=== RoPE ===")
-cos, sin = precompute_rope(cfg.seq_len, cfg.head_dim)
-cos_b = cos[None, None, :, :]
-sin_b = sin[None, None, :, :]
 
 q = jax.random.normal(jax.random.key(0),
     (cfg.batch_size, cfg.n_head, cfg.seq_len, cfg.head_dim), dtype=jnp.bfloat16)
@@ -366,18 +672,6 @@ r_rope = benchmark(bench_rope, q, cos_b, sin_b, flop_count=None, label="RoPE")
 # %%
 # 2c. SwiGLU MLP — 3 large matmuls (gate, up, down)
 print("=== SwiGLU MLP ===")
-
-def init_mlp_params(cfg, seed=42):
-    key = jax.random.key(seed)
-    k1, k2, k3 = jax.random.split(key, 3)
-    s = (3.0 ** 0.5) * (cfg.n_embd ** -0.5)
-    return dot_dict(
-        w_gate=jax.random.uniform(k1, (cfg.n_embd, cfg.mlp_dim),
-                                   dtype=jnp.bfloat16, minval=-s, maxval=s),
-        w_up=jax.random.uniform(k2, (cfg.n_embd, cfg.mlp_dim),
-                                 dtype=jnp.bfloat16, minval=-s, maxval=s),
-        w_down=jnp.zeros((cfg.mlp_dim, cfg.n_embd), dtype=jnp.bfloat16),
-    )
 
 mlp_params = init_mlp_params(cfg)
 x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
@@ -397,20 +691,6 @@ r_mlp = benchmark(bench_mlp, x, mlp_params, flop_count=mlp_flops, label="SwiGLU 
 # %%
 # 2d. Attention — einsum variant (manual QK^T + softmax + AV)
 print("=== Attention (einsum) ===")
-
-def init_attn_params(cfg, seed=42):
-    key = jax.random.key(seed)
-    keys = jax.random.split(key, 4)
-    s = (3.0 ** 0.5) * (cfg.n_embd ** -0.5)
-    return dot_dict(
-        c_q=jax.random.uniform(keys[0], (cfg.n_embd, cfg.n_head, cfg.head_dim),
-                                dtype=jnp.bfloat16, minval=-s, maxval=s),
-        c_k=jax.random.uniform(keys[1], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
-                                dtype=jnp.bfloat16, minval=-s, maxval=s),
-        c_v=jax.random.uniform(keys[2], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
-                                dtype=jnp.bfloat16, minval=-s, maxval=s),
-        c_proj=jnp.zeros((cfg.n_head, cfg.head_dim, cfg.n_embd), dtype=jnp.bfloat16),
-    )
 
 attn_params = init_attn_params(cfg)
 
@@ -477,9 +757,6 @@ r_attn_jax = benchmark(bench_attn_jax, x, attn_params, cos_b, sin_b,
 # 2f. Attention — Pallas splash kernel
 print("=== Attention (splash) ===")
 
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-    splash_attention_mask, splash_attention_kernel)
-
 @jax.jit
 def bench_attn_splash(x, params, cos, sin):
     with jax.named_scope('attn_splash'):
@@ -524,87 +801,6 @@ print_summary([r_norm, r_rope, r_mlp, r_attn_ein, r_attn_jax, r_attn_splash])
 # ## Phase 3 — Single Transformer Layer
 #
 # Assemble: pre-norm + attention + residual + pre-norm + MLP + residual.
-# Compare full layer time with sum of Phase 2 parts.
-
-# %%
-# === Single layer functions ===
-
-def init_layer_params(cfg, seed=42):
-    """Initialize params for one transformer layer."""
-    key = jax.random.key(seed)
-    keys = jax.random.split(key, 7)
-    s = (3.0 ** 0.5) * (cfg.n_embd ** -0.5)
-    layer = dot_dict()
-    layer.c_q = jax.random.uniform(keys[0], (cfg.n_embd, cfg.n_head, cfg.head_dim),
-                                    dtype=jnp.bfloat16, minval=-s, maxval=s)
-    layer.c_k = jax.random.uniform(keys[1], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
-                                    dtype=jnp.bfloat16, minval=-s, maxval=s)
-    layer.c_v = jax.random.uniform(keys[2], (cfg.n_embd, cfg.n_kv_head, cfg.head_dim),
-                                    dtype=jnp.bfloat16, minval=-s, maxval=s)
-    layer.c_proj = jnp.zeros((cfg.n_head, cfg.head_dim, cfg.n_embd), dtype=jnp.bfloat16)
-    layer.w_gate = jax.random.uniform(keys[3], (cfg.n_embd, cfg.mlp_dim),
-                                       dtype=jnp.bfloat16, minval=-s, maxval=s)
-    layer.w_up = jax.random.uniform(keys[4], (cfg.n_embd, cfg.mlp_dim),
-                                     dtype=jnp.bfloat16, minval=-s, maxval=s)
-    layer.w_down = jnp.zeros((cfg.mlp_dim, cfg.n_embd), dtype=jnp.bfloat16)
-    return layer
-
-
-def single_layer_forward(cfg, layer, x, cos, sin, *, attn_impl='splash',
-                         use_rope=True, use_qk_norm=True):
-    """Forward pass for one transformer layer."""
-    h = rms_norm(x)
-
-    # --- Attention ---
-    q = jnp.einsum('btd,dhk->bhtk', h, layer.c_q)
-    k = jnp.einsum('btd,dhk->bhtk', h, layer.c_k)
-    v = jnp.einsum('btd,dhk->bhtk', h, layer.c_v)
-
-    if use_rope:
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
-    if use_qk_norm:
-        q = rms_norm(q)
-        k = rms_norm(k)
-
-    T = x.shape[1]
-    if attn_impl == 'splash':
-        smask = splash_attention_mask.CausalMask(shape=(T, T))
-        mh_mask = splash_attention_mask.MultiHeadMask(masks=[smask] * cfg.n_head)
-        bs = min(cfg.splash_block_size, T)
-        block_sizes = splash_attention_kernel.BlockSizes(
-            block_q=bs, block_kv=bs, block_q_dkv=bs, block_kv_dkv=bs,
-            block_q_dq=bs, block_kv_dq=bs)
-        kernel = splash_attention_kernel.make_splash_mha(
-            mask=mh_mask, head_shards=1, q_seq_shards=1,
-            block_sizes=block_sizes)
-        attn_out = jax.vmap(kernel)(q, k, v)
-    elif attn_impl == 'einsum':
-        k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
-        scale = cfg.head_dim ** -0.5
-        scores = jnp.einsum('bhtd,bhsd->bhts', q, k_exp) * scale
-        rows = jnp.arange(T)[:, None]
-        cols = jnp.arange(T)[None, :]
-        mask = cols <= rows
-        scores = jnp.where(mask[None, None, :, :], scores,
-                           jnp.finfo(scores.dtype).min)
-        attn_weights = jax.nn.softmax(scores, axis=-1)
-        attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
-    else:
-        k_exp, v_exp = _expand_kv(k, v, cfg.n_head, cfg.n_kv_head)
-        attn_out = jax.nn.dot_product_attention(
-            q, k_exp, v_exp, is_causal=True, implementation='xla')
-
-    attn_out = jnp.einsum('bhtd,hde->bte', attn_out, layer.c_proj)
-    x = x + attn_out
-
-    # --- SwiGLU MLP ---
-    h2 = rms_norm(x)
-    gate = jax.nn.silu(jnp.einsum('btd,dh->bth', h2, layer.w_gate))
-    up = jnp.einsum('btd,dh->bth', h2, layer.w_up)
-    mlp_out = jnp.einsum('bth,hd->btd', gate * up, layer.w_down)
-    x = x + mlp_out
-    return x
 
 # %%
 # 3a. Full layer benchmark
@@ -620,12 +816,6 @@ def bench_layer(x, layer, cos, sin):
 
 r_layer = benchmark(bench_layer, x, layer_p, cos_b, sin_b,
                     flop_count=lf, label="Full layer (splash)")
-
-print(f"\n  Sum of parts (MLP + attn_splash):  "
-      f"{r_mlp['wall_ms'] + r_attn_splash['wall_ms']:.2f} ms")
-print(f"  Full layer:                        {r_layer['wall_ms']:.2f} ms")
-print(f"  Delta (overhead / fusion benefit):  "
-      f"{r_layer['wall_ms'] - r_mlp['wall_ms'] - r_attn_splash['wall_ms']:.2f} ms")
 
 # %%
 # 3b. Layer ablations
@@ -661,30 +851,16 @@ print_summary(results_3b)
 # Does MFU change with depth? How does HBM scale?
 
 # %%
-# === Multi-layer model ===
-
-def init_all_layers(cfg, n_layers, seed=42):
-    layers = dot_dict()
-    for i in range(n_layers):
-        layers[i] = init_layer_params(cfg, seed=seed + i * 7)
-    return layers
-
-
-def multi_layer_forward(cfg, layers, n_layers, x, cos, sin, attn_impl='splash'):
-    for i in range(n_layers):
-        x = single_layer_forward(cfg, layers[i], x, cos, sin, attn_impl=attn_impl)
-    return rms_norm(x)
-
-# %%
 # 4a. Depth sweep
 print("=== Depth sweep ===")
 results_4a = []
 x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
+lf = layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
+                 cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
 
 for n_layers in [1, 4, 8, 16, 24]:
     layers = init_all_layers(cfg, n_layers)
-    fl = n_layers * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
-                                cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
+    fl = n_layers * lf
 
     @jax.jit
     def bench_fn(x, layers, cos, sin, _n=n_layers):
@@ -755,66 +931,7 @@ r_lm = benchmark(bench_lm_head, hidden, lm_head, labels,
                  flop_count=lm_flops, label="LM head (non-chunked)")
 
 # %%
-# 5c. Chunked LM head loss (from 04_maxtext.py)
-
-def _logits_from_chunk(h_chunk, lm_head, config):
-    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
-    logits = logits[:, :config.vocab_size]
-    logits = logits.astype(jnp.float32)
-    return config.softcap * jnp.tanh(logits / config.softcap)
-
-
-@ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
-def chunked_lm_head_loss(hidden, lm_head, labels, config):
-    B, T, D = hidden.shape
-    N = config.num_lm_head_chunks
-    S = B * T // N
-    hidden_chunks = hidden.reshape(N, S, D)
-    labels_chunks = labels.reshape(N, S)
-
-    def fwd_body(_, data):
-        h_chunk, l_chunk = data
-        return None, jnp.sum(
-            optax.softmax_cross_entropy_with_integer_labels(
-                _logits_from_chunk(h_chunk, lm_head, config), l_chunk))
-
-    _, chunk_losses = jax.lax.scan(fwd_body, None, (hidden_chunks, labels_chunks))
-    return jnp.sum(chunk_losses) / (B * T)
-
-
-def _chunked_loss_fwd(hidden, lm_head, labels, config):
-    loss = chunked_lm_head_loss(hidden, lm_head, labels, config)
-    return loss, (hidden, lm_head, labels)
-
-
-def _chunked_loss_bwd(config, residuals, g):
-    hidden, lm_head, labels = residuals
-    B, T, D = hidden.shape
-    N = config.num_lm_head_chunks
-    S = B * T // N
-    hidden_chunks = hidden.reshape(N, S, D)
-    labels_chunks = labels.reshape(N, S)
-
-    def bwd_body(d_lm_head_acc, data):
-        h_chunk, l_chunk = data
-
-        def chunk_loss(h, w):
-            return jnp.sum(
-                optax.softmax_cross_entropy_with_integer_labels(
-                    _logits_from_chunk(h, w, config), l_chunk))
-
-        _, vjp_fn = jax.vjp(chunk_loss, h_chunk, lm_head)
-        d_h, d_w = vjp_fn(g / (B * T))
-        return d_lm_head_acc + d_w, d_h
-
-    d_lm_head_init = jnp.zeros_like(lm_head)
-    d_lm_head, d_hidden_chunks = jax.lax.scan(
-        bwd_body, d_lm_head_init, (hidden_chunks, labels_chunks))
-    return d_hidden_chunks.reshape(B, T, D), d_lm_head, jnp.zeros_like(labels)
-
-
-chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
-
+# 5c. Chunked LM head loss
 print("=== LM head (chunked, 8 chunks) ===")
 
 @jax.jit
@@ -842,112 +959,6 @@ print_summary([r_embed, r_lm, r_lm_chunked])
 # Gradient checkpointing (remat) trades compute for memory.
 
 # %%
-# === Full model for fwd/bwd testing ===
-
-def init_full_model(cfg, seed=42):
-    """Initialize all model params (embed + layers + lm_head + rope)."""
-    key = jax.random.key(seed)
-    params = dot_dict()
-    key, k1, k2 = jax.random.split(key, 3)
-    params.wte = jax.random.normal(k1, (cfg.padded_vocab, cfg.n_embd), dtype=jnp.bfloat16)
-    params.lm_head = jax.random.normal(k2, (cfg.n_embd, cfg.padded_vocab),
-                                        dtype=jnp.bfloat16) * 0.001
-    params.rope_cos, params.rope_sin = precompute_rope(cfg.seq_len, cfg.head_dim)
-    params.layers = init_all_layers(cfg, cfg.n_layer, seed=seed + 100)
-    return params
-
-
-def model_forward(cfg, params, tokens):
-    """Full forward: embed -> layers -> final_norm.  Returns hidden (B,T,E)."""
-    B, T = tokens.shape
-    cos = params.rope_cos[:T][None, None, :, :]
-    sin = params.rope_sin[:T][None, None, :, :]
-    x = rms_norm(params.wte[tokens])
-    for i in range(cfg.n_layer):
-        x = single_layer_forward(cfg, params.layers[i], x, cos, sin, attn_impl='splash')
-    return rms_norm(x)
-
-
-def model_forward_remat(cfg, params, tokens):
-    """Same as model_forward but with jax.checkpoint on each layer."""
-    B, T = tokens.shape
-    cos = params.rope_cos[:T][None, None, :, :]
-    sin = params.rope_sin[:T][None, None, :, :]
-    x = rms_norm(params.wte[tokens])
-    layer_fn = ft.partial(single_layer_forward, cfg, attn_impl='splash')
-    for i in range(cfg.n_layer):
-        x = jax.checkpoint(layer_fn)(params.layers[i], x, cos, sin)
-    return rms_norm(x)
-
-
-# %%
-# === Utilities for optimizer benchmarks ===
-
-def split_trainable(params):
-    """Split params into trainable and static (non-differentiable).
-    From 02_train.py — rope_cos/rope_sin are precomputed, not trained."""
-    trainable = dot_dict()
-    static = dot_dict()
-    for k, v in params.items():
-        if k in ('rope_cos', 'rope_sin'):
-            static[k] = v
-        else:
-            trainable[k] = v
-    return trainable, static
-
-
-def merge_params(trainable, static):
-    """Merge trainable and static params back together."""
-    merged = dot_dict()
-    merged.update(trainable)
-    merged.update(static)
-    return merged
-
-
-def init_adam_state(param):
-    """Initialize Adam optimizer state for a single parameter."""
-    return dot_dict(
-        mu=jnp.zeros_like(param),
-        nu=jnp.zeros_like(param),
-        count=jnp.array(0, dtype=jnp.int32),
-    )
-
-
-def adamw_step(lr, beta1, beta2, eps, wd, lr_mult, param, grad, state):
-    """AdamW update with explicit hyperparams. Returns (new_param, new_state).
-    Note: weight_decay applied only to 2D+ params (matching 02_train.py).
-    optax applies weight_decay uniformly — minor semantic difference on bias/scalar params."""
-    new_count = state.count + 1
-    new_mu = beta1 * state.mu + (1 - beta1) * grad
-    new_nu = beta2 * state.nu + (1 - beta2) * grad ** 2
-
-    mu_hat = new_mu / (1 - beta1 ** new_count)
-    nu_hat = new_nu / (1 - beta2 ** new_count)
-
-    lr_eff = lr * lr_mult
-    update = mu_hat / (jnp.sqrt(nu_hat) + eps)
-
-    # Weight decay for 2D+ params only (matches 02_train.py)
-    wd_eff = jnp.where(param.ndim >= 2, wd, 0.0)
-    new_param = param - lr_eff * (update + wd_eff * param)
-
-    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
-    return new_param, new_state
-
-
-def count_params(params):
-    """Count total trainable parameters (excludes rope_cos/rope_sin)."""
-    trainable, _ = split_trainable(params)
-    return sum(p.size for p in jax.tree.leaves(trainable) if isinstance(p, jax.Array))
-
-
-def count_non_embed_params(params):
-    """Non-embedding params (unembed + layers). Excludes wte (lookup table)."""
-    return count_params(params) - params.wte.size
-
-
-
-# %%
 full_params = init_full_model(cfg)
 tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
 labels = fake_tokens(cfg.batch_size, cfg.seq_len)
@@ -955,6 +966,7 @@ labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 total_model_flops = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
                      cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
                      matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd))
+bwd_flops = 3 * total_model_flops
 
 # %%
 # 6a. Forward only
@@ -979,8 +991,6 @@ def bench_fwd_bwd(params, tokens):
         return chunked_lm_head_loss(hidden, p.lm_head, labels, cfg)
     return jax.value_and_grad(loss_fn)(params)
 
-# ~3x forward FLOPs (fwd + 2x bwd)
-bwd_flops = 3 * total_model_flops
 r_fwd_bwd = benchmark(bench_fwd_bwd, full_params, tokens,
                        flop_count=bwd_flops, label="Forward+Backward")
 
@@ -1381,19 +1391,31 @@ print_summary(results_7f)
 print("=== Phase 9: Optimizer Step Benchmarks ===")
 print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, L={cfg.n_layer}")
 
-n_params = count_params(full_params)
-print(f"Trainable params: {n_params:,}")
+full_params_9 = init_full_model(cfg)
+n_params_9 = count_params(full_params_9)
+print(f"Trainable params: {n_params_9:,}")
 
-# Shared: tokens and labels for all optimizer benchmarks
 opt_tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
 opt_labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
-# Optimizer hyperparams (matching 02_train.py defaults)
-OPT_LR = 3e-4
-OPT_BETA1 = 0.9
-OPT_BETA2 = 0.95
-OPT_EPS = 1e-8
-OPT_WD = 0.1
+total_model_flops_9 = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
+                       cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
+                       matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd))
+bwd_flops_9 = 3 * total_model_flops_9
+
+# %%
+# 9a-baseline. Remat baseline (fwd+bwd only, no optimizer)
+print("\n--- 9a-baseline. Fwd+Bwd (remat) baseline ---")
+
+@jax.jit
+def bench_remat_9(params, tokens):
+    def loss_fn(p):
+        hidden = model_forward_remat(cfg, p, tokens)
+        return chunked_lm_head_loss(hidden, p.lm_head, opt_labels, cfg)
+    return jax.value_and_grad(loss_fn)(params)
+
+r_remat_9 = benchmark(bench_remat_9, full_params_9, opt_tokens,
+                      flop_count=bwd_flops_9, label="Fwd+Bwd (remat)")
 
 # %%
 # 9a. Manual AdamW (per-leaf loop, matching 02_train.py)
@@ -1434,7 +1456,7 @@ def bench_manual_adamw(params, opt_state, tokens, lr_mult):
 
 lr_mult = jnp.array(1.0, dtype=jnp.float32)
 r_manual = benchmark(bench_manual_adamw, manual_params, manual_opt_state,
-                     opt_tokens, lr_mult, flop_count=bwd_flops,
+                     opt_tokens, lr_mult, flop_count=bwd_flops_9,
                      label="Manual AdamW (full step)")
 
 # %%
@@ -1463,7 +1485,7 @@ def bench_optax_f32(params, opt_state, tokens):
     return loss, new_params, new_opt_state
 
 r_optax_f32 = benchmark(bench_optax_f32, optax_params_f32, optax_state_f32,
-                         opt_tokens, flop_count=bwd_flops,
+                         opt_tokens, flop_count=bwd_flops_9,
                          label="optax.adamw f32 (full step)")
 
 # %%
@@ -1493,13 +1515,13 @@ def bench_optax_bf16(params, opt_state, tokens):
     return loss, new_params, new_opt_state
 
 r_optax_bf16 = benchmark(bench_optax_bf16, optax_params_bf16, optax_state_bf16,
-                          opt_tokens, flop_count=bwd_flops,
+                          opt_tokens, flop_count=bwd_flops_9,
                           label="optax.adamw bf16 (full step)")
 
 # %%
 # 9d. Phase 9 Summary
 print("\n=== Phase 9 Summary ===")
-phase9_results = [r_remat, r_manual, r_optax_f32, r_optax_bf16]
+phase9_results = [r_remat_9, r_manual, r_optax_f32, r_optax_bf16]
 print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MFU%':>6s}  {'tok/s':>10s}")
 print("  " + "-" * 72)
 for r in phase9_results:
@@ -1509,8 +1531,8 @@ for r in phase9_results:
 
 # Optimizer overhead vs fwd+bwd only
 for r in [r_manual, r_optax_f32, r_optax_bf16]:
-    overhead = r['wall_ms'] - r_remat['wall_ms']
-    pct = overhead / r_remat['wall_ms'] * 100
+    overhead = r['wall_ms'] - r_remat_9['wall_ms']
+    pct = overhead / r_remat_9['wall_ms'] * 100
     print(f"  {r['label']:<40s}  optimizer overhead: {overhead:+.2f} ms ({pct:+.1f}%)")
 
 # %% [markdown]
@@ -1680,6 +1702,81 @@ for r in results_11:
     print(f"  {r['label']:<20s}  {r['n_non_embed']:>10,}  {r['n_params']:>10,}  "
           f"{r['wall_ms']:8.2f}  {r['mfu_pct']:5.1f}%  "
           f"{r['tok_per_sec']:>10,.0f}  {r['est_hours_20x']:7.1f}h")
+
+# %% [markdown]
+# ## Phase 12 — XProf Trace
+#
+# Capture an XProf hardware trace for one selected architecture.
+# Shows MXU utilization, memory timeline, op-level breakdown, and idle gaps.
+#
+# - Warmup runs first (absorbs JIT compilation)
+# - Then 5 profiled steps are captured
+# - View the trace in TensorBoard below
+
+# %%
+# === Phase 12: XProf profiling ===
+# Pick an architecture to profile (D1024-F3072-B4 from Phase 11 is a good default)
+print("=== Phase 12: XProf Trace Capture ===")
+prof_cfg = PerfConfig(batch_size=4, n_head=3, n_kv_head=1, head_dim=256,
+                      n_embd=1024, mlp_dim=3072, n_layer=8)
+print(f"Profiling config: B={prof_cfg.batch_size}, T={prof_cfg.seq_len}, "
+      f"D={prof_cfg.n_embd}, N={prof_cfg.n_head}, K={prof_cfg.n_kv_head}, "
+      f"H={prof_cfg.head_dim}, F={prof_cfg.mlp_dim}, L={prof_cfg.n_layer}")
+
+prof_params = init_full_model(prof_cfg)
+prof_tokens = fake_tokens(prof_cfg.batch_size, prof_cfg.seq_len)
+prof_labels = fake_tokens(prof_cfg.batch_size, prof_cfg.seq_len)
+
+prof_trainable, prof_static = split_trainable(prof_params)
+prof_sched = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
+                          eps=OPT_EPS, weight_decay=OPT_WD)
+prof_opt_state = prof_sched.init(prof_trainable)
+
+@jax.jit
+def prof_train_step(params, opt_state, tokens):
+    trainable, static = split_trainable(params)
+
+    def loss_fn(t):
+        full = merge_params(t, static)
+        hidden = model_forward_remat(prof_cfg, full, tokens)
+        return chunked_lm_head_loss(hidden, full.lm_head, prof_labels, prof_cfg)
+
+    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    updates, new_opt_state = prof_sched.update(grads, opt_state, trainable)
+    new_trainable = optax.apply_updates(trainable, updates)
+    new_params = merge_params(new_trainable, static)
+    return loss, new_params, new_opt_state
+
+# Warmup (JIT compilation)
+print("Warming up (JIT compile)...")
+for i in range(3):
+    loss, prof_params, prof_opt_state = prof_train_step(
+        prof_params, prof_opt_state, prof_tokens)
+    jax.block_until_ready(loss)
+    print(f"  warmup {i}: loss={float(loss):.4f}")
+
+# Profiled steps
+PROF_DIR = '/content/log_dir/xprof_perf'
+print(f"\nCapturing XProf trace to '{PROF_DIR}'...")
+jax.profiler.start_trace(PROF_DIR)
+for i in range(5):
+    loss, prof_params, prof_opt_state = prof_train_step(
+        prof_params, prof_opt_state, prof_tokens)
+    jax.block_until_ready(loss)
+    print(f"  profiled step {i}: loss={float(loss):.4f}")
+jax.profiler.stop_trace()
+print(f"Trace saved to '{PROF_DIR}'.")
+
+# %%
+# === View XProf Results ===
+# - **Overview page**: shows MXU% (hardware-measured) and step time breakdown
+# - **Trace viewer**: zoom into individual ops (attention, MLP, optimizer)
+# - **Memory viewer**: HBM usage timeline, peak usage, fragmentation
+# - Large gaps between "Device Execution" blocks = INPUT BOUND
+# - Tightly packed blocks = COMPUTE BOUND (good!)
+
+# %load_ext tensorboard
+# %tensorboard --logdir /content/log_dir/xprof_perf
 
 # %% [markdown]
 # ## Ideas from scaling-book
