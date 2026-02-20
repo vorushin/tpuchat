@@ -669,34 +669,24 @@ chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
 # %%
 # === train_step, eval_step, predict_step, generate ===
 
-@jax.jit
-def train_step(config, params, opt_state, x, y, lr_mult):
-    """Single training step: forward, backward, optimizer update."""
-    trainable, static = split_trainable(params)
+def make_train_step(optimizer):
+    """Create a JIT-compiled train step with the given optax optimizer."""
+    @jax.jit
+    def train_step(config, params, opt_state, x, y, _opt=optimizer):
+        trainable, static = split_trainable(params)
 
-    def loss_fn(trainable_params):
-        full_params = merge_params(trainable_params, static)
-        hidden = model_forward_remat(config, full_params, x)
-        return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
+        def loss_fn(trainable_params):
+            full_params = merge_params(trainable_params, static)
+            hidden = model_forward_remat(config, full_params, x)
+            return chunked_lm_head_loss(hidden, full_params.lm_head, y, config)
 
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+        loss, grads = jax.value_and_grad(loss_fn)(trainable)
+        updates, new_opt_state = _opt.update(grads, opt_state, trainable)
+        new_trainable = optax.apply_updates(trainable, updates)
+        new_params = merge_params(new_trainable, static)
 
-    is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
-    t_leaves, t_treedef = jax.tree.flatten(trainable)
-    g_leaves, _ = jax.tree.flatten(grads)
-    o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
-
-    new_t_leaves, new_o_leaves = [], []
-    for p, g, s in zip(t_leaves, g_leaves, o_leaves):
-        new_p, new_s = adamw_step(config, lr_mult, p, g, s)
-        new_t_leaves.append(new_p)
-        new_o_leaves.append(new_s)
-
-    new_trainable = t_treedef.unflatten(new_t_leaves)
-    new_opt_state = o_treedef.unflatten(new_o_leaves)
-    new_params = merge_params(new_trainable, static)
-
-    return loss, new_params, new_opt_state
+        return loss, new_params, new_opt_state
+    return train_step
 
 
 @jax.jit
@@ -761,7 +751,10 @@ print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
 trainable_params, static_params = split_trainable(params)
-opt_state = jax.tree.map(init_adam_state, trainable_params)
+optimizer = optax.adamw(config.learning_rate, b1=config.beta1, b2=config.beta2,
+                        eps=config.eps, weight_decay=config.weight_decay)
+opt_state = optimizer.init(trainable_params)
+train_step = make_train_step(optimizer)
 
 # Data
 raw_train = tokenize_shards(train_shard_indices, config.batch_size, config.seq_len)
@@ -809,15 +802,13 @@ for step in range(NUM_QUICK_STEPS + 1):
         print(f"XProf stopped. Trace saved to '{LOG_DIR}'.")
 
     # --- Train step ---
-    lr_mult = jnp.array(get_lr_multiplier(step, NUM_QUICK_STEPS, config),
-                         dtype=jnp.float32)
     t_data = time.time()
     x_batch, y_batch = next(train_loader)
     dt_data = time.time() - t_data
 
     t0 = time.time()
     loss, params, opt_state = train_step(config, params, opt_state,
-                                          x_batch, y_batch, lr_mult)
+                                          x_batch, y_batch)
     loss.block_until_ready()
     dt = time.time() - t0
 
@@ -907,7 +898,10 @@ def sweep_train_fn():
     print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 
     trainable, static = split_trainable(params)
-    opt_state = jax.tree.map(init_adam_state, trainable)
+    sweep_opt = optax.adamw(lr, b1=cfg.beta1, b2=cfg.beta2,
+                            eps=cfg.eps, weight_decay=cfg.weight_decay)
+    opt_state = sweep_opt.init(trainable)
+    sweep_train_step = make_train_step(sweep_opt)
 
     raw_train = tokenize_shards(train_shard_indices, cfg.batch_size, cfg.seq_len)
     train_loader = PrefetchDataLoader(raw_train, capacity=4)
@@ -948,12 +942,10 @@ def sweep_train_fn():
                 break
 
             # --- Train ---
-            lr_mult = jnp.array(get_lr_multiplier(step, SWEEP_STEPS, cfg),
-                                 dtype=jnp.float32)
             t0 = time.time()
             x_batch, y_batch = next(train_loader)
-            loss, params, opt_state = train_step(cfg, params, opt_state,
-                                                  x_batch, y_batch, lr_mult)
+            loss, params, opt_state = sweep_train_step(cfg, params, opt_state,
+                                                        x_batch, y_batch)
             loss.block_until_ready()
             dt = time.time() - t0
 
@@ -1011,7 +1003,11 @@ print(f'Estimated time: {HERO_STEPS * 0.022 / 3600:.1f} hours (at 22ms/step)')
 
 # Init optimizer
 trainable, static = split_trainable(hero_params)
-opt_state = jax.tree.map(init_adam_state, trainable)
+hero_opt = optax.adamw(hero_config.learning_rate, b1=hero_config.beta1,
+                       b2=hero_config.beta2, eps=hero_config.eps,
+                       weight_decay=hero_config.weight_decay)
+opt_state = hero_opt.init(trainable)
+hero_train_step = make_train_step(hero_opt)
 
 # Data
 raw_train = tokenize_shards(train_shard_indices, hero_config.batch_size, hero_config.seq_len)
@@ -1087,12 +1083,10 @@ try:
             break
 
         # --- Train step ---
-        lr_mult = jnp.array(get_lr_multiplier(step, HERO_STEPS, hero_config),
-                             dtype=jnp.float32)
         t0 = time.time()
         x_batch, y_batch = next(train_loader)
-        loss, params, opt_state = train_step(hero_config, params, opt_state,
-                                              x_batch, y_batch, lr_mult)
+        loss, params, opt_state = hero_train_step(hero_config, params, opt_state,
+                                                   x_batch, y_batch)
         loss.block_until_ready()
         dt = time.time() - t0
 
