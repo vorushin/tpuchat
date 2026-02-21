@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 2)
+# # 08 — TPU Ablation Lab (rev 3)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -65,7 +65,7 @@ PEAK_TFLOPS = 918          # bf16 peak compute per chip
 HBM_GB = 32
 MXU_DIM = 256              # 256×256 systolic array
 
-REVISION = 2
+REVISION = 3
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -969,6 +969,10 @@ def sweep_train_fn():
 sweep_id = wandb.sweep(sweep_config, project="tpuchat-ablations")
 print(f"Sweep ID: {sweep_id}")
 wandb.agent(sweep_id, function=sweep_train_fn, count=5)
+
+# --- Disconnect runtime to stop billing ---
+from google.colab import runtime
+runtime.unassign()
 
 # %% [markdown]
 # ## Hero Run (20 tok/param)
