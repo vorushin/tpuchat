@@ -27,7 +27,7 @@
 # - SDPA ~2x faster than einsum, mx.fast.rope 2.3x speedup
 # - GQA n_kv=1 marginally fastest
 #
-# Expected: ~7K-8K tok/s, ~35 hours wall clock, final loss ~3.5-4.0
+# Expected: ~9K-10K tok/s (~34% MFU), ~25 hours wall clock, final loss ~3.5-4.0
 
 # %%
 import functools as ft
@@ -66,7 +66,7 @@ class Config:
     mlp_dim: int = 2048        # 8/3 × E ≈ SwiGLU standard ratio
     vocab_size: int = 32768
     softcap: float = 15.0
-    num_lm_head_chunks: int = 8
+    num_lm_head_chunks: int = 2
 
     # Training
     seq_len: int = 2048
@@ -79,7 +79,7 @@ class Config:
     warmup_ratio: float = 0.02
     warmdown_ratio: float = 0.5
     max_grad_norm: float = 1.0
-    use_remat: bool = True
+    use_remat: bool = False
     target_tokens: int = 1_000_000_000  # 1B tokens
 
     # Eval / Logging
@@ -376,6 +376,38 @@ num_params = sum(p.size for _, p in mlx.utils.tree_flatten(params))
 print(f'Model parameters: {num_params:,} ({num_params/1e6:.1f}M)')
 print(f'Model memory (bf16): {num_params * 2 / 1e6:.0f} MB')
 
+# FLOP counting for MFU (matching 08_tpu_ablations methodology)
+PEAK_TFLOPS = 17.2  # Apple M4 Pro bf16 peak
+
+def matmul_flops(M, N, K, batch=1):
+    return 2 * batch * M * N * K
+
+def attention_flops(B, N, T, H):
+    return 2 * (2 * B * N * T * T * H)
+
+def compute_layer_flops(B, T, D, N, K, H, F):
+    """GLU MLP: 3 matmuls (gate + up + down)."""
+    tok = B * T
+    q    = 2 * tok * D * N * H
+    k    = 2 * tok * D * K * H
+    v    = 2 * tok * D * K * H
+    att  = attention_flops(B, N, T, H)
+    proj = 2 * tok * N * H * D
+    mlp  = 3 * (2 * tok * D * F)
+    return q + k + v + att + proj + mlp
+
+fwd_flops = (cfg.n_layer * compute_layer_flops(
+    cfg.device_batch_size, cfg.seq_len, cfg.n_embd,
+    cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
+    + matmul_flops(cfg.device_batch_size * cfg.seq_len,
+                   cfg.padded_vocab, cfg.n_embd))
+step_flops = 3 * fwd_flops
+flops_per_tok = step_flops / cfg.total_batch_tokens
+ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
+print(f'Step FLOPs: {step_flops/1e12:.3f} TFLOP | '
+      f'FLOPs/tok: {flops_per_tok/1e6:.1f}M | '
+      f'Ideal tok/s (100% MFU): {int(ideal_tok_s):,}')
+
 # %% [markdown]
 # ## Optimizer
 
@@ -411,20 +443,21 @@ print(f'Schedule: warmup {warmup_steps} + constant {constant_steps} + warmdown {
 # ## Training Step
 
 # %%
-def train_step(cfg, params, optimizer, x, y):
-    """Single training step: forward, backward, optimizer update."""
+@mx.compile
+def compiled_loss_and_grads(params, x, y):
+    """Compiled forward + backward + grad clip (compute-heavy part)."""
     def loss_fn(p):
         hidden = model_forward(cfg, p, x)
         return chunked_lm_head_loss(hidden, p['lm_head'], y, cfg)
-
     loss, grads = mx.value_and_grad(loss_fn)(params)
-
-    # Gradient clipping
     grads, gnorm = optim.clip_grad_norm(grads, max_norm=cfg.max_grad_norm)
+    return loss, grads, gnorm
 
-    # AdamW update
+
+def train_step(cfg, params, optimizer, x, y):
+    """Single training step: compiled fwd/bwd + optimizer update."""
+    loss, grads, gnorm = compiled_loss_and_grads(params, x, y)
     new_params = optimizer.apply_gradients(grads, params)
-
     return loss, new_params, gnorm
 
 # %% [markdown]
@@ -558,6 +591,10 @@ val_loss_history = []
 smooth_loss = 0.0
 total_training_time = 0.0
 best_val_loss = float('inf')
+MFU_START_STEP = 20
+mfu_t0 = None
+mfu_tokens = 0
+mfu_eval_time = 0.0
 
 print(f'\n=== Starting training for {num_iterations:,} steps ===')
 print(f'Expected: ~{num_iterations * cfg.total_batch_tokens / 1e9:.1f}B tokens')
@@ -568,7 +605,10 @@ for step in range(num_iterations + 1):
 
     # === Eval ===
     if cfg.eval_every > 0 and (last_step or step % cfg.eval_every == 0):
+        eval_t0 = time.time()
         avg_val_loss = eval_loss(cfg, params, val_loader_fn, cfg.eval_steps)
+        if mfu_t0 is not None:
+            mfu_eval_time += time.time() - eval_t0
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
         val_loss_history.append((step, avg_val_loss))
@@ -611,6 +651,12 @@ for step in range(num_iterations + 1):
     mx.eval(loss, params)
     dt = time.time() - t0
 
+    # MFU tracking
+    if step == MFU_START_STEP:
+        mfu_t0 = time.time()
+    if step > MFU_START_STEP:
+        mfu_tokens += cfg.total_batch_tokens
+
     if step > 10:
         total_training_time += dt
 
@@ -632,13 +678,24 @@ for step in range(num_iterations + 1):
             eta = f' | eta: {hrs:.1f}h' if hrs >= 1 else f' | eta: {remaining/60:.1f}m'
         gnorm_val = gnorm.item()
         cur_lr = optimizer.learning_rate.item()
+        mfu_str = ''
+        if step > MFU_START_STEP and mfu_t0 is not None:
+            step_mfu = step_flops / (PEAK_TFLOPS * 1e12 * dt) * 100 if dt > 0 else 0
+            mfu_str = f' | MFU: {step_mfu:.1f}%'
         print(f'step {step:06d}/{num_iterations:06d} ({pct:5.1f}%) | '
               f'loss: {debiased_loss:.4f} | lr: {cur_lr:.2e} | '
               f'gnorm: {gnorm_val:.2f} | dt: {dt*1000:.0f}ms | '
-              f'tok/s: {tok_per_sec:,}{eta}')
+              f'tok/s: {tok_per_sec:,}{mfu_str}{eta}')
 
 print(f'\nTraining complete. Total time: {total_training_time/3600:.1f}h')
 print(f'Best val loss: {best_val_loss:.4f}')
+
+if mfu_t0 is not None:
+    mfu_wall = time.time() - mfu_t0 - mfu_eval_time
+    tok_per_s = int(mfu_tokens / mfu_wall)
+    mfu_pct = (tok_per_s * flops_per_tok) / (PEAK_TFLOPS * 1e12) * 100
+    print(f'MFU: {mfu_pct:.1f}% | tok/s: {tok_per_s:,} | '
+          f'ideal tok/s (100% MFU): {int(ideal_tok_s):,}')
 
 # %%
 # === Plot training curves ===

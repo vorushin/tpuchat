@@ -568,3 +568,26 @@ Agent: Simplified 08_tpu_ablations.py after finding root cause:
 - Added data loading latency measurement (confirmed 0.0ms)
 
 Key lesson: optax.adamw uses `jax.tree.map` which decomposes into separate passes per operation (all mu updates, then all nu updates, etc.), giving XLA better fusion opportunities. A manual per-leaf loop interleaves all operations per parameter, creating a much harder graph to optimize. The overhead is fixed (~14ms for 58 params) but relative impact depends on model size — negligible for 168M/L=24 (Phase 9 benchmark config), catastrophic for 125M/L=8.
+
+## Feb 21 2026
+
+Agent: Added MFU measurement and mx.compile optimization to Apple Silicon notebooks (06, 07).
+
+**Benchmark results** (M4 Pro, MLX 0.30.6, E=768, L=8, ~99M params):
+- `mx.compile` gives ~1.13x speedup: 30% → 34% MFU (8,668 → 9,829 tok/s)
+- Batch sizes B=4,8,16 all give ~34% MFU; B=32 crashes to 4.2% (swap thrashing)
+- Model width E=1024 slightly better (33.4% MFU) but fewer tok/s
+- Remat hurts: 33.4% → 27.2% MFU (48 GB is plenty, no need for checkpointing)
+- Chunks=1-2 marginally better than chunks=4-8
+
+**Changes to 06_apple_silicon_perf.py:**
+- Added Phase 9: mx.compile + MFU benchmarks (compiled vs non-compiled, batch sweep, width sweep, chunk sweep)
+- Updated Final Summary to include Phase 9 results
+
+**Changes to 07_train_mlx.py:**
+- Applied `@mx.compile` to forward+backward+grad_clip (optimizer stays outside)
+- Added FLOP counting and per-step + aggregate MFU reporting (matching 08's methodology)
+- Reduced `num_lm_head_chunks` 8→2, disabled remat
+- Expected: ~9K-10K tok/s, ~34% MFU
+
+**Why ~34% not ~50%:** M4 Pro is fundamentally bandwidth-limited (63 FLOPs/byte vs TPU's 574). The ~34% MFU is actually quite good for this hardware — the ceiling is set by memory bandwidth, not compute.
