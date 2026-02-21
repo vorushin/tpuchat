@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 3)
+# # 08 — TPU Ablation Lab (rev 4)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -65,7 +65,7 @@ PEAK_TFLOPS = 918          # bf16 peak compute per chip
 HBM_GB = 32
 MXU_DIM = 256              # 256×256 systolic array
 
-REVISION = 3
+REVISION = 4
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -869,6 +869,7 @@ sweep_config = {
     },
 }
 
+SWEEP_ID = None            # set to existing sweep ID to continue, e.g. 'abc123'
 SWEEP_STEPS = 2_500        # ~13 min at ~300ms/step (same ~328M token budget)
 SWEEP_EVAL_EVERY = 250
 
@@ -966,8 +967,12 @@ def sweep_train_fn():
     print(f'Run complete. Best val loss: {best_val_loss:.4f}')
 
 
-sweep_id = wandb.sweep(sweep_config, project="tpuchat-ablations")
-print(f"Sweep ID: {sweep_id}")
+if SWEEP_ID is None:
+    sweep_id = wandb.sweep(sweep_config, project="tpuchat-ablations")
+    print(f"New sweep ID: {sweep_id}")
+else:
+    sweep_id = SWEEP_ID
+    print(f"Continuing sweep: {sweep_id}")
 wandb.agent(sweep_id, function=sweep_train_fn, count=5)
 
 # --- Disconnect runtime to stop billing ---
