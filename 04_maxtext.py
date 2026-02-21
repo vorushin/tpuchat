@@ -119,7 +119,8 @@ print(f'Model: n_layer={config.n_layer}, n_embd={config.n_embd}, n_head={config.
 # %%
 # === HuggingFace Hub login + download tokenizer ===
 from huggingface_hub import login, HfApi, hf_hub_download
-login()  # will prompt for your HF token
+from google.colab import userdata
+login(token=userdata.get("HF_TOKEN"))
 
 # Download tokenizer files from HF Hub
 import pickle

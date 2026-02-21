@@ -168,7 +168,8 @@ NUM_TRAIN_SHARDS = 50
 NUM_VAL_SHARDS = 2
 
 # --- HF login + tokenizer ---
-login()
+from google.colab import userdata
+login(token=userdata.get("HF_TOKEN"))
 
 os.makedirs(TOKENIZER_DIR, exist_ok=True)
 hf_hub_download(repo_id=HF_REPO_ID, filename='tokenizer/tokenizer.pkl',
@@ -850,8 +851,9 @@ for prompt in ['The capital of France is', 'Machine learning is']:
 # Workflow: set attn_impl, mlp_type, qk_norm in Config above,
 # re-run Model cells, then run this cell to sweep LR for that config.
 import wandb
+from google.colab import userdata
 
-wandb.login()
+wandb.login(key=userdata.get("WANDB_TOKEN"))
 
 sweep_config = {
     "name": f"ablation-{config.mlp_type}-{config.attn_impl}-qknorm{config.qk_norm}",
@@ -970,6 +972,7 @@ wandb.agent(sweep_id, function=sweep_train_fn, count=5)
 # %%
 # === Hero run: 20 tok/param, ~1.9 hours ===
 import wandb
+from google.colab import userdata
 
 SAVE_CHECKPOINTS = False   # save params to disk every 50k steps
 CHECKPOINT_DIR = '/content/checkpoints'
@@ -1011,7 +1014,7 @@ fwd_flops = (hero_config.n_layer * layer_flops(
 step_flops = 3 * fwd_flops
 
 # wandb
-wandb.login()
+wandb.login(key=userdata.get("WANDB_TOKEN"))
 wandb.init(project="tpuchat-ablations",
            name=f"hero-{hero_config.mlp_type}-{hero_config.attn_impl}-qknorm{hero_config.qk_norm}",
            config={

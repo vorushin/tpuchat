@@ -28,7 +28,8 @@
 # %%
 # Login to HuggingFace Hub for saving the trained tokenizer
 from huggingface_hub import login, HfApi
-login()  # will prompt for your HF token
+from google.colab import userdata
+login(token=userdata.get("HF_TOKEN"))
 
 HF_REPO_ID = 'vorushin/tpuchat'  # change this to your HF username/repo
 LOCAL_TOKENIZER_DIR = '/content/tokenizer'

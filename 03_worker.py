@@ -108,10 +108,11 @@ class Config:
 
 # %%
 # === wandb + HuggingFace login ===
-wandb.login()
+from google.colab import userdata
+wandb.login(key=userdata.get("WANDB_TOKEN"))
 
 from huggingface_hub import login, HfApi, hf_hub_download
-login()  # will prompt for your HF token
+login(token=userdata.get("HF_TOKEN"))
 
 # %%
 # === Download tokenizer + data shards ===
