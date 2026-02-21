@@ -1135,6 +1135,246 @@ print_summary(results_7e)
 # for host→device transfer (the main bottleneck on discrete GPUs and TPUs).
 # The bottleneck shifts to disk I/O and tokenization throughput.
 
+# %% [markdown]
+# ## Phase 9 — `mx.compile` and MFU Measurement
+#
+# Key optimization for bandwidth-limited M4 Pro: `mx.compile` fuses operations
+# into optimized Metal compute graphs, eliminating intermediate memory roundtrips.
+#
+# **MFU formula** (matching 08_tpu_ablations):
+# - `step_flops = 3 * fwd_flops` (forward + 2x backward)
+# - `MFU% = step_flops / (PEAK_TFLOPS * 1e12 * step_time_s) * 100`
+
+# %%
+# === Phase 9: mx.compile + MFU benchmarks ===
+print("=" * 80)
+print("  Phase 9 — mx.compile + MFU Measurement")
+print("=" * 80)
+
+# FLOP counting helpers (matching 08_tpu_ablations)
+def compute_layer_flops(B, T, D, N, K, H, F):
+    """GLU MLP: 3 matmuls (gate + up + down)."""
+    tok = B * T
+    q    = 2 * tok * D * N * H
+    k    = 2 * tok * D * K * H
+    v    = 2 * tok * D * K * H
+    att  = attention_flops(B, N, T, H)
+    proj = 2 * tok * N * H * D
+    mlp  = 3 * (2 * tok * D * F)
+    return q + k + v + att + proj + mlp
+
+def compute_mfu(step_time_s, step_flops):
+    """Compute MFU% from step time and total step FLOPs."""
+    return (step_flops / (PEAK_TFLOPS * 1e12 * step_time_s)) * 100
+
+# %%
+# 9a. Compiled vs non-compiled forward+backward MFU
+print("\n=== 9a. mx.compile impact on fwd+bwd MFU ===")
+print(f"Config: E={cfg.n_embd}, L={cfg.n_layer}, B={cfg.batch_size}, T={cfg.seq_len}")
+
+# Compute FLOPs for this config
+lf = compute_layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
+                          cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
+lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd)
+fwd_flops = cfg.n_layer * lf + lm_flops
+step_flops = 3 * fwd_flops  # fwd + 2x bwd
+flops_per_tok = step_flops / (cfg.batch_size * cfg.seq_len)
+
+print(f"Forward FLOPs: {fwd_flops/1e12:.3f} TFLOP")
+print(f"Step FLOPs (3x fwd): {step_flops/1e12:.3f} TFLOP")
+print(f"FLOPs/token: {flops_per_tok/1e6:.1f}M")
+ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
+print(f"Ideal tok/s (100% MFU): {int(ideal_tok_s):,}")
+
+tok = fake_tokens(cfg.batch_size, cfg.seq_len + 1)
+labels = tok[:, 1:]
+tok = tok[:, :-1]
+p = init_full_model(cfg)
+mx.eval(p)
+
+# Non-compiled fwd+bwd
+def fwd_bwd_no_compile(params, tokens, labels):
+    def loss_fn(p):
+        hidden = model_forward(cfg, p, tokens)
+        return chunked_lm_head_loss(hidden, p['lm_head'], labels, cfg)
+    return mx.value_and_grad(loss_fn)(params)
+
+# Warmup
+for _ in range(2):
+    loss, grads = fwd_bwd_no_compile(p, tok, labels)
+    mx.eval(loss, grads)
+
+times_no_compile = []
+for _ in range(5):
+    t0 = time.time()
+    loss, grads = fwd_bwd_no_compile(p, tok, labels)
+    mx.eval(loss, grads)
+    times_no_compile.append(time.time() - t0)
+avg_no_compile = sum(times_no_compile) / len(times_no_compile)
+tps_no_compile = int(cfg.batch_size * cfg.seq_len / avg_no_compile)
+mfu_no_compile = compute_mfu(avg_no_compile, step_flops)
+
+# Compiled fwd+bwd
+@mx.compile
+def fwd_bwd_compiled(params, tokens, labels):
+    def loss_fn(p):
+        hidden = model_forward(cfg, p, tokens)
+        return chunked_lm_head_loss(hidden, p['lm_head'], labels, cfg)
+    return mx.value_and_grad(loss_fn)(params)
+
+for _ in range(2):
+    loss, grads = fwd_bwd_compiled(p, tok, labels)
+    mx.eval(loss, grads)
+
+times_compiled = []
+for _ in range(5):
+    t0 = time.time()
+    loss, grads = fwd_bwd_compiled(p, tok, labels)
+    mx.eval(loss, grads)
+    times_compiled.append(time.time() - t0)
+avg_compiled = sum(times_compiled) / len(times_compiled)
+tps_compiled = int(cfg.batch_size * cfg.seq_len / avg_compiled)
+mfu_compiled = compute_mfu(avg_compiled, step_flops)
+
+print(f"  No compile:   {avg_no_compile*1000:8.1f}ms  {tps_no_compile:>8,} tok/s  MFU: {mfu_no_compile:.1f}%")
+print(f"  Compiled:     {avg_compiled*1000:8.1f}ms  {tps_compiled:>8,} tok/s  MFU: {mfu_compiled:.1f}%")
+print(f"  Speedup: {avg_no_compile/avg_compiled:.2f}x")
+
+# %%
+# 9b. Batch size sweep with mx.compile
+print("\n=== 9b. Batch size sweep (compiled, E={}, L={}) ===".format(cfg.n_embd, cfg.n_layer))
+
+results_9b = []
+for B in [4, 8, 16, 32]:
+    _cfg = PerfConfig(batch_size=B, n_embd=cfg.n_embd, n_head=cfg.n_head,
+                      n_kv_head=cfg.n_kv_head, head_dim=cfg.head_dim,
+                      mlp_dim=cfg.mlp_dim, n_layer=cfg.n_layer,
+                      seq_len=cfg.seq_len)
+    _lf = compute_layer_flops(B, _cfg.seq_len, _cfg.n_embd,
+                               _cfg.n_head, _cfg.n_kv_head, _cfg.head_dim, _cfg.mlp_dim)
+    _lm = matmul_flops(B * _cfg.seq_len, _cfg.padded_vocab, _cfg.n_embd)
+    _step_flops = 3 * (_cfg.n_layer * _lf + _lm)
+
+    _tok = fake_tokens(B, _cfg.seq_len + 1)
+    _lab = _tok[:, 1:]
+    _tok = _tok[:, :-1]
+    _p = init_full_model(_cfg)
+    mx.eval(_p)
+
+    @mx.compile
+    def _fwd_bwd(_params, _tokens, _labels):
+        def loss_fn(p):
+            hidden = model_forward(_cfg, p, _tokens)
+            return chunked_lm_head_loss(hidden, p['lm_head'], _labels, _cfg)
+        return mx.value_and_grad(loss_fn)(_params)
+
+    for _ in range(2):
+        _loss, _grads = _fwd_bwd(_p, _tok, _lab)
+        mx.eval(_loss, _grads)
+
+    times = []
+    for _ in range(5):
+        t0 = time.time()
+        _loss, _grads = _fwd_bwd(_p, _tok, _lab)
+        mx.eval(_loss, _grads)
+        times.append(time.time() - t0)
+
+    avg_t = sum(times) / len(times)
+    tps = int(B * _cfg.seq_len / avg_t)
+    mfu = compute_mfu(avg_t, _step_flops)
+    results_9b.append({'B': B, 'ms': avg_t*1000, 'tok_s': tps, 'mfu': mfu})
+    print(f"  B={B:>2}:  {avg_t*1000:8.1f}ms  {tps:>8,} tok/s  MFU: {mfu:.1f}%")
+
+# %%
+# 9c. Model width sweep with mx.compile
+print("\n=== 9c. Model width sweep (compiled, B={}, L={}) ===".format(cfg.batch_size, cfg.n_layer))
+
+results_9c = []
+for E in [512, 768, 1024, 1536]:
+    H = E // cfg.head_dim
+    MLP = int(E * 8 / 3 / 64) * 64  # SwiGLU standard ratio, rounded to 64
+    _cfg = PerfConfig(batch_size=cfg.batch_size, n_embd=E, n_head=H,
+                      n_kv_head=1, head_dim=cfg.head_dim,
+                      mlp_dim=MLP, n_layer=cfg.n_layer,
+                      seq_len=cfg.seq_len)
+
+    _lf = compute_layer_flops(_cfg.batch_size, _cfg.seq_len, E,
+                               H, 1, cfg.head_dim, MLP)
+    _lm = matmul_flops(_cfg.batch_size * _cfg.seq_len, _cfg.padded_vocab, E)
+    _step_flops = 3 * (_cfg.n_layer * _lf + _lm)
+
+    _tok = fake_tokens(_cfg.batch_size, _cfg.seq_len + 1)
+    _lab = _tok[:, 1:]
+    _tok = _tok[:, :-1]
+    _p = init_full_model(_cfg)
+    mx.eval(_p)
+
+    @mx.compile
+    def _fwd_bwd(_params, _tokens, _labels):
+        def loss_fn(p):
+            hidden = model_forward(_cfg, p, _tokens)
+            return chunked_lm_head_loss(hidden, p['lm_head'], _labels, _cfg)
+        return mx.value_and_grad(loss_fn)(_params)
+
+    for _ in range(2):
+        _loss, _grads = _fwd_bwd(_p, _tok, _lab)
+        mx.eval(_loss, _grads)
+
+    times = []
+    for _ in range(5):
+        t0 = time.time()
+        _loss, _grads = _fwd_bwd(_p, _tok, _lab)
+        mx.eval(_loss, _grads)
+        times.append(time.time() - t0)
+
+    avg_t = sum(times) / len(times)
+    tps = int(_cfg.batch_size * _cfg.seq_len / avg_t)
+    mfu = compute_mfu(avg_t, _step_flops)
+    results_9c.append({'E': E, 'H': H, 'MLP': MLP, 'ms': avg_t*1000, 'tok_s': tps, 'mfu': mfu})
+    print(f"  E={E:>4}, H={H}, MLP={MLP:>4}:  {avg_t*1000:8.1f}ms  {tps:>8,} tok/s  MFU: {mfu:.1f}%")
+
+# %%
+# 9d. Chunking ablation with mx.compile
+print("\n=== 9d. Chunk sweep (compiled, E={}, L={}, B={}) ===".format(
+    cfg.n_embd, cfg.n_layer, cfg.batch_size))
+
+results_9d = []
+for chunks in [1, 2, 4, 8]:
+    _cfg = PerfConfig(batch_size=cfg.batch_size, n_embd=cfg.n_embd, n_head=cfg.n_head,
+                      n_kv_head=cfg.n_kv_head, head_dim=cfg.head_dim,
+                      mlp_dim=cfg.mlp_dim, n_layer=cfg.n_layer,
+                      seq_len=cfg.seq_len, num_lm_head_chunks=chunks)
+
+    _tok = fake_tokens(_cfg.batch_size, _cfg.seq_len + 1)
+    _lab = _tok[:, 1:]
+    _tok = _tok[:, :-1]
+    _p = init_full_model(_cfg)
+    mx.eval(_p)
+
+    @mx.compile
+    def _fwd_bwd(_params, _tokens, _labels):
+        def loss_fn(p):
+            hidden = model_forward(_cfg, p, _tokens)
+            return chunked_lm_head_loss(hidden, p['lm_head'], _labels, _cfg)
+        return mx.value_and_grad(loss_fn)(_params)
+
+    for _ in range(2):
+        _loss, _grads = _fwd_bwd(_p, _tok, _lab)
+        mx.eval(_loss, _grads)
+
+    times = []
+    for _ in range(5):
+        t0 = time.time()
+        _loss, _grads = _fwd_bwd(_p, _tok, _lab)
+        mx.eval(_loss, _grads)
+        times.append(time.time() - t0)
+
+    avg_t = sum(times) / len(times)
+    tps = int(_cfg.batch_size * _cfg.seq_len / avg_t)
+    mfu = compute_mfu(avg_t, step_flops)  # same model, only chunking differs
+    results_9d.append({'chunks': chunks, 'ms': avg_t*1000, 'tok_s': tps, 'mfu': mfu})
+    print(f"  chunks={chunks}:  {avg_t*1000:8.1f}ms  {tps:>8,} tok/s  MFU: {mfu:.1f}%")
+
 # %%
 # === Final summary ===
 print("=" * 90)
@@ -1154,4 +1394,17 @@ for name, rlist in [
         all_results.append(r)
 
 print_summary(all_results)
-print("Done!  Use Metal GPU Capture (Phase 8.7) for detailed hardware traces.")
+
+print("\n--- Phase 9 — mx.compile + MFU ---")
+print(f"  {'Config':<35s}  {'ms':>8s}  {'tok/s':>10s}  {'MFU%':>6s}")
+print(f"  {'─'*35}  {'─'*8}  {'─'*10}  {'─'*6}")
+print(f"  {'fwd+bwd (no compile)':<35s}  {avg_no_compile*1000:8.1f}  {tps_no_compile:>10,}  {mfu_no_compile:5.1f}%")
+print(f"  {'fwd+bwd (compiled)':<35s}  {avg_compiled*1000:8.1f}  {tps_compiled:>10,}  {mfu_compiled:5.1f}%")
+for r in results_9b:
+    print(f"  {'B=' + str(r['B']) + ' (compiled)':<35s}  {r['ms']:8.1f}  {r['tok_s']:>10,}  {r['mfu']:5.1f}%")
+for r in results_9c:
+    print(f"  {'E=' + str(r['E']) + ' (compiled)':<35s}  {r['ms']:8.1f}  {r['tok_s']:>10,}  {r['mfu']:5.1f}%")
+for r in results_9d:
+    print(f"  {'chunks=' + str(r['chunks']) + ' (compiled)':<35s}  {r['ms']:8.1f}  {r['tok_s']:>10,}  {r['mfu']:5.1f}%")
+
+print("\nDone!  Use Metal GPU Capture (Phase 8.7) for detailed hardware traces.")
