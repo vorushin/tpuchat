@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tpuchat** is a JAX-native GPT pretraining harness for a single Colab Pro+ TPU v6e (32 GB HBM). Port of Karpathy's NanoChat — raw JAX, no Flax/Orbax.
 
-168M param model: RoPE, QK-norm, ReLU² MLP, sliding window attention, logit softcap, x0 residual connections. Trained on FineWeb-Edu-100B-Shuffle (50 shards, tokenized on-the-fly with custom BPE vocab 32768).
+164M param model (130M non-embed): D=1024, N=4, K=1, H=256, L=8, B=64 (16×4 microbatch). RoPE, QK-norm, SwiGLU MLP, splash attention, logit softcap. Trained on FineWeb-Edu-100B-Shuffle (50 shards, tokenized on-the-fly with custom BPE vocab 32768).
 
 ## Editing workflow
 
@@ -17,6 +17,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 There is no test suite, linter, or build system. Validation is done via training metrics (val loss, throughput, MXU%) in Colab.
 
+### Notebook revisions
+
+Notebooks with a `REVISION = N` constant (currently 08) get auto-incremented by `update_notebooks.sh` when content changes. The revision appears in the notebook title and is included in checkpoint metadata uploaded to HuggingFace. The script uses `.notebook_hashes` (gitignored) to track content changes.
+
+### Colab secrets
+
+All notebooks use `google.colab.userdata` for authentication (no interactive prompts):
+- `HF_TOKEN` — HuggingFace Hub login
+- `WANDB_TOKEN` — Weights & Biases login (notebooks 03, 08)
+
 ## File map
 
 | File | Purpose |
@@ -26,8 +36,9 @@ There is no test suite, linter, or build system. Validation is done via training
 | `03_worker.py` | wandb hyperparameter sweep worker |
 | `04_maxtext.py` | MaxText-inspired ~370M variant (SwiGLU, chunked lm_head loss) |
 | `05_tpu_perf.py` | TPU v6e performance benchmarks (MXU%, HBM bandwidth) |
+| `08_tpu_ablations.py` | Ablation lab — quick training, wandb sweep, hero run with HF upload |
 | `LOG.md` | Chronological dev log — append with `Agent:` prefix after significant work |
-| `update_notebooks.sh` | `jupytext --to ipynb` for all numbered .py files |
+| `update_notebooks.sh` | `jupytext --to ipynb` + auto-increment REVISION for changed notebooks |
 
 ## Architecture (02_train.py)
 
@@ -43,14 +54,18 @@ There is no test suite, linter, or build system. Validation is done via training
 
 **PrefetchDataLoader** — background thread overlaps tokenization + `jax.device_put` with compute.
 
-**Optimizer** — explicit AdamW with warmup/warmdown LR schedule. No optax optimizer wrapper — step function is manual.
+**Optimizer** — optax AdamW with warmup/warmdown LR schedule. Always use `optax.adamw()` — manual per-leaf loops kill MFU on TPU (see LOG.md).
+
+**Gradient accumulation** — `jax.lax.scan` over microbatches (microbatch_size=4, num_microbatches=16 for batch_size=64).
 
 **Profiling** — `jax.named_scope` on all components (embedding, layer_N/attention, layer_N/mlp, lm_head) for XProf/TensorBoard traces. Steps 15-20 captured by default.
 
 ## Key conventions
 
 - **No requirements.txt** — dependencies installed via `!pip install` cells in notebooks (jax[tpu], optax, tiktoken, pyarrow, huggingface_hub, etc.)
-- **Param shapes are explicit** — QKV: `(n_embd, n_head, head_dim)`, c_proj: `(n_head, head_dim, n_embd)`, MLP: `(n_embd, 4*n_embd)`
+- **Param shapes are explicit** — QKV: `(n_embd, n_head, head_dim)`, c_proj: `(n_head, head_dim, n_embd)`, MLP: `(n_embd, mlp_dim)`
 - **LOG.md** — always append after significant work, prefix with `Agent:`, include metrics when relevant
 - **HuggingFace Hub** — tokenizer and checkpoints stored at `vorushin/tpuchat`
 - **Data paths assume Colab** — `/content/base_data/`, `/content/tokenizer/`, `/content/log_dir/`
+- **Checkpoint format** — `params.pkl` (JAX arrays → numpy pickle) + `config.json` (Config dict + revision + training metrics), uploaded via `HfApi.upload_folder()`
+- **Runtime shutdown** — hero runs end with `runtime.unassign()` to auto-disconnect Colab and stop billing

@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (125M Model)
+# # 08 — TPU Ablation Lab (rev 2)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -65,9 +65,12 @@ PEAK_TFLOPS = 918          # bf16 peak compute per chip
 HBM_GB = 32
 MXU_DIM = 256              # 256×256 systolic array
 
+REVISION = 2
+
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
 print(f"Peak TFLOPS : {PEAK_TFLOPS} (bf16, from v6e docs)")
+print(f"Notebook rev: {REVISION}")
 
 
 @jax.tree_util.register_pytree_with_keys_class
@@ -1122,3 +1125,39 @@ for prompt in ['The capital of France is', 'In a distant galaxy, scientists disc
                'Machine learning is']:
     text = generate(hero_config, params, prompt, max_new_tokens=100)
     print(f'Prompt: {prompt}\nOutput: {text}\n')
+
+# --- Upload checkpoint to HF Hub ---
+import json
+
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+params_np = jax.tree.map(
+    lambda x: np.array(x) if isinstance(x, jax.Array) else x, params)
+with open(os.path.join(CHECKPOINT_DIR, 'params.pkl'), 'wb') as f:
+    pickle.dump(params_np, f)
+
+config_dict = {k: v for k, v in hero_config.__dict__.items()
+               if not k.startswith('_')}
+config_dict['revision'] = REVISION
+config_dict['best_val_loss'] = best_val_loss
+config_dict['total_steps'] = HERO_STEPS
+config_dict['total_training_time_hours'] = round(total_training_time / 3600, 2)
+with open(os.path.join(CHECKPOINT_DIR, 'config.json'), 'w') as f:
+    json.dump(config_dict, f, indent=2, default=str)
+
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo(HF_REPO_ID, repo_type='model', exist_ok=True)
+ckpt_name = f'checkpoint_08_rev{REVISION}'
+api.upload_folder(
+    folder_path=CHECKPOINT_DIR,
+    repo_id=HF_REPO_ID,
+    path_in_repo=ckpt_name,
+    commit_message=f'08 ablation hero run rev{REVISION}: '
+                   f'val_loss={best_val_loss:.4f}, {HERO_STEPS} steps',
+)
+print(f'\nUploaded to https://huggingface.co/{HF_REPO_ID}/tree/main/{ckpt_name}')
+
+# --- Disconnect runtime to stop billing ---
+from google.colab import runtime
+runtime.unassign()

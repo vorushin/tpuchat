@@ -4,3 +4,4 @@ maxtext
 uv.lock
 __pycache__
 scaling-book/
+.notebook_hashes
