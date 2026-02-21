@@ -13,12 +13,12 @@
 # %% [markdown]
 # # 08 — TPU Ablation Lab (125M Model)
 #
-# Controlled ablation experiments on TPU v6e for a **125M non-embed param**
-# transformer (D1024-F3072-B4, L=8). Selected from Phase 11 benchmarks.
+# Controlled ablation experiments on TPU v6e for a **130M non-embed param**
+# transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
 #
 # **Three modes:**
-# 1. **Quick Training** (~300 steps, ~7s) — XProf capture, MFU measurement
-# 2. **Sweep** (wandb, ~15-20 min/run) — Bayesian LR search per architecture config
+# 1. **Quick Training** (~300 steps) — XProf capture, MFU measurement
+# 2. **Sweep** (wandb, ~13 min/run) — Bayesian LR search per architecture config
 # 3. **Hero Run** (20 tok/param, ~1.9h) — Full training with eval + optional checkpointing
 #
 # **Ablation knobs** (set in the Model section):
@@ -26,15 +26,16 @@
 # - `MLP_TYPE`: `'glu'` (SwiGLU, F=3072) or `'plain'` (ReLU², F=4096)
 # - `QK_NORM`: `True` or `False`
 #
-# ### Architecture: D=1024, N=3, K=1, H=256, F=3072, L=8, B=4, T=2048, V=32768
+# ### Architecture: D=1024, N=4, K=1, H=256, F=3072, L=8, B=64 (16×4), T=2048, V=32768
 # | Metric | Value |
 # |--------|-------|
-# | Total params | 159.4M |
-# | Non-embed params | 125.8M |
-# | Step time (splash) | ~22ms |
-# | Throughput | ~373k tok/s |
-# | MFU | ~36.8% |
-# | Hero run (20 tok/param) | ~2.5B tokens, ~308k steps, ~1.9h |
+# | Total params | 163.6M |
+# | Non-embed params | 130.0M |
+# | Tokens/step | 131,072 (64 × 2048) |
+# | Step time (splash) | ~302ms (16 microbatches) |
+# | Throughput | ~435k tok/s |
+# | MFU | ~46.5% |
+# | Hero run (20 tok/param) | ~2.6B tokens, ~19.8k steps, ~1.7h |
 
 # %%
 # !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile
@@ -358,19 +359,19 @@ class Config:
     mlp_type: str = 'glu'           # 'glu' (SwiGLU, F=3072) | 'plain' (ReLU², F=4096)
     qk_norm: bool = True            # QK-norm on queries and keys
 
-    # ── Architecture (D1024, 125M non-embed) ───────────────────
+    # ── Architecture (D1024, 130M non-embed) ───────────────────
     n_embd: int = 1024
     n_layer: int = 8
     seq_len: int = 2048
     vocab_size: int = 32768
-    n_head: int = 3
+    n_head: int = 4
     n_kv_head: int = 1
     head_dim: int = 256
     mlp_dim: int = 3072             # 3072 for glu, 4096 for plain
     softcap: float = 15.0
     splash_block_size: int = 1024
     num_lm_head_chunks: int = 8
-    batch_size: int = 4
+    batch_size: int = 64
     microbatch_size: int = 4    # gradient accumulation when < batch_size
 
     # ── Training ───────────────────────────────────────────────
@@ -865,8 +866,8 @@ sweep_config = {
     },
 }
 
-SWEEP_STEPS = 40_000       # ~15 min at 22ms/step
-SWEEP_EVAL_EVERY = 2000
+SWEEP_STEPS = 2_500        # ~13 min at ~300ms/step (same ~328M token budget)
+SWEEP_EVAL_EVERY = 250
 
 
 def sweep_train_fn():
@@ -945,7 +946,7 @@ def sweep_train_fn():
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_val
             debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
 
-            if step % 500 == 0:
+            if step % 50 == 0:
                 tok_per_sec = int(total_batch_size / dt) if dt > 0 else 0
                 wandb.log({
                     "step": step,
@@ -970,7 +971,7 @@ wandb.agent(sweep_id, function=sweep_train_fn, count=5)
 # ## Hero Run (20 tok/param)
 
 # %%
-# === Hero run: 20 tok/param, ~1.9 hours ===
+# === Hero run: 20 tok/param, ~19.8k steps ===
 import wandb
 from google.colab import userdata
 
@@ -991,7 +992,7 @@ HERO_EVAL_EVERY = 1000
 print(f'Params: {hero_total_p/1e6:.1f}M total, {hero_non_embed/1e6:.1f}M non-embed')
 print(f'Target tokens: {target_tokens:,} (20 tok/param)')
 print(f'Steps: {HERO_STEPS:,} ({total_batch_size:,} tok/step)')
-print(f'Estimated time: {HERO_STEPS * 0.022 / 3600:.1f} hours (at 22ms/step)')
+print(f'Estimated time: {HERO_STEPS * 0.302 / 3600:.1f} hours (at ~302ms/step, 16 microbatches)')
 
 # Init optimizer
 trainable, static = split_trainable(hero_params)
