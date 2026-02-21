@@ -569,7 +569,50 @@ Agent: Simplified 08_tpu_ablations.py after finding root cause:
 
 Key lesson: optax.adamw uses `jax.tree.map` which decomposes into separate passes per operation (all mu updates, then all nu updates, etc.), giving XLA better fusion opportunities. A manual per-leaf loop interleaves all operations per parameter, creating a much harder graph to optimize. The overhead is fixed (~14ms for 58 params) but relative impact depends on model size — negligible for 168M/L=24 (Phase 9 benchmark config), catastrophic for 125M/L=8.
 
+Roman:
+bs=4, MFU: 41.0% | tok/s: 415,319 | ideal tok/s (100% MFU): 1,013,278
+Utilization of TPU Matrix Units
+36.5%
+
+bs=16,  MFU: 38.2% | tok/s: 386,769 | ideal tok/s (100% MFU): 1,013,278
+Utilization of TPU Matrix Units
+41.1%
+
+bs=64,  MFU: 36.9% | tok/s: 374,094 | ideal tok/s (100% MFU): 1,013,278
+Utilization of TPU Matrix Units
+41.3%
+
+with microbatching 4 * 16 = 64
+
+Step 00000 | Val loss: 10.3977
+step 00000/300 | loss: 10.3977 | tok/s: 6,520
+XProf started...
+XProf stopped. Trace saved to '/content/log_dir'.
+step 00050/300 | loss: 7.1801 | tok/s: 374,988
+Step 00100 | Val loss: 6.4334
+step 00100/300 | loss: 6.5136 | tok/s: 462,362
+step 00150/300 | loss: 6.1691 | tok/s: 462,193
+Step 00200 | Val loss: 5.8763
+step 00200/300 | loss: 5.9232 | tok/s: 462,869
+step 00250/300 | loss: 5.7678 | tok/s: 462,703
+Step 00300 | Val loss: 5.7091
+
+MFU: 45.8% | tok/s: 464,234 | ideal tok/s (100% MFU): 1,013,278
+
+FLOPS Utilization
+higher is better.
+Utilization of TPU Matrix Units
+50.8%
+
 ## Feb 21 2026
+
+Agent: Updated 08_tpu_ablations.py for new default config (n_head=4, batch_size=64):
+- Config defaults: n_head 3→4 (power-of-2 heads, better MXU alignment), batch_size 4→64 (16×4 microbatch grad accum)
+- Param counts: 163.6M total, 130.0M non-embed (was 159.4M / 125.8M — extra Q/c_proj weights from 4th head)
+- Sweep: 40k→2.5k steps (same ~328M token budget at 131k tokens/step), eval every 250, log every 50
+- Hero run: ~19.8k steps (was ~308k), time estimate uses measured 302ms/step
+- Measured perf (n_head=4, B=64): 435k tok/s, 46.5% MFU, ~302ms/step
+- Also added Colab secrets for wandb (WANDB_TOKEN) and HuggingFace (HF_TOKEN) logins across all notebooks (01-04, 08)
 
 Agent: Added MFU measurement and mx.compile optimization to Apple Silicon notebooks (06, 07).
 
@@ -591,3 +634,56 @@ Agent: Added MFU measurement and mx.compile optimization to Apple Silicon notebo
 - Expected: ~9K-10K tok/s, ~34% MFU
 
 **Why ~34% not ~50%:** M4 Pro is fundamentally bandwidth-limited (63 FLOPs/byte vs TPU's 574). The ~34% MFU is actually quite good for this hardware — the ceiling is set by memory bandwidth, not compute.
+
+Roman:
+Chose 4 heads, 1 kv head, 4 microbatch_size, 64 total batch size.
+
+Params: 163.6M total, 130.0M non-embed
+Batch: 64 x 2048 = 131,072 tokens/step
+
+=== Quick Training: 300 steps ===
+
+Step 00000 | Val loss: 10.3977
+step 00000/300 | loss: 10.3977 | tok/s: 6,730
+XProf started...
+XProf stopped. Trace saved to '/content/log_dir'.
+step 00050/300 | loss: 7.2771 | tok/s: 354,038
+Step 00100 | Val loss: 6.5158
+step 00100/300 | loss: 6.6157 | tok/s: 433,227
+step 00150/300 | loss: 6.2137 | tok/s: 432,792
+Step 00200 | Val loss: 5.9096
+step 00200/300 | loss: 5.9570 | tok/s: 433,262
+step 00250/300 | loss: 5.7972 | tok/s: 433,239
+Step 00300 | Val loss: 5.7351
+
+MFU: 46.5% | tok/s: 434,932 | ideal tok/s (100% MFU): 935,334
+
+FLOPS Utilization
+higher is better.
+Utilization of TPU Matrix Units
+51.6%
+
+Profile-window Peak Memory Usage
+stack + heap, within profiling window
+5.56 GiB
+Timestamp: 1275.5 ms
+Stack Reservation: 3.25 GiB
+Heap Allocation: 2.31 GiB
+Free Memory: 25.68 GiB
+Fragmentation: 0.23%
+
+Running LR sweep:
+
+Syncing run sweet-sweep-1 to Weights & Biases (docs)
+Sweep page: https://wandb.ai/vorushin/tpuchat-ablations/sweeps/2mkkjiwn
+View project at https://wandb.ai/vorushin/tpuchat-ablations
+View sweep at https://wandb.ai/vorushin/tpuchat-ablations/sweeps/2mkkjiwn
+View run at https://wandb.ai/vorushin/tpuchat-ablations/runs/ec457laq
+Sweep run: lr=2.82e-04, attn=splash, mlp=glu, qk_norm=True
+Params: 163.6M total, 130.0M non-embed
+
+=== Sweep run: 2500 steps ===
+
+Step 00000 | Val loss: 10.3977 (best: 10.3977)
+step 00000/2500 | loss: 10.3977 | tok/s: 6,699
+step 00050/2500 | loss: 7.8415 | tok/s: 436,034
