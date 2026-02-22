@@ -265,11 +265,8 @@ class PerfConfig:
     splash_block_size: int = 1024
     num_lm_head_chunks: int = 8
 
-    @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
 cfg = PerfConfig()
+assert cfg.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {cfg.vocab_size}"
 assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
     f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
 print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
@@ -411,9 +408,8 @@ def multi_layer_forward(cfg, layers, n_layers, x, cos, sin, attn_impl='splash'):
 # === Chunked LM head loss ===
 
 def _logits_from_chunk(h_chunk, lm_head, config):
-    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
-    logits = logits[:, :config.vocab_size]
-    logits = logits.astype(jnp.float32)
+    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
+                        preferred_element_type=jnp.float32)
     return config.softcap * jnp.tanh(logits / config.softcap)
 
 
@@ -476,8 +472,8 @@ def init_full_model(cfg, seed=42):
     key = jax.random.key(seed)
     params = dot_dict()
     key, k1, k2 = jax.random.split(key, 3)
-    params.wte = jax.random.normal(k1, (cfg.padded_vocab, cfg.n_embd), dtype=jnp.bfloat16)
-    params.lm_head = jax.random.normal(k2, (cfg.n_embd, cfg.padded_vocab),
+    params.wte = jax.random.normal(k1, (cfg.vocab_size, cfg.n_embd), dtype=jnp.bfloat16)
+    params.lm_head = jax.random.normal(k2, (cfg.n_embd, cfg.vocab_size),
                                         dtype=jnp.bfloat16) * 0.001
     params.rope_cos, params.rope_sin = precompute_rope(cfg.seq_len, cfg.head_dim)
     params.layers = init_all_layers(cfg, cfg.n_layer, seed=seed + 100)
@@ -901,7 +897,7 @@ for r in results_4a:
 # 5a. Embedding lookup
 print("=== Embedding ===")
 wte = jax.random.normal(jax.random.key(0),
-    (cfg.padded_vocab, cfg.n_embd), dtype=jnp.bfloat16)
+    (cfg.vocab_size, cfg.n_embd), dtype=jnp.bfloat16)
 tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
 
 @jax.jit
@@ -915,18 +911,18 @@ r_embed = benchmark(bench_embed, tokens, wte, flop_count=None,
 # 5b. LM head — non-chunked
 print("=== LM head (non-chunked) ===")
 lm_head = jax.random.normal(jax.random.key(1),
-    (cfg.n_embd, cfg.padded_vocab), dtype=jnp.bfloat16) * 0.001
+    (cfg.n_embd, cfg.vocab_size), dtype=jnp.bfloat16) * 0.001
 hidden = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
 labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
 @jax.jit
 def bench_lm_head(hidden, lm_head, labels):
-    logits = jnp.einsum('btd,dv->btv', hidden, lm_head)
-    logits = logits[:, :, :cfg.vocab_size].astype(jnp.float32)
+    logits = jnp.einsum('btd,dv->btv', hidden, lm_head,
+                        preferred_element_type=jnp.float32)
     logits = cfg.softcap * jnp.tanh(logits / cfg.softcap)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, labels))
 
-lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd)
+lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd)
 r_lm = benchmark(bench_lm_head, hidden, lm_head, labels,
                  flop_count=lm_flops, label="LM head (non-chunked)")
 
@@ -965,7 +961,7 @@ labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
 total_model_flops = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
                      cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
-                     matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd))
+                     matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd))
 bwd_flops = 3 * total_model_flops
 
 # %%
@@ -1043,7 +1039,7 @@ for bs in [1, 2, 4, 8]:
     lab = fake_tokens(bs, cfg_bs.seq_len)
     fl = 3 * (cfg_bs.n_layer * layer_flops(bs, cfg_bs.seq_len, cfg_bs.n_embd,
               cfg_bs.n_head, cfg_bs.n_kv_head, cfg_bs.head_dim, cfg_bs.mlp_dim) +
-              matmul_flops(bs * cfg_bs.seq_len, cfg_bs.padded_vocab, cfg_bs.n_embd))
+              matmul_flops(bs * cfg_bs.seq_len, cfg_bs.vocab_size, cfg_bs.n_embd))
 
     @jax.jit
     def bench(p, tok, _lab=lab, _cfg=cfg_bs):
@@ -1073,7 +1069,7 @@ for sl in [1024, 2048, 4096]:
     lab = fake_tokens(cfg_sl.batch_size, sl)
     fl = 3 * (cfg_sl.n_layer * layer_flops(cfg_sl.batch_size, sl, cfg_sl.n_embd,
               cfg_sl.n_head, cfg_sl.n_kv_head, cfg_sl.head_dim, cfg_sl.mlp_dim) +
-              matmul_flops(cfg_sl.batch_size * sl, cfg_sl.padded_vocab, cfg_sl.n_embd))
+              matmul_flops(cfg_sl.batch_size * sl, cfg_sl.vocab_size, cfg_sl.n_embd))
 
     @jax.jit
     def bench(p, tok, _lab=lab, _cfg=cfg_sl):
@@ -1106,7 +1102,7 @@ for hd, nh in [(128, 8), (256, 4)]:
               cfg_hd.n_embd, cfg_hd.n_head, cfg_hd.n_kv_head,
               cfg_hd.head_dim, cfg_hd.mlp_dim) +
               matmul_flops(cfg_hd.batch_size * cfg_hd.seq_len,
-                           cfg_hd.padded_vocab, cfg_hd.n_embd))
+                           cfg_hd.vocab_size, cfg_hd.n_embd))
 
     @jax.jit
     def bench(p, tok, _lab=lab, _cfg=cfg_hd):
@@ -1136,7 +1132,7 @@ for n_kv in [1, 2, 4]:
               cfg_gqa.n_embd, cfg_gqa.n_head, n_kv,
               cfg_gqa.head_dim, cfg_gqa.mlp_dim) +
               matmul_flops(cfg_gqa.batch_size * cfg_gqa.seq_len,
-                           cfg_gqa.padded_vocab, cfg_gqa.n_embd))
+                           cfg_gqa.vocab_size, cfg_gqa.n_embd))
 
     @jax.jit
     def bench(p, tok, _lab=lab, _cfg=cfg_gqa):
@@ -1400,7 +1396,7 @@ opt_labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
 total_model_flops_9 = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
                        cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
-                       matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd))
+                       matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd))
 bwd_flops_9 = 3 * total_model_flops_9
 
 # %%
@@ -1572,7 +1568,7 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
 
     fl_s = 3 * (cfg_s.n_layer * layer_flops(bs, cfg_s.seq_len, cfg_s.n_embd,
                 cfg_s.n_head, cfg_s.n_kv_head, cfg_s.head_dim, cfg_s.mlp_dim) +
-                matmul_flops(bs * cfg_s.seq_len, cfg_s.padded_vocab, cfg_s.n_embd))
+                matmul_flops(bs * cfg_s.seq_len, cfg_s.vocab_size, cfg_s.n_embd))
 
     @jax.jit
     def bench_sweep(params, opt_state, tokens, _cfg=cfg_s, _sched=sched_s, _lab=lab_s):
@@ -1662,7 +1658,7 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
 
     fl_s = 3 * (cfg_s.n_layer * layer_flops(bs, cfg_s.seq_len, cfg_s.n_embd,
                 cfg_s.n_head, cfg_s.n_kv_head, cfg_s.head_dim, cfg_s.mlp_dim) +
-                matmul_flops(bs * cfg_s.seq_len, cfg_s.padded_vocab, cfg_s.n_embd))
+                matmul_flops(bs * cfg_s.seq_len, cfg_s.vocab_size, cfg_s.n_embd))
 
     @jax.jit
     def bench_sweep_11(params, opt_state, tokens, _cfg=cfg_s, _sched=sched_s, _lab=lab_s):

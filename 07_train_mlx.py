@@ -93,10 +93,6 @@ class Config:
     param_seed: int = 42
 
     @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
-    @property
     def total_batch_tokens(self):
         return self.device_batch_size * self.seq_len
 
@@ -106,6 +102,7 @@ class Config:
 
 
 cfg = Config()
+assert cfg.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {cfg.vocab_size}"
 assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
     f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
 assert cfg.n_head % cfg.n_kv_head == 0, \
@@ -328,8 +325,8 @@ def init_full_model(cfg, seed=42):
     """Initialize all model params (embed + layers + lm_head)."""
     mx.random.seed(seed)
     params = {}
-    params['wte'] = mx.random.normal((cfg.padded_vocab, cfg.n_embd)).astype(mx.bfloat16)
-    params['lm_head'] = mx.random.normal((cfg.n_embd, cfg.padded_vocab)).astype(mx.bfloat16) * 0.001
+    params['wte'] = mx.random.normal((cfg.vocab_size, cfg.n_embd)).astype(mx.bfloat16)
+    params['lm_head'] = mx.random.normal((cfg.n_embd, cfg.vocab_size)).astype(mx.bfloat16) * 0.001
     params['emb_norm_w'] = mx.ones((cfg.n_embd,), dtype=mx.bfloat16)
     params['final_norm_w'] = mx.ones((cfg.n_embd,), dtype=mx.bfloat16)
     params['layers'] = {}
@@ -360,8 +357,8 @@ def chunked_lm_head_loss(hidden, lm_head, labels, config):
 
     total_loss = mx.array(0.0)
     for i in range(N):
-        logits = hidden_flat[i] @ lm_head          # (S, padded_vocab)
-        logits = logits[:, :config.vocab_size].astype(mx.float32)
+        logits = hidden_flat[i] @ lm_head          # (S, vocab_size)
+        logits = logits.astype(mx.float32)
         logits = config.softcap * mx.tanh(logits / config.softcap)
         total_loss = total_loss + mx.sum(nn.losses.cross_entropy(logits, labels_flat[i]))
     return total_loss / (B * T)
@@ -400,7 +397,7 @@ fwd_flops = (cfg.n_layer * compute_layer_flops(
     cfg.device_batch_size, cfg.seq_len, cfg.n_embd,
     cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
     + matmul_flops(cfg.device_batch_size * cfg.seq_len,
-                   cfg.padded_vocab, cfg.n_embd))
+                   cfg.vocab_size, cfg.n_embd))
 step_flops = 3 * fwd_flops
 flops_per_tok = step_flops / cfg.total_batch_tokens
 ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
@@ -498,8 +495,8 @@ def generate(cfg, params, enc, prompt, max_new_tokens=100,
         hidden = model_forward(cfg, params, x)
         # Get logits at last valid position
         h = hidden[0, len(context) - 1, :]  # (E,)
-        logits = h @ params['lm_head']  # (padded_vocab,)
-        logits = logits[:cfg.vocab_size].astype(mx.float32)
+        logits = h @ params['lm_head']  # (vocab_size,)
+        logits = logits.astype(mx.float32)
         logits = cfg.softcap * mx.tanh(logits / cfg.softcap)
         mx.eval(logits)
 

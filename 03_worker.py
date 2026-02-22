@@ -102,10 +102,6 @@ class Config:
     def n_layer(self):
         return self.depth
 
-    @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
 # %%
 # === wandb + HuggingFace login ===
 from google.colab import userdata
@@ -119,6 +115,7 @@ login(token=userdata.get("HF_TOKEN"))
 import pickle
 
 config_default = Config()
+assert config_default.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {config_default.vocab_size}"
 
 TOKENIZER_DIR = '/content/tokenizer'
 os.makedirs(TOKENIZER_DIR, exist_ok=True)
@@ -243,7 +240,7 @@ def init_param_state(config: Config) -> dot_dict:
     n_kv_head = config.n_kv_head
     head_dim = config.head_dim
     n_layer = config.n_layer
-    padded_vocab = config.padded_vocab
+    vocab_size = config.vocab_size
     def split_key():
         nonlocal key
         key, subkey = jax.random.split(key)
@@ -255,10 +252,10 @@ def init_param_state(config: Config) -> dot_dict:
     params = dot_dict()
 
     # Token embedding: normal(0, 1)
-    params.wte = jax.random.normal(split_key(), (padded_vocab, n_embd), dtype=jnp.bfloat16)
+    params.wte = jax.random.normal(split_key(), (vocab_size, n_embd), dtype=jnp.bfloat16)
 
     # LM head: normal(0, 0.001)
-    params.lm_head = jax.random.normal(split_key(), (n_embd, padded_vocab), dtype=jnp.bfloat16) * 0.001
+    params.lm_head = jax.random.normal(split_key(), (n_embd, vocab_size), dtype=jnp.bfloat16) * 0.001
 
     # Per-layer scalars
     params.resid_lambdas = jnp.ones(n_layer, dtype=jnp.bfloat16)
@@ -426,11 +423,10 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
     # Final norm + lm_head
     with jax.named_scope('lm_head'):
         x = rms_norm(x)
-        logits = jnp.einsum('btd,dv->btv', x, params.lm_head)
-        logits = logits[:, :, :config.vocab_size]  # remove padding
+        logits = jnp.einsum('btd,dv->btv', x, params.lm_head,
+                            preferred_element_type=jnp.float32)
 
         # Logit softcap
-        logits = logits.astype(jnp.float32)
         logits = config.softcap * jnp.tanh(logits / config.softcap)
 
     return logits

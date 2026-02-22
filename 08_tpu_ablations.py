@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 10)
+# # 08 — TPU Ablation Lab (rev 11)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -61,7 +61,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 10
+REVISION = 11
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -388,15 +388,12 @@ class Config:
     param_seed: int = 42
 
     @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
-    @property
     def num_microbatches(self):
         return self.batch_size // self.microbatch_size
 
 
 config = Config()
+assert config.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {config.vocab_size}"
 print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
       f'V={config.vocab_size}, N={config.n_head}, K={config.n_kv_head}, '
       f'H={config.head_dim}, F={config.mlp_dim}')
@@ -523,9 +520,9 @@ def init_full_model(config, seed=42):
     key = jax.random.key(seed)
     params = dot_dict()
     key, k1, k2 = jax.random.split(key, 3)
-    params.wte = jax.random.normal(k1, (config.padded_vocab, config.n_embd),
+    params.wte = jax.random.normal(k1, (config.vocab_size, config.n_embd),
                                     dtype=jnp.bfloat16)
-    params.lm_head = jax.random.normal(k2, (config.n_embd, config.padded_vocab),
+    params.lm_head = jax.random.normal(k2, (config.n_embd, config.vocab_size),
                                         dtype=jnp.bfloat16) * 0.001
     params.rope_cos, params.rope_sin = precompute_rope(config.seq_len, config.head_dim)
     params.layers = init_all_layers(config, config.n_layer, seed=seed + 100)
@@ -548,9 +545,8 @@ def model_forward(config, params, tokens):
 # === chunked_lm_head_loss ===
 
 def _logits_from_chunk(h_chunk, lm_head, config):
-    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
-    logits = logits[:, :config.vocab_size]
-    logits = logits.astype(jnp.float32)
+    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
+                        preferred_element_type=jnp.float32)
     return config.softcap * jnp.tanh(logits / config.softcap)
 
 
@@ -663,9 +659,8 @@ def predict_step(config, params, x):
     """JIT-compiled single step inference: returns logits."""
     hidden = model_forward(config, params, x)
     with jax.named_scope('lm_head'):
-        logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head)
-        logits = logits[:, :, :config.vocab_size]
-        logits = logits.astype(jnp.float32)
+        logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head,
+                            preferred_element_type=jnp.float32)
         logits = config.softcap * jnp.tanh(logits / config.softcap)
     return logits
 
@@ -729,7 +724,7 @@ fwd_flops = (config.n_layer * layer_flops(
     config.n_head, config.n_kv_head, config.head_dim,
     config.mlp_dim, config.mlp_type)
     + matmul_flops(config.batch_size * config.seq_len,
-                   config.padded_vocab, config.n_embd))
+                   config.vocab_size, config.n_embd))
 step_flops = 3 * fwd_flops  # fwd + 2x bwd
 
 smooth_loss = 0.0
@@ -1003,7 +998,7 @@ fwd_flops = (hero_config.n_layer * layer_flops(
     hero_config.n_head, hero_config.n_kv_head, hero_config.head_dim,
     hero_config.mlp_dim, hero_config.mlp_type)
     + matmul_flops(hero_config.batch_size * hero_config.seq_len,
-                   hero_config.padded_vocab, hero_config.n_embd))
+                   hero_config.vocab_size, hero_config.n_embd))
 step_flops = 3 * fwd_flops
 
 # wandb

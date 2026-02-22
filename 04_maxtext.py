@@ -97,12 +97,8 @@ class Config:
     # Seed
     param_seed: int = 42
 
-    # Derived
-    @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
 config = Config()
+assert config.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {config.vocab_size}"
 assert config.n_head % config.n_kv_head == 0, \
     f'n_head ({config.n_head}) must be divisible by n_kv_head ({config.n_kv_head})'
 assert config.n_embd == config.n_head * config.head_dim, \
@@ -114,7 +110,7 @@ assert (config.device_batch_size * config.seq_len) % config.num_lm_head_chunks =
     f'device_batch_size * seq_len ({config.device_batch_size * config.seq_len}) must be divisible by num_lm_head_chunks ({config.num_lm_head_chunks})'
 print(f'Model: n_layer={config.n_layer}, n_embd={config.n_embd}, n_head={config.n_head}, '
       f'n_kv_head={config.n_kv_head}, head_dim={config.head_dim}, '
-      f'mlp_dim={config.mlp_dim}, vocab={config.vocab_size} (padded={config.padded_vocab})')
+      f'mlp_dim={config.mlp_dim}, vocab={config.vocab_size}')
 
 # %%
 # === HuggingFace Hub login + download tokenizer ===
@@ -295,7 +291,7 @@ def init_param_state(config: Config) -> dot_dict:
     head_dim = config.head_dim
     n_layer = config.n_layer
     mlp_dim = config.mlp_dim
-    padded_vocab = config.padded_vocab
+    vocab_size = config.vocab_size
     def split_key():
         nonlocal key
         key, subkey = jax.random.split(key)
@@ -307,10 +303,10 @@ def init_param_state(config: Config) -> dot_dict:
     params = dot_dict()
 
     # Token embedding: normal(0, 1)
-    params.wte = jax.random.normal(split_key(), (padded_vocab, n_embd), dtype=jnp.bfloat16)
+    params.wte = jax.random.normal(split_key(), (vocab_size, n_embd), dtype=jnp.bfloat16)
 
     # LM head: normal(0, 0.001)
-    params.lm_head = jax.random.normal(split_key(), (n_embd, padded_vocab), dtype=jnp.bfloat16) * 0.001
+    params.lm_head = jax.random.normal(split_key(), (n_embd, vocab_size), dtype=jnp.bfloat16) * 0.001
 
     # Precompute RoPE
     params.rope_cos, params.rope_sin = precompute_rope(config.seq_len, head_dim)
@@ -506,18 +502,16 @@ def model_apply(config: Config, params: dot_dict, tokens: jax.Array) -> jax.Arra
 def apply_lm_head(config: Config, params: dot_dict, hidden: jax.Array) -> jax.Array:
     """Apply lm_head to get logits. Used for eval and generation."""
     with jax.named_scope('lm_head'):
-        logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head)
-        logits = logits[:, :, :config.vocab_size]
-        logits = logits.astype(jnp.float32)
+        logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head,
+                            preferred_element_type=jnp.float32)
         logits = config.softcap * jnp.tanh(logits / config.softcap)
     return logits
 
 
 def _logits_from_chunk(h_chunk: jax.Array, lm_head: jax.Array, config: Config) -> jax.Array:
     """Compute logits for a single (chunk_size, n_embd) slice."""
-    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head)
-    logits = logits[:, :config.vocab_size]
-    logits = logits.astype(jnp.float32)
+    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
+                        preferred_element_type=jnp.float32)
     return config.softcap * jnp.tanh(logits / config.softcap)
 
 

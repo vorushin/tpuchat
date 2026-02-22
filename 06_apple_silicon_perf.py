@@ -190,11 +190,8 @@ class PerfConfig:
     softcap: float = 15.0
     num_lm_head_chunks: int = 8
 
-    @property
-    def padded_vocab(self):
-        return ((self.vocab_size + 63) // 64) * 64
-
 cfg = PerfConfig()
+assert cfg.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {cfg.vocab_size}"
 assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
     f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
 print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, E={cfg.n_embd}, "
@@ -675,7 +672,7 @@ for r in results_4a:
 # 5a. Embedding lookup
 print("=== Embedding ===")
 mx.random.seed(0)
-wte = mx.random.normal((cfg.padded_vocab, cfg.n_embd)).astype(mx.bfloat16)
+wte = mx.random.normal((cfg.vocab_size, cfg.n_embd)).astype(mx.bfloat16)
 emb_norm_w = mx.ones((cfg.n_embd,), dtype=mx.bfloat16)
 tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
 
@@ -689,17 +686,17 @@ r_embed = benchmark(bench_embed, tokens, wte, emb_norm_w, flop_count=None,
 # 5b. LM head — non-chunked
 print("\n=== LM head (non-chunked) ===")
 mx.random.seed(1)
-lm_head = mx.random.normal((cfg.n_embd, cfg.padded_vocab)).astype(mx.bfloat16) * 0.001
+lm_head = mx.random.normal((cfg.n_embd, cfg.vocab_size)).astype(mx.bfloat16) * 0.001
 hidden = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
 labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
 def bench_lm_head(hidden, lm_head, labels):
     logits = mx.einsum('btd,dv->btv', hidden, lm_head)
-    logits = logits[:, :, :cfg.vocab_size].astype(mx.float32)
+    logits = logits.astype(mx.float32)
     logits = cfg.softcap * mx.tanh(logits / cfg.softcap)
     return mx.mean(nn.losses.cross_entropy(logits, labels))
 
-lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd)
+lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd)
 r_lm = benchmark(bench_lm_head, hidden, lm_head, labels,
                  flop_count=lm_flops, label="LM head (non-chunked)")
 
@@ -717,8 +714,8 @@ def chunked_lm_head_loss(hidden, lm_head, labels, config):
 
     total_loss = mx.array(0.0)
     for i in range(N):
-        logits = hidden_flat[i] @ lm_head          # (S, padded_vocab)
-        logits = logits[:, :config.vocab_size].astype(mx.float32)
+        logits = hidden_flat[i] @ lm_head          # (S, vocab_size)
+        logits = logits.astype(mx.float32)
         logits = config.softcap * mx.tanh(logits / config.softcap)
         total_loss = total_loss + mx.sum(nn.losses.cross_entropy(logits, labels_flat[i]))
     return total_loss / (B * T)
@@ -753,8 +750,8 @@ def init_full_model(cfg, seed=42):
     """Initialize all model params (embed + layers + lm_head)."""
     mx.random.seed(seed)
     params = {}
-    params['wte'] = mx.random.normal((cfg.padded_vocab, cfg.n_embd)).astype(mx.bfloat16)
-    params['lm_head'] = mx.random.normal((cfg.n_embd, cfg.padded_vocab)).astype(mx.bfloat16) * 0.001
+    params['wte'] = mx.random.normal((cfg.vocab_size, cfg.n_embd)).astype(mx.bfloat16)
+    params['lm_head'] = mx.random.normal((cfg.n_embd, cfg.vocab_size)).astype(mx.bfloat16) * 0.001
     params['emb_norm_w'] = mx.ones((cfg.n_embd,), dtype=mx.bfloat16)
     params['final_norm_w'] = mx.ones((cfg.n_embd,), dtype=mx.bfloat16)
     params['layers'] = init_all_layers(cfg, cfg.n_layer, seed=seed + 100)
@@ -784,7 +781,7 @@ labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
 total_model_flops = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
                      cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
-                     matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd))
+                     matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd))
 
 # %%
 # 6a. Forward only
@@ -854,7 +851,7 @@ for bs in [1, 2, 4, 8]:
     lab = fake_tokens(bs, cfg_bs.seq_len)
     fl = 3 * (cfg_bs.n_layer * layer_flops(bs, cfg_bs.seq_len, cfg_bs.n_embd,
               cfg_bs.n_head, cfg_bs.n_kv_head, cfg_bs.head_dim, cfg_bs.mlp_dim) +
-              matmul_flops(bs * cfg_bs.seq_len, cfg_bs.padded_vocab, cfg_bs.n_embd))
+              matmul_flops(bs * cfg_bs.seq_len, cfg_bs.vocab_size, cfg_bs.n_embd))
 
     def bench(p, tok, _lab=lab, _cfg=cfg_bs):
         def loss_fn(params):
@@ -883,7 +880,7 @@ for sl in [512, 1024, 2048, 4096]:
     lab = fake_tokens(cfg_sl.batch_size, sl)
     fl = 3 * (cfg_sl.n_layer * layer_flops(cfg_sl.batch_size, sl, cfg_sl.n_embd,
               cfg_sl.n_head, cfg_sl.n_kv_head, cfg_sl.head_dim, cfg_sl.mlp_dim) +
-              matmul_flops(cfg_sl.batch_size * sl, cfg_sl.padded_vocab, cfg_sl.n_embd))
+              matmul_flops(cfg_sl.batch_size * sl, cfg_sl.vocab_size, cfg_sl.n_embd))
 
     def bench(p, tok, _lab=lab, _cfg=cfg_sl):
         def loss_fn(params):
@@ -915,7 +912,7 @@ for hd, nh in [(64, 16), (128, 8), (256, 4)]:
               cfg_hd.n_embd, cfg_hd.n_head, cfg_hd.n_kv_head,
               cfg_hd.head_dim, cfg_hd.mlp_dim) +
               matmul_flops(cfg_hd.batch_size * cfg_hd.seq_len,
-                           cfg_hd.padded_vocab, cfg_hd.n_embd))
+                           cfg_hd.vocab_size, cfg_hd.n_embd))
 
     def bench(p, tok, _lab=lab, _cfg=cfg_hd):
         def loss_fn(params):
@@ -944,7 +941,7 @@ for n_kv in [1, 2, 4]:
               cfg_gqa.n_embd, cfg_gqa.n_head, n_kv,
               cfg_gqa.head_dim, cfg_gqa.mlp_dim) +
               matmul_flops(cfg_gqa.batch_size * cfg_gqa.seq_len,
-                           cfg_gqa.padded_vocab, cfg_gqa.n_embd))
+                           cfg_gqa.vocab_size, cfg_gqa.n_embd))
 
     def bench(p, tok, _lab=lab, _cfg=cfg_gqa):
         def loss_fn(params):
@@ -1175,7 +1172,7 @@ print(f"Config: E={cfg.n_embd}, L={cfg.n_layer}, B={cfg.batch_size}, T={cfg.seq_
 # Compute FLOPs for this config
 lf = compute_layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
                           cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
-lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.padded_vocab, cfg.n_embd)
+lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd)
 fwd_flops = cfg.n_layer * lf + lm_flops
 step_flops = 3 * fwd_flops  # fwd + 2x bwd
 flops_per_tok = step_flops / (cfg.batch_size * cfg.seq_len)
@@ -1252,7 +1249,7 @@ for B in [4, 8, 16, 32]:
                       seq_len=cfg.seq_len)
     _lf = compute_layer_flops(B, _cfg.seq_len, _cfg.n_embd,
                                _cfg.n_head, _cfg.n_kv_head, _cfg.head_dim, _cfg.mlp_dim)
-    _lm = matmul_flops(B * _cfg.seq_len, _cfg.padded_vocab, _cfg.n_embd)
+    _lm = matmul_flops(B * _cfg.seq_len, _cfg.vocab_size, _cfg.n_embd)
     _step_flops = 3 * (_cfg.n_layer * _lf + _lm)
 
     _tok = fake_tokens(B, _cfg.seq_len + 1)
@@ -1300,7 +1297,7 @@ for E in [512, 768, 1024, 1536]:
 
     _lf = compute_layer_flops(_cfg.batch_size, _cfg.seq_len, E,
                                H, 1, cfg.head_dim, MLP)
-    _lm = matmul_flops(_cfg.batch_size * _cfg.seq_len, _cfg.padded_vocab, E)
+    _lm = matmul_flops(_cfg.batch_size * _cfg.seq_len, _cfg.vocab_size, E)
     _step_flops = 3 * (_cfg.n_layer * _lf + _lm)
 
     _tok = fake_tokens(_cfg.batch_size, _cfg.seq_len + 1)
