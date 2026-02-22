@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 11)
+# # 08 — TPU Ablation Lab (rev 12)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -61,7 +61,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 11
+REVISION = 12
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -374,7 +374,7 @@ class Config:
     microbatch_size: int = 4    # gradient accumulation when < batch_size
 
     # ── Training ───────────────────────────────────────────────
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
