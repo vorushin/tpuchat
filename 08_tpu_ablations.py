@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 5)
+# # 08 — TPU Ablation Lab (rev 10)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -48,7 +48,6 @@
 import functools as ft
 import time
 import os
-import math
 import pickle
 import queue
 import threading
@@ -58,14 +57,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import tiktoken
 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
-HBM_GB = 32
-MXU_DIM = 256              # 256×256 systolic array
 
-REVISION = 5
+REVISION = 10
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -513,7 +509,7 @@ def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
     return x
 
 # %%
-# === init_full_model, model_forward, model_forward_remat ===
+# === init_full_model, model_forward ===
 
 def init_all_layers(config, n_layers, seed=42):
     layers = dot_dict()
@@ -547,18 +543,6 @@ def model_forward(config, params, tokens):
         x = single_layer_forward(config, params.layers[i], x, cos, sin, layer_idx=i)
     return rms_norm(x)
 
-
-def model_forward_remat(config, params, tokens):
-    """Same as model_forward but with jax.checkpoint on each layer."""
-    B, T = tokens.shape
-    cos = params.rope_cos[:T][None, None, :, :]
-    sin = params.rope_sin[:T][None, None, :, :]
-    with jax.named_scope('embedding'):
-        x = rms_norm(params.wte[tokens])
-    for i in range(config.n_layer):
-        layer_fn = ft.partial(single_layer_forward, config, layer_idx=i)
-        x = jax.checkpoint(layer_fn)(params.layers[i], x, cos, sin)
-    return rms_norm(x)
 
 # %%
 # === chunked_lm_head_loss ===
@@ -686,7 +670,7 @@ def predict_step(config, params, x):
     return logits
 
 
-def generate(config, params, prompt, max_new_tokens=64, temperature=0.8):
+def generate(config, params, enc, prompt, max_new_tokens=64, temperature=0.8):
     """Generate text from a prompt using temperature sampling."""
     bos_id = enc.encode_single_token('<|bos|>')
     ids = [bos_id] + enc.encode_ordinary(prompt)
@@ -729,7 +713,7 @@ print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
-trainable_params, static_params = split_trainable(params)
+trainable_params, _ = split_trainable(params)
 optimizer = make_optimizer(config, NUM_QUICK_STEPS)
 opt_state = optimizer.init(trainable_params)
 train_step = make_train_step(optimizer)
@@ -766,7 +750,7 @@ for step in range(NUM_QUICK_STEPS + 1):
         eval_t0 = time.time()
         val_loader = val_loader_fn()
         val_losses = []
-        for ei in range(config.eval_steps):
+        for _ in range(config.eval_steps):
             vx, vy = next(val_loader)
             vx, vy = jnp.array(vx), jnp.array(vy)
             vl = eval_step(config, params, vx, vy)
@@ -776,7 +760,7 @@ for step in range(NUM_QUICK_STEPS + 1):
         if mfu_t0 is not None:
             mfu_eval_time += eval_dt
         report_eval_time += eval_dt
-        print(f'Step {step:05d} | Val loss: {avg_val_loss:.4f}')
+        print(f'step {step:05d} | Val loss: {avg_val_loss:.4f}')
 
     if last_step:
         break
@@ -790,9 +774,7 @@ for step in range(NUM_QUICK_STEPS + 1):
         print(f"XProf stopped. Trace saved to '{LOG_DIR}'.")
 
     # --- Train step ---
-    t_data = time.time()
     x_batch, y_batch = next(train_loader)
-    dt_data = time.time() - t_data
 
     t0 = time.time()
     loss, params, opt_state = train_step(config, params, opt_state,
@@ -835,7 +817,7 @@ if mfu_t0 is not None:
 # --- Sample text ---
 print('\n--- Samples ---')
 for prompt in ['The capital of France is', 'Machine learning is']:
-    text = generate(config, params, prompt, max_new_tokens=64)
+    text = generate(config, params, enc, prompt, max_new_tokens=64)
     print(f'Prompt: {prompt}\nOutput: {text}\n')
 
 # %%
@@ -869,6 +851,7 @@ sweep_config = {
     },
 }
 
+SWEEP_PROJECT = "tpuchat-ablations"
 SWEEP_ID = None            # set to existing sweep ID to continue, e.g. 'abc123'
 SWEEP_STEPS = 2_500        # ~13 min at ~300ms/step (same ~328M token budget)
 SWEEP_EVAL_EVERY = 250
@@ -917,7 +900,7 @@ def sweep_train_fn():
             if step % SWEEP_EVAL_EVERY == 0 or last_step:
                 val_loader = val_loader_fn()
                 val_losses = []
-                for ei in range(cfg.eval_steps):
+                for _ in range(cfg.eval_steps):
                     vx, vy = next(val_loader)
                     vx, vy = jnp.array(vx), jnp.array(vy)
                     vl = eval_step(cfg, params, vx, vy)
@@ -931,7 +914,7 @@ def sweep_train_fn():
                     "val/loss": avg_val_loss,
                     "val_loss": avg_val_loss,
                 })
-                print(f'Step {step:05d} | Val loss: {avg_val_loss:.4f} '
+                print(f'step {step:05d} | Val loss: {avg_val_loss:.4f} '
                       f'(best: {best_val_loss:.4f})')
 
             if last_step:
@@ -961,19 +944,16 @@ def sweep_train_fn():
                       f'| tok/s: {tok_per_sec:,}')
 
     finally:
+        # Stop prefetch thread so it doesn't linger between sweep runs
         train_loader.stop()
 
     wandb.finish()
     print(f'Run complete. Best val loss: {best_val_loss:.4f}')
 
 
-if SWEEP_ID is None:
-    sweep_id = wandb.sweep(sweep_config, project="tpuchat-ablations")
-    print(f"New sweep ID: {sweep_id}")
-else:
-    sweep_id = SWEEP_ID
-    print(f"Continuing sweep: {sweep_id}")
-wandb.agent(sweep_id, function=sweep_train_fn, count=5, project="tpuchat-ablations")
+sweep_id = SWEEP_ID or wandb.sweep(sweep_config, project=SWEEP_PROJECT)
+print(f"{'Continuing' if SWEEP_ID else 'New'} sweep: {sweep_id}")
+wandb.agent(sweep_id, function=sweep_train_fn, count=5, project=SWEEP_PROJECT)
 
 # --- Disconnect runtime to stop billing ---
 from google.colab import runtime
@@ -1042,6 +1022,7 @@ wandb.define_metric("train/mfu_pct", step_metric="step")
 wandb.define_metric("val/loss", step_metric="step")
 
 smooth_loss = 0.0
+debiased_loss = 0.0
 best_val_loss = float('inf')
 total_training_time = 0.0
 params = hero_params
@@ -1059,7 +1040,7 @@ try:
         if step % HERO_EVAL_EVERY == 0 or last_step:
             val_loader = val_loader_fn()
             val_losses = []
-            for ei in range(hero_config.eval_steps):
+            for _ in range(hero_config.eval_steps):
                 vx, vy = next(val_loader)
                 vx, vy = jnp.array(vx), jnp.array(vy)
                 vl = eval_step(hero_config, params, vx, vy)
@@ -1068,8 +1049,11 @@ try:
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
 
-            wandb.log({"step": step, "val/loss": avg_val_loss})
-            print(f'Step {step:06d}/{HERO_STEPS} | Val loss: {avg_val_loss:.4f} '
+            eval_log = {"step": step, "val/loss": avg_val_loss}
+            if last_step:
+                eval_log["train/loss"] = debiased_loss
+            wandb.log(eval_log)
+            print(f'step {step:06d}/{HERO_STEPS} | Val loss: {avg_val_loss:.4f} '
                   f'(best: {best_val_loss:.4f})')
 
         # --- Checkpoint ---
@@ -1132,7 +1116,7 @@ print(f'Total training time: {total_training_time/3600:.1f}h')
 print('\n--- Samples ---')
 for prompt in ['The capital of France is', 'In a distant galaxy, scientists discovered',
                'Machine learning is']:
-    text = generate(hero_config, params, prompt, max_new_tokens=100)
+    text = generate(hero_config, params, enc, prompt, max_new_tokens=100)
     print(f'Prompt: {prompt}\nOutput: {text}\n')
 
 # --- Upload checkpoint to HF Hub ---
