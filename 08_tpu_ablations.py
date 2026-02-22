@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 30)
+# # 08 — TPU Ablation Lab (rev 31)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-budget).
@@ -78,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 30
+REVISION = 31
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -331,36 +331,6 @@ def make_optimizer(config, num_steps):
                        weight_decay=config.weight_decay)
 
 # %%
-# === Manual AdamW (for benchmarking optimizer overhead) ===
-
-def init_adam_state(param):
-    """Initialize Adam optimizer state for a single parameter."""
-    return dot_dict(
-        mu=jnp.zeros_like(param),
-        nu=jnp.zeros_like(param),
-        count=jnp.array(0, dtype=jnp.int32),
-    )
-
-
-def adamw_step(config, lr_mult, param, grad, state):
-    """AdamW update using config hyperparams. Returns (new_param, new_state)."""
-    new_count = state.count + 1
-    new_mu = config.beta1 * state.mu + (1 - config.beta1) * grad
-    new_nu = config.beta2 * state.nu + (1 - config.beta2) * grad ** 2
-
-    mu_hat = new_mu / (1 - config.beta1 ** new_count)
-    nu_hat = new_nu / (1 - config.beta2 ** new_count)
-
-    lr_eff = config.learning_rate * lr_mult
-    update = mu_hat / (jnp.sqrt(nu_hat) + config.eps)
-
-    wd_eff = jnp.where(param.ndim >= 2, config.weight_decay, 0.0)
-    new_param = param - lr_eff * (update + wd_eff * param)
-
-    new_state = dot_dict(mu=new_mu, nu=new_nu, count=new_count)
-    return new_param, new_state
-
-# %%
 # === count_params, count_non_embed_params ===
 
 def count_params(params):
@@ -388,10 +358,9 @@ def count_non_embed_params(params):
 @dataclass(kw_only=True, frozen=True)
 class Config:
     # ── Ablation knobs ─────────────────────────────────────────
-    attn_impl: str = 'splash'       # 'splash' | 'einsum' | 'jax'
+    attn_impl: str = 'splash'       # 'splash' | 'einsum'
     mlp_type: str = 'glu'           # 'glu' (SwiGLU, F=3072) | 'plain' (ReLU², F=4096)
     qk_norm: bool = True            # QK-norm on queries and keys
-    optimizer_type: str = 'optax'   # 'optax' | 'manual'
 
     # ── Architecture (D1024, 130M non-embed) ───────────────────
     n_embd: int = 1024
@@ -434,7 +403,7 @@ print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
       f'V={config.vocab_size}, N={config.n_head}, K={config.n_kv_head}, '
       f'H={config.head_dim}, F={config.mlp_dim}')
 print(f'Ablations: attn_impl={config.attn_impl}, mlp_type={config.mlp_type}, '
-      f'qk_norm={config.qk_norm}, optimizer={config.optimizer_type}')
+      f'qk_norm={config.qk_norm}')
 mb_info = (f', microbatch={config.microbatch_size}, accum={config.num_microbatches}x'
            if config.num_microbatches > 1 else '')
 print(f'Training: lr={config.learning_rate:.1e}, B={config.batch_size}{mb_info}')
@@ -522,11 +491,6 @@ def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
                                jnp.finfo(scores.dtype).min)
             attn_weights = jax.nn.softmax(scores, axis=-1)
             attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
-
-        elif config.attn_impl == 'jax':
-            k_exp, v_exp = _expand_kv(k, v, config.n_head, config.n_kv_head)
-            attn_out = jax.nn.dot_product_attention(
-                q, k_exp, v_exp, is_causal=True, implementation='xla')
 
         attn_out = jnp.einsum('bhtd,hde->bte', attn_out, layer.c_proj)
 
@@ -689,55 +653,6 @@ def make_train_step(optimizer):
     return train_step
 
 
-def make_manual_train_step():
-    """Create a JIT-compiled train step using manual per-leaf AdamW.
-
-    Uses constant LR (no schedule) — this is for benchmarking optimizer
-    overhead, not training quality. lr_mult is accepted for API compatibility.
-    """
-    @jax.jit
-    def train_step(config, params, opt_state, x, y, lr_mult):
-        num_mb = config.num_microbatches
-
-        x_micro = x.reshape(num_mb, config.microbatch_size, config.seq_len)
-        y_micro = y.reshape(num_mb, config.microbatch_size, config.seq_len)
-
-        def loss_fn(params, x_mb, y_mb):
-            hidden = model_forward(config, params, x_mb)
-            return chunked_lm_head_loss(hidden, params.lm_head, y_mb, config)
-
-        def microbatch_step(grad_acc, data):
-            x_mb, y_mb = data
-            loss, grads = jax.value_and_grad(loss_fn)(params, x_mb, y_mb)
-            grad_acc = jax.tree.map(jax.lax.add, grad_acc, grads)
-            return grad_acc, loss
-
-        with jax.named_scope('forward_backward'):
-            grad_init = jax.tree.map(jnp.zeros_like, params)
-            grads, losses = jax.lax.scan(microbatch_step, grad_init,
-                                         (x_micro, y_micro))
-            grads = jax.tree.map(lambda g: g / num_mb, grads)
-            loss = jnp.mean(losses)
-
-        with jax.named_scope('optimizer'):
-            is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
-            t_leaves, t_treedef = jax.tree.flatten(params)
-            g_leaves, _ = jax.tree.flatten(grads)
-            o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
-
-            new_t_leaves, new_o_leaves = [], []
-            for p, g, s in zip(t_leaves, g_leaves, o_leaves):
-                new_p, new_s = adamw_step(config, lr_mult, p, g, s)
-                new_t_leaves.append(new_p)
-                new_o_leaves.append(new_s)
-
-            new_params = t_treedef.unflatten(new_t_leaves)
-            new_opt_state = o_treedef.unflatten(new_o_leaves)
-
-        return loss, new_params, new_opt_state
-    return train_step
-
-
 @jax.jit
 def eval_step(config, params, x, y):
     """JIT-compiled eval: returns loss for a single batch."""
@@ -811,13 +726,9 @@ print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
-if config.optimizer_type == 'manual':
-    opt_state = jax.tree.map(init_adam_state, params)
-    train_step = make_manual_train_step()
-else:
-    optimizer = make_optimizer(config, NUM_QUICK_STEPS)
-    opt_state = optimizer.init(params)
-    train_step = make_train_step(optimizer)
+optimizer = make_optimizer(config, NUM_QUICK_STEPS)
+opt_state = optimizer.init(params)
+train_step = make_train_step(optimizer)
 
 # Data
 raw_train = tokenize_shards(train_shard_indices, config.batch_size, config.seq_len)
@@ -878,12 +789,8 @@ for step in range(NUM_QUICK_STEPS + 1):
     x_batch, y_batch = next(train_loader)
 
     t0 = time.time()
-    if config.optimizer_type == 'manual':
-        loss, params, opt_state = train_step(config, params, opt_state,
-                                              x_batch, y_batch, jnp.array(1.0))
-    else:
-        loss, params, opt_state = train_step(config, params, opt_state,
-                                              x_batch, y_batch)
+    loss, params, opt_state = train_step(config, params, opt_state,
+                                          x_batch, y_batch)
     loss.block_until_ready()
     dt = time.time() - t0
 
@@ -955,7 +862,7 @@ from google.colab import userdata
 wandb.login(key=userdata.get("WANDB_TOKEN"))
 
 sweep_config = {
-    "name": f"ablation-{config.mlp_type}-{config.attn_impl}-qknorm{config.qk_norm}-{config.optimizer_type}",
+    "name": f"ablation-{config.mlp_type}-{config.attn_impl}-qknorm{config.qk_norm}",
     "method": "bayes",
     "metric": {"goal": "minimize", "name": "val_loss"},
     "parameters": {
@@ -990,13 +897,9 @@ def sweep_train_fn():
     non_embed_p = count_non_embed_params(params)
     print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 
-    if cfg.optimizer_type == 'manual':
-        opt_state = jax.tree.map(init_adam_state, params)
-        sweep_train_step = make_manual_train_step()
-    else:
-        sweep_opt = make_optimizer(cfg, SWEEP_STEPS)
-        opt_state = sweep_opt.init(params)
-        sweep_train_step = make_train_step(sweep_opt)
+    sweep_opt = make_optimizer(cfg, SWEEP_STEPS)
+    opt_state = sweep_opt.init(params)
+    sweep_train_step = make_train_step(sweep_opt)
 
     raw_train = tokenize_shards(train_shard_indices, cfg.batch_size, cfg.seq_len)
     train_loader = PrefetchDataLoader(raw_train, capacity=4)
@@ -1039,12 +942,8 @@ def sweep_train_fn():
             # --- Train ---
             t0 = time.time()
             x_batch, y_batch = next(train_loader)
-            if cfg.optimizer_type == 'manual':
-                loss, params, opt_state = sweep_train_step(
-                    cfg, params, opt_state, x_batch, y_batch, jnp.array(1.0))
-            else:
-                loss, params, opt_state = sweep_train_step(
-                    cfg, params, opt_state, x_batch, y_batch)
+            loss, params, opt_state = sweep_train_step(cfg, params, opt_state,
+                                                        x_batch, y_batch)
             loss.block_until_ready()
             dt = time.time() - t0
 
@@ -1158,13 +1057,9 @@ print(f'Steps: {HERO_STEPS:,} ({total_batch_size:,} tok/step)')
 print(f'Estimated time: {HERO_STEPS * 0.302 / 3600:.1f} hours (at ~302ms/step, 16 microbatches)')
 
 # Init optimizer
-if hero_config.optimizer_type == 'manual':
-    opt_state = jax.tree.map(init_adam_state, hero_params)
-    hero_train_step = make_manual_train_step()
-else:
-    hero_opt = make_optimizer(hero_config, HERO_STEPS)
-    opt_state = hero_opt.init(hero_params)
-    hero_train_step = make_train_step(hero_opt)
+hero_opt = make_optimizer(hero_config, HERO_STEPS)
+opt_state = hero_opt.init(hero_params)
+hero_train_step = make_train_step(hero_opt)
 
 # Data
 raw_train = tokenize_shards(train_shard_indices, hero_config.batch_size, hero_config.seq_len)
@@ -1183,10 +1078,9 @@ step_flops = 3 * fwd_flops
 # wandb
 wandb.login(key=userdata.get("WANDB_TOKEN"))
 wandb.init(project="tpuchat-ablations",
-           name=f"hero-{hero_config.mlp_type}-{hero_config.attn_impl}-qknorm{hero_config.qk_norm}-{hero_config.optimizer_type}",
+           name=f"hero-{hero_config.mlp_type}-{hero_config.attn_impl}-qknorm{hero_config.qk_norm}",
            config={
                "mlp_type": hero_config.mlp_type, "attn_impl": hero_config.attn_impl, "qk_norm": hero_config.qk_norm,
-               "optimizer_type": hero_config.optimizer_type,
                "learning_rate": hero_config.learning_rate,
                "non_embed_params": hero_non_embed,
                "target_tokens": target_tokens, "steps": HERO_STEPS,
@@ -1247,12 +1141,8 @@ try:
         # --- Train step ---
         t0 = time.time()
         x_batch, y_batch = next(train_loader)
-        if hero_config.optimizer_type == 'manual':
-            loss, params, opt_state = hero_train_step(
-                hero_config, params, opt_state, x_batch, y_batch, jnp.array(1.0))
-        else:
-            loss, params, opt_state = hero_train_step(
-                hero_config, params, opt_state, x_batch, y_batch)
+        loss, params, opt_state = hero_train_step(hero_config, params, opt_state,
+                                                   x_batch, y_batch)
         loss.block_until_ready()
         dt = time.time() - t0
 
