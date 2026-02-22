@@ -11,12 +11,12 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 31)
+# # 08 — TPU Ablation Lab (rev 32)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-budget).
 # Based on Karpathy's [nanochat](https://github.com/karpathy/nanochat) — ported
-# to raw JAX for a single TPU v6e on Google Colab Pro+. Also works
+# to JAX for a single TPU v6e on Google Colab Pro+. Also works
 # on TPU v5e (available on the free Colab plan, ~3× slower).
 #
 # **Runtime type:** In Colab, go to *Runtime → Change runtime type* and select
@@ -78,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 31
+REVISION = 32
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -352,7 +352,6 @@ def count_non_embed_params(params):
 # model variants and tune hyperparameters — edit it as needed.
 
 # %%
-# === Config ===
 
 @jax.tree_util.register_static
 @dataclass(kw_only=True, frozen=True)
@@ -409,7 +408,6 @@ mb_info = (f', microbatch={config.microbatch_size}, accum={config.num_microbatch
 print(f'Training: lr={config.learning_rate:.1e}, B={config.batch_size}{mb_info}')
 
 # %%
-# === init_layer_params (branches on mlp_type) ===
 
 def init_layer_params(config, seed=42):
     """Initialize params for one transformer layer."""
@@ -442,8 +440,6 @@ def init_layer_params(config, seed=42):
         layer.w_down = jnp.zeros((config.mlp_dim, config.n_embd), dtype=jnp.bfloat16)
     return layer
 
-# %%
-# === single_layer_forward (uses attn_impl, qk_norm, mlp_type from config) ===
 
 def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
     """Forward pass for one transformer layer."""
@@ -510,8 +506,6 @@ def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
     x = x + mlp_out
     return x
 
-# %%
-# === init_full_model, model_forward ===
 
 def init_all_layers(config, n_layers, seed=42):
     layers = dot_dict()
@@ -546,11 +540,12 @@ def model_forward(config, params, tokens):
     return rms_norm(x)
 
 
-# %%
-# === chunked_lm_head_loss ===
-
 def _logit_dtype(config):
     return jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
+
+
+# Chunked LM head loss, reduces HMB usage by the last matmul (hidden_dim -> vocab_dim).
+# Extracted from maxtext.
 
 
 def _logits_from_chunk(h_chunk, lm_head, config):
@@ -610,8 +605,6 @@ def _chunked_loss_bwd(config, residuals, g):
 
 chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
 
-# %%
-# === train_step, eval_step, predict_step, generate ===
 
 def make_train_step(optimizer):
     """Create a JIT-compiled train step with the given optax optimizer.
@@ -711,7 +704,6 @@ def generate(config, params, enc, prompt, max_new_tokens=64,
 # (something needs fixing).
 
 # %%
-# === Quick Training: ~300 steps, XProf on 15-20, MFU measurement ===
 
 NUM_QUICK_STEPS = 300
 EVAL_EVERY = 100
@@ -1225,11 +1217,7 @@ from google.colab import runtime
 runtime.unassign()
 
 # %% [markdown]
-# ## Load & Sample (standalone)
-#
-# Load a trained checkpoint from HuggingFace and generate text. This cell runs
-# independently — you can use it on a fresh CPU-only Colab kernel to inspect any
-# previously uploaded model.
+# ## Load from HF checkpoint & Sample
 
 # %%
 # === Load hero checkpoint from HuggingFace ===
