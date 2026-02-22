@@ -687,3 +687,11 @@ Params: 163.6M total, 130.0M non-embed
 Step 00000 | Val loss: 10.3977 (best: 10.3977)
 step 00000/2500 | loss: 10.3977 | tok/s: 6,699
 step 00050/2500 | loss: 7.8415 | tok/s: 436,034
+
+## Feb 22 2026
+
+Agent: Removed `padded_vocab` property from all 7 notebooks (02–08). `vocab_size=32768` is already divisible by 256, so the round-up-to-64 was a no-op. Replaced with `assert config.vocab_size % 256 == 0` after Config instantiation. Changed all embedding/lm_head init shapes from `padded_vocab` → `vocab_size`. Removed logit slicing lines (`logits[:, :, :config.vocab_size]`) that stripped the (non-existent) padding. Removed `(padded=...)` from print statements.
+
+Agent: Fixed lm_head einsums in TPU notebooks (02–05, 08) to use `preferred_element_type=jnp.float32` instead of `.astype(jnp.float32)` after the einsum. Previously the fp32 MXU accumulator was truncated to bf16 (default output dtype when both inputs are bf16), then cast back to fp32 — losing precision. Now the einsum outputs fp32 directly, preserving the full accumulator precision for the softcap and cross-entropy.
+
+Agent: Set default learning_rate to 1e-4 in 08_tpu_ablations.py (rev 12).
