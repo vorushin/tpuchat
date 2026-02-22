@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 12)
+# # 08 — TPU Ablation Lab (rev 13)
 #
 # Controlled ablation experiments on TPU v6e for a **130M non-embed param**
 # transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
@@ -38,7 +38,7 @@
 # | Hero run (20 tok/param) | ~2.6B tokens, ~19.8k steps, ~1.7h |
 
 # %%
-# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile
+# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile plotly
 
 # %% [markdown]
 # ## Utilities
@@ -61,7 +61,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 12
+REVISION = 13
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -953,6 +953,44 @@ wandb.agent(sweep_id, function=sweep_train_fn, count=5, project=SWEEP_PROJECT)
 # --- Disconnect runtime to stop billing ---
 from google.colab import runtime
 runtime.unassign()
+
+# %%
+# === Plot sweep results: LR vs val_loss ===
+import wandb
+import plotly.graph_objects as go
+
+api = wandb.Api()
+sweep = api.sweep(f"{SWEEP_PROJECT}/{sweep_id}")
+runs = [r for r in sweep.runs if r.state == "finished"]
+
+lrs = [r.config["learning_rate"] for r in runs]
+val_losses = [r.summary["val_loss"] for r in runs]
+names = [r.name for r in runs]
+
+best_idx = val_losses.index(min(val_losses))
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=lrs, y=val_losses, mode='markers',
+    marker=dict(size=10, color='steelblue'),
+    text=names, hovertemplate='%{text}<br>LR: %{x:.2e}<br>val_loss: %{y:.4f}<extra></extra>',
+    name='runs',
+))
+fig.add_trace(go.Scatter(
+    x=[lrs[best_idx]], y=[val_losses[best_idx]], mode='markers',
+    marker=dict(size=14, color='crimson', symbol='star'),
+    hovertemplate=f'{names[best_idx]}<br>LR: {lrs[best_idx]:.2e}<br>val_loss: {val_losses[best_idx]:.4f}<extra></extra>',
+    name=f'best (LR={lrs[best_idx]:.2e})',
+))
+fig.update_layout(
+    title='Sweep: Learning Rate vs Val Loss',
+    xaxis=dict(title='Learning Rate', type='log'),
+    yaxis=dict(title='Val Loss'),
+    template='plotly_white',
+    showlegend=True,
+    width=700, height=450,
+)
+fig.show()
 
 # %% [markdown]
 # ## Hero Run (20 tok/param)
