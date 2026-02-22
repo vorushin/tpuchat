@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 24)
+# # 08 — TPU Ablation Lab (rev 26)
 #
 # Companion notebook for
 # [LLM pretraining on TPU with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-budget).
@@ -78,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 24
+REVISION = 26
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -372,6 +372,7 @@ class Config:
     head_dim: int = 256
     mlp_dim: int = 3072             # 3072 for glu, 4096 for plain
     softcap: float = 15.0
+    logit_dtype: str = 'bf16'       # 'bf16' or 'fp32' — bf16 is ~4% faster
     splash_block_size: int = 1024
     num_lm_head_chunks: int = 8
     batch_size: int = 64
@@ -548,9 +549,13 @@ def model_forward(config, params, tokens):
 # %%
 # === chunked_lm_head_loss ===
 
+def _logit_dtype(config):
+    return jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
+
+
 def _logits_from_chunk(h_chunk, lm_head, config):
     logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
-                        preferred_element_type=jnp.float32)
+                        preferred_element_type=_logit_dtype(config))
     return config.softcap * jnp.tanh(logits / config.softcap)
 
 
@@ -661,13 +666,14 @@ def predict_step(config, params, x):
     hidden = model_forward(config, params, x)
     with jax.named_scope('lm_head'):
         logits = jnp.einsum('btd,dv->btv', hidden, params.lm_head,
-                            preferred_element_type=jnp.float32)
+                            preferred_element_type=_logit_dtype(config))
         logits = config.softcap * jnp.tanh(logits / config.softcap)
     return logits
 
 
-def generate(config, params, enc, prompt, max_new_tokens=64, temperature=0.8):
-    """Generate text from a prompt using temperature sampling."""
+def generate(config, params, enc, prompt, max_new_tokens=64,
+             temperature=0.8, top_k=50):
+    """Generate text from a prompt using top-k + temperature sampling."""
     bos_id = enc.encode_single_token('<|bos|>')
     ids = [bos_id] + enc.encode_ordinary(prompt)
     key = jax.random.key(42)
@@ -683,8 +689,12 @@ def generate(config, params, enc, prompt, max_new_tokens=64, temperature=0.8):
         if temperature == 0:
             next_id = int(jnp.argmax(next_logits))
         else:
-            key, subkey = jax.random.split(key)
             next_logits = next_logits / temperature
+            if top_k > 0:
+                top_vals = jax.lax.top_k(next_logits, top_k)[0]
+                next_logits = jnp.where(next_logits >= top_vals[-1],
+                                        next_logits, -1e10)
+            key, subkey = jax.random.split(key)
             next_id = int(jax.random.categorical(subkey, next_logits))
         ids.append(next_id)
 
