@@ -52,7 +52,6 @@
 # %%
 import functools as ft
 import time
-import math
 from dataclasses import dataclass
 
 import jax
@@ -251,26 +250,32 @@ def _expand_kv(k, v, n_head, n_kv_head):
 @jax.tree_util.register_static
 @dataclass(kw_only=True, frozen=True)
 class PerfConfig:
-    """All dims 256-aligned for MXU.  Matches 04_maxtext.py defaults."""
-    batch_size: int = 8
+    """All dims 256-aligned for MXU.  164M param model (130M non-embed)."""
+    batch_size: int = 64
+    microbatch_size: int = 4
     seq_len: int = 2048
     n_head: int = 4
-    n_kv_head: int = 2
+    n_kv_head: int = 1
     head_dim: int = 256
     n_embd: int = 1024       # n_head * head_dim
     mlp_dim: int = 3072      # 3x expansion for SwiGLU
     vocab_size: int = 32768
-    n_layer: int = 24
+    n_layer: int = 8
     softcap: float = 15.0
+    logit_dtype: str = 'bf16'    # 'bf16' or 'fp32' — bf16 is ~4% faster
     splash_block_size: int = 1024
     num_lm_head_chunks: int = 8
+
+    @property
+    def num_microbatches(self):
+        return self.batch_size // self.microbatch_size
 
 cfg = PerfConfig()
 assert cfg.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {cfg.vocab_size}"
 assert cfg.n_embd == cfg.n_head * cfg.head_dim, \
     f'n_embd ({cfg.n_embd}) must equal n_head * head_dim ({cfg.n_head * cfg.head_dim})'
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
-      f"N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
+print(f"Config: B={cfg.batch_size}, mb={cfg.microbatch_size}, T={cfg.seq_len}, "
+      f"D={cfg.n_embd}, N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
       f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}")
 
 # %%
@@ -407,9 +412,13 @@ def multi_layer_forward(cfg, layers, n_layers, x, cos, sin, attn_impl='splash'):
 # %%
 # === Chunked LM head loss ===
 
+def _logit_dtype(config):
+    return jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
+
+
 def _logits_from_chunk(h_chunk, lm_head, config):
     logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
-                        preferred_element_type=jnp.float32)
+                        preferred_element_type=_logit_dtype(config))
     return config.softcap * jnp.tanh(logits / config.softcap)
 
 
@@ -468,14 +477,13 @@ chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
 # === Full model ===
 
 def init_full_model(cfg, seed=42):
-    """Initialize all model params (embed + layers + lm_head + rope)."""
+    """Initialize all model params (embed + layers + lm_head)."""
     key = jax.random.key(seed)
     params = dot_dict()
     key, k1, k2 = jax.random.split(key, 3)
     params.wte = jax.random.normal(k1, (cfg.vocab_size, cfg.n_embd), dtype=jnp.bfloat16)
     params.lm_head = jax.random.normal(k2, (cfg.n_embd, cfg.vocab_size),
                                         dtype=jnp.bfloat16) * 0.001
-    params.rope_cos, params.rope_sin = precompute_rope(cfg.seq_len, cfg.head_dim)
     params.layers = init_all_layers(cfg, cfg.n_layer, seed=seed + 100)
     return params
 
@@ -483,8 +491,9 @@ def init_full_model(cfg, seed=42):
 def model_forward(cfg, params, tokens):
     """Full forward: embed -> layers -> final_norm.  Returns hidden (B,T,E)."""
     B, T = tokens.shape
-    cos = params.rope_cos[:T][None, None, :, :]
-    sin = params.rope_sin[:T][None, None, :, :]
+    cos, sin = precompute_rope(T, cfg.head_dim)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
     x = rms_norm(params.wte[tokens])
     for i in range(cfg.n_layer):
         x = single_layer_forward(cfg, params.layers[i], x, cos, sin, attn_impl='splash')
@@ -494,8 +503,9 @@ def model_forward(cfg, params, tokens):
 def model_forward_remat(cfg, params, tokens):
     """Same as model_forward but with jax.checkpoint on each layer."""
     B, T = tokens.shape
-    cos = params.rope_cos[:T][None, None, :, :]
-    sin = params.rope_sin[:T][None, None, :, :]
+    cos, sin = precompute_rope(T, cfg.head_dim)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
     x = rms_norm(params.wte[tokens])
     layer_fn = ft.partial(single_layer_forward, cfg, attn_impl='splash')
     for i in range(cfg.n_layer):
@@ -504,27 +514,6 @@ def model_forward_remat(cfg, params, tokens):
 
 # %%
 # === Optimizer utilities ===
-
-def split_trainable(params):
-    """Split params into trainable and static (non-differentiable).
-    From 02_train.py — rope_cos/rope_sin are precomputed, not trained."""
-    trainable = dot_dict()
-    static = dot_dict()
-    for k, v in params.items():
-        if k in ('rope_cos', 'rope_sin'):
-            static[k] = v
-        else:
-            trainable[k] = v
-    return trainable, static
-
-
-def merge_params(trainable, static):
-    """Merge trainable and static params back together."""
-    merged = dot_dict()
-    merged.update(trainable)
-    merged.update(static)
-    return merged
-
 
 def init_adam_state(param):
     """Initialize Adam optimizer state for a single parameter."""
@@ -558,9 +547,8 @@ def adamw_step(lr, beta1, beta2, eps, wd, lr_mult, param, grad, state):
 
 
 def count_params(params):
-    """Count total trainable parameters (excludes rope_cos/rope_sin)."""
-    trainable, _ = split_trainable(params)
-    return sum(p.size for p in jax.tree.leaves(trainable) if isinstance(p, jax.Array))
+    """Count total parameters."""
+    return sum(p.size for p in jax.tree.leaves(params) if isinstance(p, jax.Array))
 
 
 def count_non_embed_params(params):
@@ -574,6 +562,37 @@ OPT_BETA1 = 0.9
 OPT_BETA2 = 0.95
 OPT_EPS = 1e-8
 OPT_WD = 0.1
+
+# %%
+# === Microbatched train step ===
+
+def make_bench_train_step(optimizer, cfg, labels):
+    """Create a JIT-compiled train step with microbatch gradient accumulation."""
+    @jax.jit
+    def train_step(params, opt_state, tokens, _opt=optimizer):
+        num_mb = cfg.num_microbatches
+        x_micro = tokens.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
+        y_micro = labels.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
+
+        def loss_fn(params, x_mb, y_mb):
+            hidden = model_forward(cfg, params, x_mb)
+            return chunked_lm_head_loss(hidden, params.lm_head, y_mb, cfg)
+
+        def microbatch_step(grad_acc, data):
+            x_mb, y_mb = data
+            loss, grads = jax.value_and_grad(loss_fn)(params, x_mb, y_mb)
+            grad_acc = jax.tree.map(jax.lax.add, grad_acc, grads)
+            return grad_acc, loss
+
+        grad_init = jax.tree.map(jnp.zeros_like, params)
+        grads, losses = jax.lax.scan(microbatch_step, grad_init, (x_micro, y_micro))
+        grads = jax.tree.map(lambda g: g / num_mb, grads)
+        loss = jnp.mean(losses)
+
+        updates, new_opt_state = _opt.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return loss, new_params, new_opt_state
+    return train_step
 
 # %% [markdown]
 # ## Phase 1 — Matmul Baseline
@@ -642,9 +661,12 @@ print_summary(results_1c)
 # - **Attention**: mixed (projections = compute, softmax = memory)
 
 # %%
+# Component benchmarks use microbatch_size (B=4) to avoid OOM on attention matrices
+B_comp = cfg.microbatch_size
+
 # 2a. RMSNorm — pure elementwise, expect ~0% MFU
 print("=== RMSNorm ===")
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
+x = fake_hidden(B_comp, cfg.seq_len, cfg.n_embd)
 
 @jax.jit
 def bench_rmsnorm(x):
@@ -657,7 +679,7 @@ r_norm = benchmark(bench_rmsnorm, x, flop_count=None, label="RMSNorm")
 print("=== RoPE ===")
 
 q = jax.random.normal(jax.random.key(0),
-    (cfg.batch_size, cfg.n_head, cfg.seq_len, cfg.head_dim), dtype=jnp.bfloat16)
+    (B_comp, cfg.n_head, cfg.seq_len, cfg.head_dim), dtype=jnp.bfloat16)
 
 @jax.jit
 def bench_rope(q, cos, sin):
@@ -670,7 +692,7 @@ r_rope = benchmark(bench_rope, q, cos_b, sin_b, flop_count=None, label="RoPE")
 print("=== SwiGLU MLP ===")
 
 mlp_params = init_mlp_params(cfg)
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
+x = fake_hidden(B_comp, cfg.seq_len, cfg.n_embd)
 
 @jax.jit
 def bench_mlp(x, params):
@@ -680,7 +702,7 @@ def bench_mlp(x, params):
         up = jnp.einsum('btd,dh->bth', h, params.w_up)
         return jnp.einsum('bth,hd->btd', gate * up, params.w_down)
 
-tok = cfg.batch_size * cfg.seq_len
+tok = B_comp * cfg.seq_len
 mlp_flops = 3 * 2 * tok * cfg.n_embd * cfg.mlp_dim
 r_mlp = benchmark(bench_mlp, x, mlp_params, flop_count=mlp_flops, label="SwiGLU MLP")
 
@@ -714,15 +736,15 @@ def bench_attn_einsum(x, params, cos, sin):
         attn_out = jnp.einsum('bhts,bhsd->bhtd', attn_weights, v_exp)
         return jnp.einsum('bhtd,hde->bte', attn_out, params.c_proj)
 
-tok = cfg.batch_size * cfg.seq_len
+tok = B_comp * cfg.seq_len
 proj_flops = (2 * tok * cfg.n_embd * cfg.n_head * cfg.head_dim +
               2 * tok * cfg.n_embd * cfg.n_kv_head * cfg.head_dim +
               2 * tok * cfg.n_embd * cfg.n_kv_head * cfg.head_dim +
               2 * tok * cfg.n_head * cfg.head_dim * cfg.n_embd)
-attn_core = attention_flops(cfg.batch_size, cfg.n_head, cfg.seq_len, cfg.head_dim)
+attn_core = attention_flops(B_comp, cfg.n_head, cfg.seq_len, cfg.head_dim)
 total_attn_flops = proj_flops + attn_core
 
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
+x = fake_hidden(B_comp, cfg.seq_len, cfg.n_embd)
 r_attn_ein = benchmark(bench_attn_einsum, x, attn_params, cos_b, sin_b,
                         flop_count=total_attn_flops, label="Attention (einsum)")
 
@@ -802,8 +824,8 @@ print_summary([r_norm, r_rope, r_mlp, r_attn_ein, r_attn_jax, r_attn_splash])
 # 3a. Full layer benchmark
 print("=== Single layer (splash) ===")
 layer_p = init_layer_params(cfg)
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
-lf = layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
+x = fake_hidden(B_comp, cfg.seq_len, cfg.n_embd)
+lf = layer_flops(B_comp, cfg.seq_len, cfg.n_embd,
                  cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
 
 @jax.jit
@@ -850,11 +872,11 @@ print_summary(results_3b)
 # 4a. Depth sweep
 print("=== Depth sweep ===")
 results_4a = []
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
-lf = layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
+x = fake_hidden(B_comp, cfg.seq_len, cfg.n_embd)
+lf = layer_flops(B_comp, cfg.seq_len, cfg.n_embd,
                  cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
 
-for n_layers in [1, 4, 8, 16, 24]:
+for n_layers in [1, 2, 4, 8, 12]:
     layers = init_all_layers(cfg, n_layers)
     fl = n_layers * lf
 
@@ -894,11 +916,14 @@ for r in results_4a:
 # - Chunked vs non-chunked loss comparison
 
 # %%
+# Use microbatch_size for component benchmarks (non-chunked lm_head would OOM at B=64)
+B5 = cfg.microbatch_size
+
 # 5a. Embedding lookup
 print("=== Embedding ===")
 wte = jax.random.normal(jax.random.key(0),
     (cfg.vocab_size, cfg.n_embd), dtype=jnp.bfloat16)
-tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
+tokens = fake_tokens(B5, cfg.seq_len)
 
 @jax.jit
 def bench_embed(tokens, wte):
@@ -912,17 +937,17 @@ r_embed = benchmark(bench_embed, tokens, wte, flop_count=None,
 print("=== LM head (non-chunked) ===")
 lm_head = jax.random.normal(jax.random.key(1),
     (cfg.n_embd, cfg.vocab_size), dtype=jnp.bfloat16) * 0.001
-hidden = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
-labels = fake_tokens(cfg.batch_size, cfg.seq_len)
+hidden = fake_hidden(B5, cfg.seq_len, cfg.n_embd)
+labels = fake_tokens(B5, cfg.seq_len)
 
 @jax.jit
 def bench_lm_head(hidden, lm_head, labels):
     logits = jnp.einsum('btd,dv->btv', hidden, lm_head,
-                        preferred_element_type=jnp.float32)
+                        preferred_element_type=_logit_dtype(cfg))
     logits = cfg.softcap * jnp.tanh(logits / cfg.softcap)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, labels))
 
-lm_flops = matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd)
+lm_flops = matmul_flops(B5 * cfg.seq_len, cfg.vocab_size, cfg.n_embd)
 r_lm = benchmark(bench_lm_head, hidden, lm_head, labels,
                  flop_count=lm_flops, label="LM head (non-chunked)")
 
@@ -955,23 +980,25 @@ print_summary([r_embed, r_lm, r_lm_chunked])
 # Gradient checkpointing (remat) trades compute for memory.
 
 # %%
-full_params = init_full_model(cfg)
-tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
-labels = fake_tokens(cfg.batch_size, cfg.seq_len)
+# Use microbatch_size as batch for single-pass benchmarks (no gradient accumulation)
+cfg_6 = PerfConfig(batch_size=cfg.microbatch_size, microbatch_size=cfg.microbatch_size)
+full_params = init_full_model(cfg_6)
+tokens = fake_tokens(cfg_6.batch_size, cfg_6.seq_len)
+labels = fake_tokens(cfg_6.batch_size, cfg_6.seq_len)
 
-total_model_flops = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
-                     cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
-                     matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd))
+total_model_flops = (cfg_6.n_layer * layer_flops(cfg_6.batch_size, cfg_6.seq_len, cfg_6.n_embd,
+                     cfg_6.n_head, cfg_6.n_kv_head, cfg_6.head_dim, cfg_6.mlp_dim) +
+                     matmul_flops(cfg_6.batch_size * cfg_6.seq_len, cfg_6.vocab_size, cfg_6.n_embd))
 bwd_flops = 3 * total_model_flops
 
 # %%
 # 6a. Forward only
-print("=== Forward only ===")
+print(f"=== Forward only (B={cfg_6.batch_size}) ===")
 
 @jax.jit
 def bench_fwd(params, tokens):
-    hidden = model_forward(cfg, params, tokens)
-    return chunked_lm_head_loss(hidden, params.lm_head, labels, cfg)
+    hidden = model_forward(cfg_6, params, tokens)
+    return chunked_lm_head_loss(hidden, params.lm_head, labels, cfg_6)
 
 r_fwd = benchmark(bench_fwd, full_params, tokens,
                   flop_count=total_model_flops, label="Forward only")
@@ -983,8 +1010,8 @@ print("=== Forward + Backward ===")
 @jax.jit
 def bench_fwd_bwd(params, tokens):
     def loss_fn(p):
-        hidden = model_forward(cfg, p, tokens)
-        return chunked_lm_head_loss(hidden, p.lm_head, labels, cfg)
+        hidden = model_forward(cfg_6, p, tokens)
+        return chunked_lm_head_loss(hidden, p.lm_head, labels, cfg_6)
     return jax.value_and_grad(loss_fn)(params)
 
 r_fwd_bwd = benchmark(bench_fwd_bwd, full_params, tokens,
@@ -997,8 +1024,8 @@ print("=== Forward + Backward (remat) ===")
 @jax.jit
 def bench_fwd_bwd_remat(params, tokens):
     def loss_fn(p):
-        hidden = model_forward_remat(cfg, p, tokens)
-        return chunked_lm_head_loss(hidden, p.lm_head, labels, cfg)
+        hidden = model_forward_remat(cfg_6, p, tokens)
+        return chunked_lm_head_loss(hidden, p.lm_head, labels, cfg_6)
     return jax.value_and_grad(loss_fn)(params)
 
 r_remat = benchmark(bench_fwd_bwd_remat, full_params, tokens,
@@ -1012,7 +1039,7 @@ print(f"  Backward / Forward ratio:  {r_fwd_bwd['wall_ms'] / max(r_fwd['wall_ms'
 print(f"  Remat overhead vs no-remat: {r_remat['wall_ms'] / max(r_fwd_bwd['wall_ms'], 0.01):.2f}x")
 
 n_params = count_params(full_params)
-print(f"\n  Trainable params: {n_params:,}")
+print(f"\n  Total params: {n_params:,}")
 for r in [r_fwd_bwd, r_remat]:
     print(f"  {r['label']:<30s}  MFU {r['mfu_pct']:5.1f}%")
 
@@ -1033,7 +1060,7 @@ print("=== Batch size sweep ===")
 results_7a = []
 
 for bs in [1, 2, 4, 8]:
-    cfg_bs = PerfConfig(batch_size=bs)
+    cfg_bs = PerfConfig(batch_size=bs, microbatch_size=bs)
     p = init_full_model(cfg_bs)
     tok = fake_tokens(bs, cfg_bs.seq_len)
     lab = fake_tokens(bs, cfg_bs.seq_len)
@@ -1058,43 +1085,13 @@ for r in results_7a:
     print(f"    {r['label']:<20s}  {r['tok_per_sec']:,.0f} tok/s")
 
 # %%
-# 7b. Sequence length sweep
-print("\n=== Sequence length sweep ===")
+# 7b. Head dim alignment: 128 (8 heads) vs 256 (4 heads)
+print("\n=== Head dim alignment ===")
 results_7b = []
 
-for sl in [1024, 2048, 4096]:
-    cfg_sl = PerfConfig(seq_len=sl)
-    p = init_full_model(cfg_sl)
-    tok = fake_tokens(cfg_sl.batch_size, sl)
-    lab = fake_tokens(cfg_sl.batch_size, sl)
-    fl = 3 * (cfg_sl.n_layer * layer_flops(cfg_sl.batch_size, sl, cfg_sl.n_embd,
-              cfg_sl.n_head, cfg_sl.n_kv_head, cfg_sl.head_dim, cfg_sl.mlp_dim) +
-              matmul_flops(cfg_sl.batch_size * sl, cfg_sl.vocab_size, cfg_sl.n_embd))
-
-    @jax.jit
-    def bench(p, tok, _lab=lab, _cfg=cfg_sl):
-        def loss_fn(params):
-            hidden = model_forward(_cfg, params, tok)
-            return chunked_lm_head_loss(hidden, params.lm_head, _lab, _cfg)
-        return jax.value_and_grad(loss_fn)(p)
-
-    r = benchmark(bench, p, tok, flop_count=fl, label=f"seq_len={sl}")
-    r['tok_per_sec'] = cfg_sl.batch_size * sl / (r['wall_ms'] / 1000)
-    results_7b.append(r)
-
-print_summary(results_7b)
-print("  Throughput:")
-for r in results_7b:
-    print(f"    {r['label']:<20s}  {r['tok_per_sec']:,.0f} tok/s")
-
-# %%
-# 7c. Head dim alignment: 128 (8 heads) vs 256 (4 heads)
-print("\n=== Head dim alignment ===")
-results_7c = []
-
 for hd, nh in [(128, 8), (256, 4)]:
-    cfg_hd = PerfConfig(head_dim=hd, n_head=nh, n_kv_head=max(1, nh // 4),
-                         n_embd=nh * hd)
+    cfg_hd = PerfConfig(batch_size=4, microbatch_size=4, head_dim=hd,
+                         n_head=nh, n_kv_head=max(1, nh // 4), n_embd=nh * hd)
     p = init_full_model(cfg_hd)
     tok = fake_tokens(cfg_hd.batch_size, cfg_hd.seq_len)
     lab = fake_tokens(cfg_hd.batch_size, cfg_hd.seq_len)
@@ -1114,17 +1111,17 @@ for hd, nh in [(128, 8), (256, 4)]:
     r = benchmark(bench, p, tok, flop_count=fl,
                   label=f"head_dim={hd}, n_head={nh}, D={nh*hd}")
     r['tok_per_sec'] = cfg_hd.batch_size * cfg_hd.seq_len / (r['wall_ms'] / 1000)
-    results_7c.append(r)
+    results_7b.append(r)
 
-print_summary(results_7c)
+print_summary(results_7b)
 
 # %%
-# 7d. GQA ratio comparison
+# 7c. GQA ratio comparison
 print("\n=== GQA ratio ===")
-results_7d = []
+results_7c = []
 
 for n_kv in [1, 2, 4]:
-    cfg_gqa = PerfConfig(n_kv_head=n_kv)
+    cfg_gqa = PerfConfig(batch_size=4, microbatch_size=4, n_kv_head=n_kv)
     p = init_full_model(cfg_gqa)
     tok = fake_tokens(cfg_gqa.batch_size, cfg_gqa.seq_len)
     lab = fake_tokens(cfg_gqa.batch_size, cfg_gqa.seq_len)
@@ -1144,37 +1141,15 @@ for n_kv in [1, 2, 4]:
     r = benchmark(bench, p, tok, flop_count=fl,
                   label=f"n_kv_head={n_kv} (ratio {cfg.n_head}:{n_kv})")
     r['tok_per_sec'] = cfg_gqa.batch_size * cfg_gqa.seq_len / (r['wall_ms'] / 1000)
-    results_7d.append(r)
+    results_7c.append(r)
 
-print_summary(results_7d)
-
-# %%
-# 7e. Splash block size sweep (single layer)
-print("\n=== Splash block size sweep (single layer) ===")
-results_7e = []
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
-lf = layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
-                 cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim)
-
-for bs in [256, 512, 1024]:
-    cfg_bs = PerfConfig(splash_block_size=bs)
-    layer_p = init_layer_params(cfg_bs)
-
-    @jax.jit
-    def bench_fn(x, layer, cos, sin, _cfg=cfg_bs):
-        return single_layer_forward(_cfg, layer, x, cos, sin, attn_impl='splash')
-
-    r = benchmark(bench_fn, x, layer_p, cos_b, sin_b,
-                  flop_count=lf, label=f"splash block_size={bs}")
-    results_7e.append(r)
-
-print_summary(results_7e)
+print_summary(results_7c)
 
 # %%
-# 7f. Attention implementation comparison (single layer)
+# 7d. Attention implementation comparison (single layer)
 print("\n=== Attention implementation comparison (single layer) ===")
-results_7f = []
-x = fake_hidden(cfg.batch_size, cfg.seq_len, cfg.n_embd)
+results_7d = []
+x = fake_hidden(B_comp, cfg.seq_len, cfg.n_embd)
 layer_p = init_layer_params(cfg)
 
 for impl in ['einsum', 'jax', 'splash']:
@@ -1184,9 +1159,9 @@ for impl in ['einsum', 'jax', 'splash']:
 
     r = benchmark(bench_fn, x, layer_p, cos_b, sin_b,
                   flop_count=lf, label=f"attn_impl={impl}")
-    results_7f.append(r)
+    results_7d.append(r)
 
-print_summary(results_7f)
+print_summary(results_7d)
 
 # %% [markdown]
 # ### Ideas to try
@@ -1197,199 +1172,21 @@ print_summary(results_7f)
 # - **Tok/s vs MFU%**: these are different! MFU measures compute efficiency, tok/s measures throughput
 
 # %% [markdown]
-# ## Phase 8 — Advanced Optimization Ideas
+# ## Phase 8 — Optimizer Step Benchmarks
 #
-# Concepts with starter code for experimentation.
-
-# %% [markdown]
-# ### 8.1 Custom Pallas Kernel: Fused RMSNorm + Linear
-#
-# RMSNorm reads all of `x` from HBM, writes normalized `x` back, then the next matmul
-# reads it again.  A fused Pallas kernel could normalize and multiply in one pass,
-# saving one full HBM roundtrip (~2 × B × T × E bytes).
-#
-# ```python
-# from jax.experimental import pallas as pl
-#
-# def fused_norm_linear_kernel(x_ref, w_ref, out_ref):
-#     """Fused RMSNorm + linear projection in a single Pallas kernel."""
-#     x = x_ref[...]
-#     # RMSNorm in-register
-#     x_norm = x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6)
-#     # Linear projection
-#     out_ref[...] = x_norm @ w_ref[...]
-#
-# # Call with:
-# # out = pl.pallas_call(fused_norm_linear_kernel, ...)(x, w)
-# ```
-#
-# **Expected benefit**: Saves ~2 × 8 × 2048 × 1024 × 2 = 64 MB per layer per call.
-# At 24 layers with 4 norm+linear pairs each, that's ~6 GB less HBM traffic.
-
-# %% [markdown]
-# ### 8.2 Int8 Matmul Experiments
-#
-# TPU v6e supports int8 computation with ~2x the bf16 throughput.
-# XLA can auto-quantize via `jax.lax.dot_general` with `preferred_element_type`.
-#
-# ```python
-# # Manual quantization
-# scale = jnp.max(jnp.abs(a)) / 127.0
-# a_i8 = jnp.int8(jnp.round(a / scale))
-# b_i8 = jnp.int8(jnp.round(b / scale))
-#
-# result_i32 = jax.lax.dot_general(
-#     a_i8, b_i8,
-#     dimension_numbers=(((1,), (0,)), ((), ())),
-#     preferred_element_type=jnp.int32)
-# result_bf16 = (result_i32 * scale * scale).astype(jnp.bfloat16)
-# ```
-#
-# **Caveats**: Quantization noise hurts attention scores more than MLP.
-# Consider quantizing only the MLP weights (gate/up/down) first.
-
-# %% [markdown]
-# ### 8.3 Scan-based Layer Stacking
-#
-# `jax.lax.scan` over layers reduces XLA compilation time from O(n_layer) to O(1)
-# and makes remat trivial.  Requires stacking all layer params into arrays with
-# a leading layer dimension.
-#
-# ```python
-# # Stack params: each weight becomes (n_layer, ...)
-# stacked = jax.tree.map(lambda *xs: jnp.stack(xs), *[layers[i] for i in range(n)])
-#
-# def scan_body(x, layer_params):
-#     x = single_layer_forward(cfg, layer_params, x, cos, sin)
-#     return x, None
-#
-# x, _ = jax.lax.scan(scan_body, x_init, stacked)
-# ```
-#
-# **Bonus**: Combine with `jax.checkpoint` for free per-layer remat:
-# `x, _ = jax.lax.scan(jax.checkpoint(scan_body), x_init, stacked)`
-
-# %% [markdown]
-# ### 8.4 Pipeline / Microbatch Strategies
-#
-# Split the batch into micro-batches and overlap compute of one with data movement
-# of the next.  On a single chip the benefit is limited, but it helps when the model
-# barely fits:
-#
-# ```python
-# micro_bs = cfg.batch_size // 4
-# micro_grads = []
-# for i in range(4):
-#     mb = tokens[i*micro_bs : (i+1)*micro_bs]
-#     _, g = jax.value_and_grad(loss_fn)(params, mb)
-#     micro_grads.append(g)
-# grads = jax.tree.map(lambda *gs: sum(gs) / 4, *micro_grads)
-# ```
-#
-# This is essentially gradient accumulation — useful if you need a large effective
-# batch but can only fit a small micro-batch in HBM.
-
-# %% [markdown]
-# ### 8.5 Mixed Precision Strategies
-#
-# The model keeps all params and activations in **bfloat16**, with selective
-# upcasting to float32 for numerically sensitive ops:
-#
-# - **Currently f32**: logit softcap (`tanh`), cross-entropy loss
-# - **Worth trying in f32**: attention scores (before softmax), optimizer moments
-# - **Keep bf16**: all matmuls (projections, MLP), RMSNorm, RoPE
-#
-# The key insight: bf16 matmul already accumulates internally in f32 on MXU,
-# so the matmul output is accurate even though inputs are bf16.
-# The danger zones are **reductions** (softmax, loss) and **small values** (optimizer eps).
-
-# %% [markdown]
-# ### 8.6 Memory Layout Optimization
-#
-# JAX/XLA uses row-major (C-contiguous) layout by default.
-# For attention, the `(B, H, T, D)` layout is optimal because:
-# - Splash/Pallas kernels expect this layout natively
-# - The T dimension (which we iterate over in causal masking) is contiguous with D
-# - Einsum `'bhtd,bhsd->bhts'` has good locality
-#
-# The alternative `(B, T, H, D)` (common in PyTorch) requires a transpose before
-# attention, which is a pure memory operation with 0% MFU.
-#
-# Our codebase avoids transposes entirely by producing Q/K/V in `(B, H, T, D)`
-# directly via `einsum('btd,dhk->bhtk', ...)` — the einsum fuses the reshape.
-
-# %% [markdown]
-# ### 8.7 Double Buffering / Async Data Transfer
-#
-# For real training (not this fake-data notebook), overlapping host→device
-# transfer with compute is critical:
-#
-# ```python
-# class PrefetchDataLoader:
-#     def _worker(self):
-#         for x, y in self.iterator:
-#             # Transfer to HBM in background thread
-#             item = (jax.device_put(jnp.array(x)),
-#                     jax.device_put(jnp.array(y)))
-#             self.queue.put(item)
-# ```
-#
-# See `04_maxtext.py` for the full implementation.
-# With prefetching, data loading adds ~0ms overhead per step.
-
-# %% [markdown]
-# ### 8.8 Sharding for Multi-Chip (Future)
-#
-# When scaling beyond a single TPU v6e, use `jax.sharding`:
-#
-# - **Tensor parallelism**: shard along the head dimension (natural for GQA).
-#   Each chip handles `n_head / num_chips` heads.
-# - **FSDP**: shard parameters and gather them just-in-time.
-#   `jax.experimental.mesh_utils.create_device_mesh` + `NamedSharding`.
-# - **Pipeline parallelism**: assign layers to different chips.
-#   `jax.lax.ppermute` for inter-chip communication.
-#
-# ```python
-# from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
-# mesh = Mesh(jax.devices(), ('dp',))
-# # Shard batch dimension across devices
-# x_sharded = jax.device_put(x, NamedSharding(mesh, P('dp', None)))
-# ```
-
-# %% [markdown]
-# ### 8.9 XProf Trace Capture
-#
-# Wrap any benchmark with XProf to get a detailed hardware trace:
-#
-# ```python
-# jax.profiler.start_trace('my_trace_dir')
-# for _ in range(5):
-#     out = bench_fn(*args)
-#     jax.block_until_ready(out)
-# jax.profiler.stop_trace()
-# # Then: %load_ext tensorboard  /  %tensorboard --logdir my_trace_dir
-# ```
-#
-# XProf shows:
-# - MFU (actual vs peak)
-# - Memory timeline (stack, heap, fragmentation)
-# - Op-level breakdown (which ops are slowest)
-# - Idle gaps (input-bound vs compute-bound)
-
-# %% [markdown]
-# ## Phase 9 — Optimizer Step Benchmarks
-#
-# Measure full train step (fwd + bwd with remat + optimizer update).
-# Compare manual AdamW (matching 02_train.py) vs optax.adamw variants.
+# Measure full train step (fwd + bwd + optimizer) with microbatching (B=64, mb=4).
+# Compare manual AdamW (per-leaf loop) vs optax.adamw variants.
+# With L=8 + B=64, the manual loop overhead should be dramatic (~1.5-2x).
 
 # %%
-# === Phase 9: Optimizer step benchmarks ===
-print("=== Phase 9: Optimizer Step Benchmarks ===")
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, L={cfg.n_layer}")
+# === Phase 8: Optimizer step benchmarks ===
+print("=== Phase 8: Optimizer Step Benchmarks ===")
+print(f"Config: B={cfg.batch_size}, mb={cfg.microbatch_size}, T={cfg.seq_len}, "
+      f"D={cfg.n_embd}, L={cfg.n_layer}")
 
 full_params_9 = init_full_model(cfg)
 n_params_9 = count_params(full_params_9)
-print(f"Trainable params: {n_params_9:,}")
+print(f"Total params: {n_params_9:,}")
 
 opt_tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
 opt_labels = fake_tokens(cfg.batch_size, cfg.seq_len)
@@ -1400,41 +1197,64 @@ total_model_flops_9 = (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cf
 bwd_flops_9 = 3 * total_model_flops_9
 
 # %%
-# 9a-baseline. Remat baseline (fwd+bwd only, no optimizer)
-print("\n--- 9a-baseline. Fwd+Bwd (remat) baseline ---")
+# 8a-baseline. Fwd+Bwd only (with microbatching, no optimizer)
+print("\n--- 9a-baseline. Fwd+Bwd (microbatched) baseline ---")
 
 @jax.jit
-def bench_remat_9(params, tokens):
-    def loss_fn(p):
-        hidden = model_forward_remat(cfg, p, tokens)
-        return chunked_lm_head_loss(hidden, p.lm_head, opt_labels, cfg)
-    return jax.value_and_grad(loss_fn)(params)
+def bench_fwd_bwd_9(params, tokens):
+    num_mb = cfg.num_microbatches
+    x_micro = tokens.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
+    y_micro = opt_labels.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
 
-r_remat_9 = benchmark(bench_remat_9, full_params_9, opt_tokens,
-                      flop_count=bwd_flops_9, label="Fwd+Bwd (remat)")
+    def loss_fn(params, x_mb, y_mb):
+        hidden = model_forward(cfg, params, x_mb)
+        return chunked_lm_head_loss(hidden, params.lm_head, y_mb, cfg)
+
+    def microbatch_step(grad_acc, data):
+        x_mb, y_mb = data
+        loss, grads = jax.value_and_grad(loss_fn)(params, x_mb, y_mb)
+        grad_acc = jax.tree.map(jax.lax.add, grad_acc, grads)
+        return grad_acc, loss
+
+    grad_init = jax.tree.map(jnp.zeros_like, params)
+    grads, losses = jax.lax.scan(microbatch_step, grad_init, (x_micro, y_micro))
+    grads = jax.tree.map(lambda g: g / num_mb, grads)
+    return jnp.mean(losses), grads
+
+r_fwd_bwd_9 = benchmark(bench_fwd_bwd_9, full_params_9, opt_tokens,
+                         flop_count=bwd_flops_9, label="Fwd+Bwd (microbatched)")
 
 # %%
-# 9a. Manual AdamW (per-leaf loop, matching 02_train.py)
+# 8a. Manual AdamW (per-leaf loop — traces ~58 separate update ops into XLA)
 print("\n--- 9a. Manual AdamW ---")
 
 manual_params = init_full_model(cfg)
-manual_trainable, manual_static = split_trainable(manual_params)
-manual_opt_state = jax.tree.map(init_adam_state, manual_trainable)
+manual_opt_state = jax.tree.map(init_adam_state, manual_params)
 
 @jax.jit
 def bench_manual_adamw(params, opt_state, tokens, lr_mult):
-    trainable, static = split_trainable(params)
+    num_mb = cfg.num_microbatches
+    x_micro = tokens.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
+    y_micro = opt_labels.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
 
-    def loss_fn(t):
-        full = merge_params(t, static)
-        hidden = model_forward_remat(cfg, full, tokens)
-        return chunked_lm_head_loss(hidden, full.lm_head, opt_labels, cfg)
+    def loss_fn(params, x_mb, y_mb):
+        hidden = model_forward(cfg, params, x_mb)
+        return chunked_lm_head_loss(hidden, params.lm_head, y_mb, cfg)
 
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
+    def microbatch_step(grad_acc, data):
+        x_mb, y_mb = data
+        loss, grads = jax.value_and_grad(loss_fn)(params, x_mb, y_mb)
+        grad_acc = jax.tree.map(jax.lax.add, grad_acc, grads)
+        return grad_acc, loss
 
-    # Per-leaf AdamW update (matching 02_train.py pattern)
+    grad_init = jax.tree.map(jnp.zeros_like, params)
+    grads, losses = jax.lax.scan(microbatch_step, grad_init, (x_micro, y_micro))
+    grads = jax.tree.map(lambda g: g / num_mb, grads)
+    loss = jnp.mean(losses)
+
+    # Per-leaf AdamW update (traces ~58 separate update ops)
     is_opt_leaf = lambda x: isinstance(x, dot_dict) and 'mu' in x
-    t_leaves, t_treedef = jax.tree.flatten(trainable)
+    t_leaves, t_treedef = jax.tree.flatten(params)
     g_leaves, _ = jax.tree.flatten(grads)
     o_leaves, o_treedef = jax.tree.flatten(opt_state, is_leaf=is_opt_leaf)
 
@@ -1445,9 +1265,8 @@ def bench_manual_adamw(params, opt_state, tokens, lr_mult):
         new_t_leaves.append(new_p)
         new_o_leaves.append(new_s)
 
-    new_trainable = t_treedef.unflatten(new_t_leaves)
+    new_params = t_treedef.unflatten(new_t_leaves)
     new_opt_state = o_treedef.unflatten(new_o_leaves)
-    new_params = merge_params(new_trainable, static)
     return loss, new_params, new_opt_state
 
 lr_mult = jnp.array(1.0, dtype=jnp.float32)
@@ -1456,68 +1275,38 @@ r_manual = benchmark(bench_manual_adamw, manual_params, manual_opt_state,
                      label="Manual AdamW (full step)")
 
 # %%
-# 9b. optax.adamw (f32 moments)
+# 8b. optax.adamw (f32 moments)
 print("\n--- 9b. optax.adamw (f32 mu) ---")
 
 optax_params_f32 = init_full_model(cfg)
-optax_trainable_f32, optax_static_f32 = split_trainable(optax_params_f32)
 schedule_f32 = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
                             eps=OPT_EPS, weight_decay=OPT_WD)
-optax_state_f32 = schedule_f32.init(optax_trainable_f32)
+optax_state_f32 = schedule_f32.init(optax_params_f32)
+train_step_f32 = make_bench_train_step(schedule_f32, cfg, opt_labels)
 
-@jax.jit
-def bench_optax_f32(params, opt_state, tokens):
-    trainable, static = split_trainable(params)
-
-    def loss_fn(t):
-        full = merge_params(t, static)
-        hidden = model_forward_remat(cfg, full, tokens)
-        return chunked_lm_head_loss(hidden, full.lm_head, opt_labels, cfg)
-
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
-    updates, new_opt_state = schedule_f32.update(grads, opt_state, trainable)
-    new_trainable = optax.apply_updates(trainable, updates)
-    new_params = merge_params(new_trainable, static)
-    return loss, new_params, new_opt_state
-
-r_optax_f32 = benchmark(bench_optax_f32, optax_params_f32, optax_state_f32,
+r_optax_f32 = benchmark(train_step_f32, optax_params_f32, optax_state_f32,
                          opt_tokens, flop_count=bwd_flops_9,
                          label="optax.adamw f32 (full step)")
 
 # %%
-# 9c. optax.adamw (bf16 moments — MaxText style)
+# 8c. optax.adamw (bf16 moments)
 print("\n--- 9c. optax.adamw (bf16 mu) ---")
 
 optax_params_bf16 = init_full_model(cfg)
-optax_trainable_bf16, optax_static_bf16 = split_trainable(optax_params_bf16)
 schedule_bf16 = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
                              eps=OPT_EPS, weight_decay=OPT_WD,
                              mu_dtype=jnp.bfloat16)
-optax_state_bf16 = schedule_bf16.init(optax_trainable_bf16)
+optax_state_bf16 = schedule_bf16.init(optax_params_bf16)
+train_step_bf16 = make_bench_train_step(schedule_bf16, cfg, opt_labels)
 
-@jax.jit
-def bench_optax_bf16(params, opt_state, tokens):
-    trainable, static = split_trainable(params)
-
-    def loss_fn(t):
-        full = merge_params(t, static)
-        hidden = model_forward_remat(cfg, full, tokens)
-        return chunked_lm_head_loss(hidden, full.lm_head, opt_labels, cfg)
-
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
-    updates, new_opt_state = schedule_bf16.update(grads, opt_state, trainable)
-    new_trainable = optax.apply_updates(trainable, updates)
-    new_params = merge_params(new_trainable, static)
-    return loss, new_params, new_opt_state
-
-r_optax_bf16 = benchmark(bench_optax_bf16, optax_params_bf16, optax_state_bf16,
+r_optax_bf16 = benchmark(train_step_bf16, optax_params_bf16, optax_state_bf16,
                           opt_tokens, flop_count=bwd_flops_9,
                           label="optax.adamw bf16 (full step)")
 
 # %%
-# 9d. Phase 9 Summary
-print("\n=== Phase 9 Summary ===")
-phase9_results = [r_remat_9, r_manual, r_optax_f32, r_optax_bf16]
+# 8d. Phase 8 Summary
+print("\n=== Phase 8 Summary ===")
+phase9_results = [r_fwd_bwd_9, r_manual, r_optax_f32, r_optax_bf16]
 print(f"\n  {'Label':<40s}  {'Wall ms':>8s}  {'MFU%':>6s}  {'tok/s':>10s}")
 print("  " + "-" * 72)
 for r in phase9_results:
@@ -1527,121 +1316,40 @@ for r in phase9_results:
 
 # Optimizer overhead vs fwd+bwd only
 for r in [r_manual, r_optax_f32, r_optax_bf16]:
-    overhead = r['wall_ms'] - r_remat_9['wall_ms']
-    pct = overhead / r_remat_9['wall_ms'] * 100
+    overhead = r['wall_ms'] - r_fwd_bwd_9['wall_ms']
+    pct = overhead / r_fwd_bwd_9['wall_ms'] * 100
     print(f"  {r['label']:<40s}  optimizer overhead: {overhead:+.2f} ms ({pct:+.1f}%)")
 
 # %% [markdown]
-# ## Phase 10 — ~100M Param Config Sweep
-#
-# Full train step (fwd+bwd+remat+optimizer) for configs targeting ~100M params.
-# Uses batch_size=16 (smaller model → more batch fits in HBM).
-
-# %%
-# === Phase 10: ~100M param config sweep ===
-print("=== Phase 10: ~100M Param Config Sweep ===")
-
-sweep_configs = [
-    # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
-    ("D768 N3 L8",   3, 1, 256, 768,  2048, 8,  16),
-    ("D512 N2 L16",  2, 1, 256, 512,  1536, 16, 16),
-    ("D512 N2 L24",  2, 1, 256, 512,  1536, 24, 16),
-]
-
-results_10 = []
-for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs:
-    print(f"\n--- {label}: D={ne}, N={nh}, K={nkv}, H={hd}, F={mlp}, L={nl}, B={bs} ---")
-    cfg_s = PerfConfig(batch_size=bs, n_head=nh, n_kv_head=nkv, head_dim=hd,
-                       n_embd=ne, mlp_dim=mlp, n_layer=nl)
-    p_s = init_full_model(cfg_s)
-    n_p = count_params(p_s)
-    print(f"  Trainable params: {n_p:,}")
-
-    tok_s = fake_tokens(bs, cfg_s.seq_len)
-    lab_s = fake_tokens(bs, cfg_s.seq_len)
-
-    # Use optax.adamw f32 (likely best from Phase 9)
-    tr_s, st_s = split_trainable(p_s)
-    sched_s = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
-                           eps=OPT_EPS, weight_decay=OPT_WD)
-    ostate_s = sched_s.init(tr_s)
-
-    fl_s = 3 * (cfg_s.n_layer * layer_flops(bs, cfg_s.seq_len, cfg_s.n_embd,
-                cfg_s.n_head, cfg_s.n_kv_head, cfg_s.head_dim, cfg_s.mlp_dim) +
-                matmul_flops(bs * cfg_s.seq_len, cfg_s.vocab_size, cfg_s.n_embd))
-
-    @jax.jit
-    def bench_sweep(params, opt_state, tokens, _cfg=cfg_s, _sched=sched_s, _lab=lab_s):
-        trainable, static = split_trainable(params)
-
-        def loss_fn(t):
-            full = merge_params(t, static)
-            hidden = model_forward_remat(_cfg, full, tokens)
-            return chunked_lm_head_loss(hidden, full.lm_head, _lab, _cfg)
-
-        loss, grads = jax.value_and_grad(loss_fn)(trainable)
-        updates, new_opt_state = _sched.update(grads, opt_state, trainable)
-        new_trainable = optax.apply_updates(trainable, updates)
-        new_params = merge_params(new_trainable, static)
-        return loss, new_params, new_opt_state
-
-    r = benchmark(bench_sweep, p_s, ostate_s, tok_s, flop_count=fl_s,
-                  label=f"{label} (B={bs})")
-    r['n_params'] = n_p
-    r['tok_per_sec'] = bs * cfg_s.seq_len / (r['wall_ms'] / 1000)
-
-    # Estimated wall time for 20 tokens/param training run
-    total_tokens = 20 * n_p
-    total_steps = total_tokens / (bs * cfg_s.seq_len)
-    est_hours = total_steps * (r['wall_ms'] / 1000) / 3600
-    r['est_hours_20x'] = est_hours
-    results_10.append(r)
-
-# %%
-# 10b. Phase 10 Summary
-print("\n=== Phase 10 Summary ===")
-print(f"\n  {'Label':<25s}  {'Params':>10s}  {'Wall ms':>8s}  {'MFU%':>6s}  "
-      f"{'tok/s':>10s}  {'20x hrs':>8s}")
-print("  " + "-" * 82)
-for r in results_10:
-    print(f"  {r['label']:<25s}  {r['n_params']:>10,}  {r['wall_ms']:8.2f}  "
-          f"{r['mfu_pct']:5.1f}%  {r['tok_per_sec']:>10,.0f}  "
-          f"{r['est_hours_20x']:7.1f}h")
-
-# %% [markdown]
-# ## Phase 11 — ~100M Non-Embed Param Architecture Sweep
+# ## Phase 9 — ~100M Non-Embed Param Architecture Sweep
 #
 # Fix L=8 and systematically vary D, H, F, and K to find what architecture
 # choices matter most for ~100M non-embedding parameter models on TPU v6e.
+# All configs use microbatching (mb=4) and optax.adamw.
 #
 # **Parameter counting convention (Chinchilla/Kaplan):**
 # - **Embedding** (V×D) is a pure lookup table — 0 matmul FLOPs, **not counted**
 # - **Unembedding** (D×V) is a real matmul (our biggest at ~78% MFU) — **counted**
 # - Non-embed params = unembed (D×V) + layer params
-# - For ~100M non-embed models at L=8, embed is 20-30% of total params
-#   (wasted budget if not tying, but tying hurts convergence)
 # - `N` in scaling laws = non-embedding params
 
 # %%
-# === Phase 11: ~100M non-embed param architecture sweep ===
-print("=== Phase 11: ~100M Non-Embed Param Architecture Sweep ===")
+# === Phase 9: ~100M non-embed param architecture sweep ===
+print("=== Phase 9: ~100M Non-Embed Param Architecture Sweep ===")
 
-sweep_configs_11 = [
-    # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size)
-    ("D768-F3328-B4",    3, 1, 256, 768,  3328, 8, 4),    # 99M non-embed baseline
-    ("D1024-F3072-B2",   3, 1, 256, 1024, 3072, 8, 2),    # 126M, small batch
-    ("D1024-F3072-B4",   3, 1, 256, 1024, 3072, 8, 4),    # 126M, peak MFU
-    ("D1024-N4-F3072-B4",4, 1, 256, 1024, 3072, 8, 4),    # 130M, D=N×H (square attn proj)
-    ("D1024-F3072-B8",   3, 1, 256, 1024, 3072, 8, 8),    # 126M, batch scaling
-    ("D1024-F3072-B16",  3, 1, 256, 1024, 3072, 8, 16),   # 126M, batch scaling
-    ("D1024-F3072-B32",  3, 1, 256, 1024, 3072, 8, 32),   # 126M, large batch
+sweep_configs_9 = [
+    # (label, n_head, n_kv_head, head_dim, n_embd, mlp_dim, n_layer, batch_size, microbatch_size)
+    ("D1024-N4-K1-B64",  4, 1, 256, 1024, 3072, 8, 64, 4),    # 130M — our final config
+    ("D1024-N3-K1-B64",  3, 1, 256, 1024, 3072, 8, 64, 4),    # 126M — fewer Q heads
+    ("D768-N3-K1-B64",   3, 1, 256, 768,  3328, 8, 64, 4),    # 99M — smaller model
+    ("D1024-N4-K1-B32",  4, 1, 256, 1024, 3072, 8, 32, 4),    # 130M — smaller batch
 ]
 
-results_11 = []
-for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
-    print(f"\n--- {label}: D={ne}, N={nh}, K={nkv}, H={hd}, F={mlp}, L={nl}, B={bs} ---")
-    cfg_s = PerfConfig(batch_size=bs, n_head=nh, n_kv_head=nkv, head_dim=hd,
-                       n_embd=ne, mlp_dim=mlp, n_layer=nl)
+results_9 = []
+for label, nh, nkv, hd, ne, mlp, nl, bs, mbs in sweep_configs_9:
+    print(f"\n--- {label}: D={ne}, N={nh}, K={nkv}, H={hd}, F={mlp}, L={nl}, B={bs}, mb={mbs} ---")
+    cfg_s = PerfConfig(batch_size=bs, microbatch_size=mbs, n_head=nh, n_kv_head=nkv,
+                       head_dim=hd, n_embd=ne, mlp_dim=mlp, n_layer=nl)
     p_s = init_full_model(cfg_s)
     n_p = count_params(p_s)
     n_ne = count_non_embed_params(p_s)
@@ -1650,33 +1358,18 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
     tok_s = fake_tokens(bs, cfg_s.seq_len)
     lab_s = fake_tokens(bs, cfg_s.seq_len)
 
-    # Use optax.adamw f32 (best from Phase 9)
-    tr_s, st_s = split_trainable(p_s)
     sched_s = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
                            eps=OPT_EPS, weight_decay=OPT_WD)
-    ostate_s = sched_s.init(tr_s)
+    ostate_s = sched_s.init(p_s)
 
     fl_s = 3 * (cfg_s.n_layer * layer_flops(bs, cfg_s.seq_len, cfg_s.n_embd,
                 cfg_s.n_head, cfg_s.n_kv_head, cfg_s.head_dim, cfg_s.mlp_dim) +
                 matmul_flops(bs * cfg_s.seq_len, cfg_s.vocab_size, cfg_s.n_embd))
 
-    @jax.jit
-    def bench_sweep_11(params, opt_state, tokens, _cfg=cfg_s, _sched=sched_s, _lab=lab_s):
-        trainable, static = split_trainable(params)
+    step_fn = make_bench_train_step(sched_s, cfg_s, lab_s)
 
-        def loss_fn(t):
-            full = merge_params(t, static)
-            hidden = model_forward_remat(_cfg, full, tokens)
-            return chunked_lm_head_loss(hidden, full.lm_head, _lab, _cfg)
-
-        loss, grads = jax.value_and_grad(loss_fn)(trainable)
-        updates, new_opt_state = _sched.update(grads, opt_state, trainable)
-        new_trainable = optax.apply_updates(trainable, updates)
-        new_params = merge_params(new_trainable, static)
-        return loss, new_params, new_opt_state
-
-    r = benchmark(bench_sweep_11, p_s, ostate_s, tok_s, flop_count=fl_s,
-                  label=f"{label} (B={bs})")
+    r = benchmark(step_fn, p_s, ostate_s, tok_s, flop_count=fl_s,
+                  label=f"{label}")
     r['n_params'] = n_p
     r['n_non_embed'] = n_ne
     r['tok_per_sec'] = bs * cfg_s.seq_len / (r['wall_ms'] / 1000)
@@ -1686,23 +1379,23 @@ for label, nh, nkv, hd, ne, mlp, nl, bs in sweep_configs_11:
     total_steps = total_tokens / (bs * cfg_s.seq_len)
     est_hours = total_steps * (r['wall_ms'] / 1000) / 3600
     r['est_hours_20x'] = est_hours
-    results_11.append(r)
+    results_9.append(r)
 
 # %%
-# 11b. Phase 11 Summary
-print("\n=== Phase 11 Summary ===")
+# 9b. Phase 9 Summary
+print("\n=== Phase 9 Summary ===")
 print(f"\n  {'Label':<20s}  {'Non-embed':>10s}  {'Total':>10s}  {'Wall ms':>8s}  "
       f"{'MFU%':>6s}  {'tok/s':>10s}  {'20x hrs':>8s}")
 print("  " + "-" * 92)
-for r in results_11:
+for r in results_9:
     print(f"  {r['label']:<20s}  {r['n_non_embed']:>10,}  {r['n_params']:>10,}  "
           f"{r['wall_ms']:8.2f}  {r['mfu_pct']:5.1f}%  "
           f"{r['tok_per_sec']:>10,.0f}  {r['est_hours_20x']:7.1f}h")
 
 # %% [markdown]
-# ## Phase 12 — XProf Trace
+# ## Phase 10 — XProf Trace
 #
-# Capture an XProf hardware trace for one selected architecture.
+# Capture an XProf hardware trace for the final config (D1024-N4-K1-B64).
 # Shows MXU utilization, memory timeline, op-level breakdown, and idle gaps.
 #
 # - Warmup runs first (absorbs JIT compilation)
@@ -1710,38 +1403,20 @@ for r in results_11:
 # - View the trace in TensorBoard below
 
 # %%
-# === Phase 12: XProf profiling ===
-# Pick an architecture to profile (D1024-F3072-B4 from Phase 11 is a good default)
-print("=== Phase 12: XProf Trace Capture ===")
-prof_cfg = PerfConfig(batch_size=4, n_head=3, n_kv_head=1, head_dim=256,
-                      n_embd=1024, mlp_dim=3072, n_layer=8)
-print(f"Profiling config: B={prof_cfg.batch_size}, T={prof_cfg.seq_len}, "
-      f"D={prof_cfg.n_embd}, N={prof_cfg.n_head}, K={prof_cfg.n_kv_head}, "
-      f"H={prof_cfg.head_dim}, F={prof_cfg.mlp_dim}, L={prof_cfg.n_layer}")
+# === Phase 10: XProf profiling ===
+print("=== Phase 10: XProf Trace Capture ===")
+print(f"Profiling config: B={cfg.batch_size}, mb={cfg.microbatch_size}, "
+      f"T={cfg.seq_len}, D={cfg.n_embd}, N={cfg.n_head}, K={cfg.n_kv_head}, "
+      f"H={cfg.head_dim}, F={cfg.mlp_dim}, L={cfg.n_layer}")
 
-prof_params = init_full_model(prof_cfg)
-prof_tokens = fake_tokens(prof_cfg.batch_size, prof_cfg.seq_len)
-prof_labels = fake_tokens(prof_cfg.batch_size, prof_cfg.seq_len)
+prof_params = init_full_model(cfg)
+prof_tokens = fake_tokens(cfg.batch_size, cfg.seq_len)
+prof_labels = fake_tokens(cfg.batch_size, cfg.seq_len)
 
-prof_trainable, prof_static = split_trainable(prof_params)
 prof_sched = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
                           eps=OPT_EPS, weight_decay=OPT_WD)
-prof_opt_state = prof_sched.init(prof_trainable)
-
-@jax.jit
-def prof_train_step(params, opt_state, tokens):
-    trainable, static = split_trainable(params)
-
-    def loss_fn(t):
-        full = merge_params(t, static)
-        hidden = model_forward_remat(prof_cfg, full, tokens)
-        return chunked_lm_head_loss(hidden, full.lm_head, prof_labels, prof_cfg)
-
-    loss, grads = jax.value_and_grad(loss_fn)(trainable)
-    updates, new_opt_state = prof_sched.update(grads, opt_state, trainable)
-    new_trainable = optax.apply_updates(trainable, updates)
-    new_params = merge_params(new_trainable, static)
-    return loss, new_params, new_opt_state
+prof_opt_state = prof_sched.init(prof_params)
+prof_train_step = make_bench_train_step(prof_sched, cfg, prof_labels)
 
 # Warmup (JIT compilation)
 print("Warming up (JIT compile)...")
@@ -1774,41 +1449,14 @@ print(f"Trace saved to '{PROF_DIR}'.")
 # %load_ext tensorboard
 # %tensorboard --logdir /content/log_dir/xprof_perf
 
-# %% [markdown]
-# ## Ideas from scaling-book
-#
-# Reference: `jax-ml/scaling-book` (cloned locally in `scaling-book/`)
-#
-# **Remat FLOPs accounting** — Block remat costs ~8ND FLOPs (vs 6ND without remat)
-# because it recomputes the forward pass during backward. Our MFU% uses analytical
-# FLOP counts (3× forward for fwd+bwd) which correctly reflects actual compute work.
-#
-# **Arithmetic intensity roofline** — The book defines `intensity = FLOPs / bytes`.
-# For our matmul benchmarks we already compute HBM bytes — could plot a roofline
-# diagram showing which ops are compute-bound vs memory-bound. Critical intensity
-# for v6e = 918e12 / 1600e9 ≈ 574 FLOPs/byte. Ops above this line are compute-bound.
-#
-# **Attention dominance threshold** — Book says attention FLOPs dominate when
-# `T > 8D` (assuming standard `F=4D` and `D=NH`). For our default config (D=1024),
-# that's `T > 8192`. Our T=2048 is well below — attention is a small fraction of
-# total FLOPs, MLP and projections dominate.
-#
-# **`jax.checkpoint` policies** — `dots_with_no_batch_dims_saveable` saves only
-# big matmul outputs (~7 checkpoints/layer vs 1 for block remat, ~20 for no remat).
-# This trades off between the 6ND and 8ND extremes — worth benchmarking.
-#
-# **int8 inference matmuls** — TPU v6e int8 = 2× bf16 throughput. The critical
-# batch size for compute-bound regime stays the same (proportional reduction in
-# both FLOPs and bytes).
-
 # %%
 # === All outputs — copy/paste this cell's output into Claude Code ===
 print("=" * 90)
 print("  ALL BENCHMARK RESULTS")
 print("=" * 90)
 print()
-print(f"Config: B={cfg.batch_size}, T={cfg.seq_len}, D={cfg.n_embd}, "
-      f"N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
+print(f"Config: B={cfg.batch_size}, mb={cfg.microbatch_size}, T={cfg.seq_len}, "
+      f"D={cfg.n_embd}, N={cfg.n_head}, K={cfg.n_kv_head}, H={cfg.head_dim}, "
       f"F={cfg.mlp_dim}, V={cfg.vocab_size}, L={cfg.n_layer}, "
       f"softcap={cfg.softcap}, splash_bs={cfg.splash_block_size}, "
       f"lm_chunks={cfg.num_lm_head_chunks}")
