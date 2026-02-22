@@ -11,20 +11,21 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 13)
+# # 08 — TPU Ablation Lab (rev 24)
 #
-# Controlled ablation experiments on TPU v6e for a **130M non-embed param**
-# transformer (D1024-F3072-B64, L=8). Gradient accumulation: 16 microbatches of 4.
+# Companion notebook for
+# [LLM pretraining on TPU with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-budget).
+# Based on Karpathy's [nanochat](https://github.com/karpathy/nanochat) — ported
+# to raw JAX for a single TPU v6e on Google Colab Pro+ ($50/month). Also works
+# on TPU v5e (available on the free Colab plan, ~3× slower).
+#
+# **Runtime type:** In Colab, go to *Runtime → Change runtime type* and select
+# **TPU v6e** (or v5e).
 #
 # **Three modes:**
 # 1. **Quick Training** (~300 steps) — XProf capture, MFU measurement
 # 2. **Sweep** (wandb, ~13 min/run) — Bayesian LR search per architecture config
-# 3. **Hero Run** (20 tok/param, ~1.9h) — Full training with eval + optional checkpointing
-#
-# **Ablation knobs** (set in the Model section):
-# - `ATTN_IMPL`: `'splash'` or `'einsum'`
-# - `MLP_TYPE`: `'glu'` (SwiGLU, F=3072) or `'plain'` (ReLU², F=4096)
-# - `QK_NORM`: `True` or `False`
+# 3. **Hero Run** (20 tok/param, ~1.9h) — Full training with eval + HuggingFace upload
 #
 # ### Architecture: D=1024, N=4, K=1, H=256, F=3072, L=8, B=64 (16×4), T=2048, V=32768
 # | Metric | Value |
@@ -36,12 +37,28 @@
 # | Throughput | ~435k tok/s |
 # | MFU | ~46.5% |
 # | Hero run (20 tok/param) | ~2.6B tokens, ~19.8k steps, ~1.7h |
+#
+# ### Setup: Colab Secrets
+#
+# This notebook reads API tokens from
+# [Colab Secrets](https://colab.research.google.com/) (🔑 key icon in the left
+# sidebar). Add two secrets before running:
+#
+# | Secret | Where to get it | Used by |
+# |--------|----------------|---------|
+# | `HF_TOKEN` | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) (read access is enough) | Utilities — downloads the tokenizer from `vorushin/tpuchat` |
+# | `WANDB_TOKEN` | [wandb.ai/authorize](https://wandb.ai/authorize) | Sweep and Hero Run — logs metrics to Weights & Biases |
 
 # %%
 # !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile plotly
 
 # %% [markdown]
-# ## Utilities
+# ## Prerequisites
+#
+# Loads the data and the tokenizer (trained in
+# [01_tokenizer.ipynb](https://github.com/vorushin/tpuchat/blob/master/01_tokenizer.ipynb)).
+# You may need to change the number of data shards downloaded here if you train
+# bigger models or train them for longer.
 
 # %%
 # === Imports, TPU constants, dot_dict ===
@@ -61,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 13
+REVISION = 24
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -69,6 +86,8 @@ print(f"Peak TFLOPS : {PEAK_TFLOPS} (bf16, from v6e docs)")
 print(f"Notebook rev: {REVISION}")
 
 
+# JAX pytree with dot-notation access
+# (from https://docs.jax.dev/en/latest/the-training-cookbook.html)
 @jax.tree_util.register_pytree_with_keys_class
 class dot_dict(dict):
     __setattr__ = dict.__setitem__
@@ -312,32 +331,11 @@ def make_optimizer(config, num_steps):
                        weight_decay=config.weight_decay)
 
 # %%
-# === split_trainable, merge_params, count_params, count_non_embed_params ===
-
-def split_trainable(params):
-    """Split params into trainable and static (non-differentiable)."""
-    trainable = dot_dict()
-    static = dot_dict()
-    for k, v in params.items():
-        if k in ('rope_cos', 'rope_sin'):
-            static[k] = v
-        else:
-            trainable[k] = v
-    return trainable, static
-
-
-def merge_params(trainable, static):
-    """Merge trainable and static params back together."""
-    merged = dot_dict()
-    merged.update(trainable)
-    merged.update(static)
-    return merged
-
+# === count_params, count_non_embed_params ===
 
 def count_params(params):
-    """Count total trainable parameters (excludes rope_cos/rope_sin)."""
-    trainable, _ = split_trainable(params)
-    return sum(p.size for p in jax.tree.leaves(trainable) if isinstance(p, jax.Array))
+    """Count total parameters."""
+    return sum(p.size for p in jax.tree.leaves(params) if isinstance(p, jax.Array))
 
 
 def count_non_embed_params(params):
@@ -346,6 +344,12 @@ def count_non_embed_params(params):
 
 # %% [markdown]
 # ## Model
+#
+# The core of the notebook: transformer architecture and training loop.
+# Architecture: RoPE, RMSNorm, MQA (4 query heads, 1 KV head), QK-norm, logit
+# softcap, SwiGLU MLP, AdamW optimizer. Tensor dimensions are aligned to the
+# TPU's 256×256 MXU block size. The `Config` dataclass lets you experiment with
+# model variants and tune hyperparameters — edit it as needed.
 
 # %%
 # === Config ===
@@ -516,7 +520,7 @@ def init_all_layers(config, n_layers, seed=42):
 
 
 def init_full_model(config, seed=42):
-    """Initialize all model params (embed + layers + lm_head + rope)."""
+    """Initialize all model params (embed + layers + lm_head)."""
     key = jax.random.key(seed)
     params = dot_dict()
     key, k1, k2 = jax.random.split(key, 3)
@@ -524,7 +528,6 @@ def init_full_model(config, seed=42):
                                     dtype=jnp.bfloat16)
     params.lm_head = jax.random.normal(k2, (config.n_embd, config.vocab_size),
                                         dtype=jnp.bfloat16) * 0.001
-    params.rope_cos, params.rope_sin = precompute_rope(config.seq_len, config.head_dim)
     params.layers = init_all_layers(config, config.n_layer, seed=seed + 100)
     return params
 
@@ -532,8 +535,9 @@ def init_full_model(config, seed=42):
 def model_forward(config, params, tokens):
     """Full forward: embed -> layers -> final_norm. Returns hidden (B,T,D)."""
     B, T = tokens.shape
-    cos = params.rope_cos[:T][None, None, :, :]
-    sin = params.rope_sin[:T][None, None, :, :]
+    cos, sin = precompute_rope(T, config.head_dim)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
     with jax.named_scope('embedding'):
         x = rms_norm(params.wte[tokens])
     for i in range(config.n_layer):
@@ -613,35 +617,32 @@ def make_train_step(optimizer):
     """
     @jax.jit
     def train_step(config, params, opt_state, x, y, _opt=optimizer):
-        trainable, static = split_trainable(params)
         num_mb = config.num_microbatches
 
         # Reshape full batch into microbatches: (B,T) → (num_mb, mb_size, T)
         x_micro = x.reshape(num_mb, config.microbatch_size, config.seq_len)
         y_micro = y.reshape(num_mb, config.microbatch_size, config.seq_len)
 
-        def loss_fn(trainable_params, x_mb, y_mb):
-            full_params = merge_params(trainable_params, static)
-            hidden = model_forward(config, full_params, x_mb)
-            return chunked_lm_head_loss(hidden, full_params.lm_head, y_mb, config)
+        def loss_fn(params, x_mb, y_mb):
+            hidden = model_forward(config, params, x_mb)
+            return chunked_lm_head_loss(hidden, params.lm_head, y_mb, config)
 
         def microbatch_step(grad_acc, data):
             x_mb, y_mb = data
-            loss, grads = jax.value_and_grad(loss_fn)(trainable, x_mb, y_mb)
+            loss, grads = jax.value_and_grad(loss_fn)(params, x_mb, y_mb)
             grad_acc = jax.tree.map(jax.lax.add, grad_acc, grads)
             return grad_acc, loss
 
         with jax.named_scope('forward_backward'):
-            grad_init = jax.tree.map(jnp.zeros_like, trainable)
+            grad_init = jax.tree.map(jnp.zeros_like, params)
             grads, losses = jax.lax.scan(microbatch_step, grad_init,
                                          (x_micro, y_micro))
             grads = jax.tree.map(lambda g: g / num_mb, grads)
             loss = jnp.mean(losses)
 
         with jax.named_scope('optimizer'):
-            updates, new_opt_state = _opt.update(grads, opt_state, trainable)
-            new_trainable = optax.apply_updates(trainable, updates)
-            new_params = merge_params(new_trainable, static)
+            updates, new_opt_state = _opt.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
 
         return loss, new_params, new_opt_state
     return train_step
@@ -691,6 +692,13 @@ def generate(config, params, enc, prompt, max_new_tokens=64, temperature=0.8):
 
 # %% [markdown]
 # ## Quick Training (XProf)
+#
+# Trains for 300 steps — outputs MFU and throughput. Also runs the TPU profiler
+# XProf for a few steps and shows the profiling results. Check that your loss
+# goes down, that the MFU is reasonable (~50% is achievable on v6e), and use
+# tok/s to estimate time of your longer runs. In the XProf trace, tightly packed
+# "Device Execution" blocks = compute-bound (good); large gaps = input-bound
+# (something needs fixing).
 
 # %%
 # === Quick Training: ~300 steps, XProf on 15-20, MFU measurement ===
@@ -708,9 +716,8 @@ print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
-trainable_params, _ = split_trainable(params)
 optimizer = make_optimizer(config, NUM_QUICK_STEPS)
-opt_state = optimizer.init(trainable_params)
+opt_state = optimizer.init(params)
 train_step = make_train_step(optimizer)
 
 # Data
@@ -826,6 +833,14 @@ for prompt in ['The capital of France is', 'Machine learning is']:
 
 # %% [markdown]
 # ## Sweep (wandb)
+#
+# When everything looks good with your new transformer variant — run a quick
+# (1–2 hour) hyperparameter search. Uses Bayesian optimization to search
+# learning rate in log-uniform [5e-5, 1e-3] by default; feel free to add more
+# parameters to `sweep_config`. At the very least, find a good learning rate —
+# that's the most important hyperparameter to tune. You can run multiple copies
+# of this Colab in parallel: "Save a copy in Drive" and set `SWEEP_ID` to the
+# wandb sweep ID printed in the output of your first Colab.
 
 # %%
 # === wandb LR sweep ===
@@ -872,9 +887,8 @@ def sweep_train_fn():
     non_embed_p = count_non_embed_params(params)
     print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
 
-    trainable, static = split_trainable(params)
     sweep_opt = make_optimizer(cfg, SWEEP_STEPS)
-    opt_state = sweep_opt.init(trainable)
+    opt_state = sweep_opt.init(params)
     sweep_train_step = make_train_step(sweep_opt)
 
     raw_train = tokenize_shards(train_shard_indices, cfg.batch_size, cfg.seq_len)
@@ -959,8 +973,14 @@ runtime.unassign()
 import wandb
 import plotly.graph_objects as go
 
+from google.colab import userdata
+
+wandb.login(key=userdata.get("WANDB_TOKEN"))
+
+SWEEP_PROJECT_AND_ID = "tpuchat-ablations/q2c790hc"
+
 api = wandb.Api()
-sweep = api.sweep(f"{SWEEP_PROJECT}/{sweep_id}")
+sweep = api.sweep(SWEEP_PROJECT_AND_ID)
 runs = [r for r in sweep.runs if r.state == "finished"]
 
 lrs = [r.config["learning_rate"] for r in runs]
@@ -994,6 +1014,13 @@ fig.show()
 
 # %% [markdown]
 # ## Hero Run (20 tok/param)
+#
+# You found the good hyperparameters — update them in
+# `hero_config = Config(learning_rate=...)` and train your model for 20 tokens
+# per parameter (Chinchilla-optimal ratio). Training config: AdamW, warmup 2%,
+# warmdown 50% (cosine to 0), weight_decay=0.1. The model is exported to
+# HuggingFace and the Colab kernel is terminated afterwards (to avoid paying for
+# an idle TPU).
 
 # %%
 # === Hero run: 20 tok/param, ~19.8k steps ===
@@ -1020,9 +1047,8 @@ print(f'Steps: {HERO_STEPS:,} ({total_batch_size:,} tok/step)')
 print(f'Estimated time: {HERO_STEPS * 0.302 / 3600:.1f} hours (at ~302ms/step, 16 microbatches)')
 
 # Init optimizer
-trainable, static = split_trainable(hero_params)
 hero_opt = make_optimizer(hero_config, HERO_STEPS)
-opt_state = hero_opt.init(trainable)
+opt_state = hero_opt.init(hero_params)
 hero_train_step = make_train_step(hero_opt)
 
 # Data
@@ -1187,3 +1213,65 @@ print(f'\nUploaded to https://huggingface.co/{HF_REPO_ID}/tree/main/{ckpt_name}'
 # --- Disconnect runtime to stop billing ---
 from google.colab import runtime
 runtime.unassign()
+
+# %% [markdown]
+# ## Load & Sample (standalone)
+#
+# Load a trained checkpoint from HuggingFace and generate text. This cell runs
+# independently — you can use it on a fresh CPU-only Colab kernel to inspect any
+# previously uploaded model.
+
+# %%
+# === Load hero checkpoint from HuggingFace ===
+import pickle
+import jax
+import jax.numpy as jnp
+from huggingface_hub import hf_hub_download
+
+HF_REPO_ID = "vorushin/tpuchat"
+CHECKPOINT_NAME = "checkpoint_08_rev22"  # update to match your upload
+
+# Download params and config
+params_path = hf_hub_download(HF_REPO_ID, f"{CHECKPOINT_NAME}/params.pkl")
+config_path = hf_hub_download(HF_REPO_ID, f"{CHECKPOINT_NAME}/config.json")
+
+import json
+with open(config_path) as f:
+    config_dict = json.load(f)
+print(f"Checkpoint: {CHECKPOINT_NAME}")
+print(f"Val loss: {config_dict.get('best_val_loss', 'N/A')}")
+print(f"Steps: {config_dict.get('total_steps', 'N/A')}")
+
+# Reconstruct Config and load params
+sample_config = Config(
+    learning_rate=config_dict['learning_rate'],
+    n_embd=config_dict['n_embd'],
+    n_layer=config_dict['n_layer'],
+    n_head=config_dict['n_head'],
+    n_kv_head=config_dict['n_kv_head'],
+    head_dim=config_dict['head_dim'],
+    mlp_dim=config_dict['mlp_dim'],
+)
+
+with open(params_path, 'rb') as f:
+    params_np = pickle.load(f)
+sample_params = jax.tree.map(jnp.array, params_np)
+
+print(f'\nParams loaded: {count_params(sample_params)/1e6:.1f}M')
+
+# %%
+# === Generate samples ===
+prompts = [
+    'The capital of France is',
+    'In a distant galaxy, scientists discovered',
+    'Machine learning is',
+    'The most important invention of the 20th century',
+    'Once upon a time, in a small village',
+    'The theory of relativity states that',
+]
+
+print('--- Samples ---\n')
+for prompt in prompts:
+    text = generate(sample_config, sample_params, enc, prompt, max_new_tokens=100)
+    print(f'Prompt: {prompt}')
+    print(f'Output: {text}\n')
