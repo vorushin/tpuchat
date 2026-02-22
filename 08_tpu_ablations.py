@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 26)
+# # 08 — TPU Ablation Lab (rev 27)
 #
 # Companion notebook for
 # [LLM pretraining on TPU with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-budget).
@@ -78,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 26
+REVISION = 27
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -1239,7 +1239,7 @@ import jax.numpy as jnp
 from huggingface_hub import hf_hub_download
 
 HF_REPO_ID = "vorushin/tpuchat"
-CHECKPOINT_NAME = "checkpoint_08_rev22"  # update to match your upload
+CHECKPOINT_NAME = "checkpoint_08_rev4"  # update to match your upload
 
 # Download params and config
 params_path = hf_hub_download(HF_REPO_ID, f"{CHECKPOINT_NAME}/params.pkl")
