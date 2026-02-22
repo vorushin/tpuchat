@@ -488,7 +488,7 @@ def init_full_model(cfg, seed=42):
     return params
 
 
-def model_forward(cfg, params, tokens):
+def model_forward(cfg, params, tokens, attn_impl='splash'):
     """Full forward: embed -> layers -> final_norm.  Returns hidden (B,T,E)."""
     B, T = tokens.shape
     cos, sin = precompute_rope(T, cfg.head_dim)
@@ -496,7 +496,7 @@ def model_forward(cfg, params, tokens):
     sin = sin[None, None, :, :]
     x = rms_norm(params.wte[tokens])
     for i in range(cfg.n_layer):
-        x = single_layer_forward(cfg, params.layers[i], x, cos, sin, attn_impl='splash')
+        x = single_layer_forward(cfg, params.layers[i], x, cos, sin, attn_impl=attn_impl)
     return rms_norm(x)
 
 
@@ -566,7 +566,7 @@ OPT_WD = 0.1
 # %%
 # === Microbatched train step ===
 
-def make_bench_train_step(optimizer, cfg, labels):
+def make_bench_train_step(optimizer, cfg, labels, attn_impl='splash'):
     """Create a JIT-compiled train step with microbatch gradient accumulation."""
     @jax.jit
     def train_step(params, opt_state, tokens, _opt=optimizer):
@@ -575,7 +575,7 @@ def make_bench_train_step(optimizer, cfg, labels):
         y_micro = labels.reshape(num_mb, cfg.microbatch_size, cfg.seq_len)
 
         def loss_fn(params, x_mb, y_mb):
-            hidden = model_forward(cfg, params, x_mb)
+            hidden = model_forward(cfg, params, x_mb, attn_impl=attn_impl)
             return chunked_lm_head_loss(hidden, params.lm_head, y_mb, cfg)
 
         def microbatch_step(grad_acc, data):
@@ -1162,6 +1162,35 @@ for impl in ['einsum', 'jax', 'splash']:
     results_7d.append(r)
 
 print_summary(results_7d)
+
+# %%
+# 7e. Attention implementation — full train step (fwd+bwd+optimizer, microbatched)
+print("\n=== Attention implementation (full train step, B=64 microbatched) ===")
+results_7e = []
+
+fl_7e = 3 * (cfg.n_layer * layer_flops(cfg.batch_size, cfg.seq_len, cfg.n_embd,
+              cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.mlp_dim) +
+              matmul_flops(cfg.batch_size * cfg.seq_len, cfg.vocab_size, cfg.n_embd))
+
+for impl in ['splash', 'jax', 'einsum']:
+    p = init_full_model(cfg)
+    tok = fake_tokens(cfg.batch_size, cfg.seq_len)
+    lab = fake_tokens(cfg.batch_size, cfg.seq_len)
+
+    sched = optax.adamw(OPT_LR, b1=OPT_BETA1, b2=OPT_BETA2,
+                         eps=OPT_EPS, weight_decay=OPT_WD)
+    ostate = sched.init(p)
+    step_fn = make_bench_train_step(sched, cfg, lab, attn_impl=impl)
+
+    r = benchmark(step_fn, p, ostate, tok, flop_count=fl_7e,
+                  label=f"train_step attn={impl}")
+    r['tok_per_sec'] = cfg.batch_size * cfg.seq_len / (r['wall_ms'] / 1000)
+    results_7e.append(r)
+
+print_summary(results_7e)
+print("  Throughput:")
+for r in results_7e:
+    print(f"    {r['label']:<40s}  {r['tok_per_sec']:,.0f} tok/s")
 
 # %% [markdown]
 # ### Ideas to try
