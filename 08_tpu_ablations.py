@@ -11,10 +11,10 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 32)
+# # 08 — TPU Ablation Lab (rev 33)
 #
 # Companion notebook for
-# [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-budget).
+# [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-v6e-50usd).
 # Based on Karpathy's [nanochat](https://github.com/karpathy/nanochat) — ported
 # to JAX for a single TPU v6e on Google Colab Pro+. Also works
 # on TPU v5e (available on the free Colab plan, ~3× slower).
@@ -78,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 32
+REVISION = 33
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
