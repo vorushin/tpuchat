@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 7)
+# # 09 — MoE Training Lab (rev 9)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 7
+REVISION = 9
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -351,6 +351,7 @@ class Config:
     n_experts: int = 8              # number of routed experts
     n_active_experts: int = 2       # top-k experts activated per token
     expert_mlp_dim: int = 512       # per-expert FFN hidden dim (ReLU²)
+    capacity_factor: float = 1.25   # expert buffer headroom (1.0 = exact, 1.25 = 25% extra)
     aux_loss_alpha: float = 0.01    # load balancing loss coefficient
     z_loss_alpha: float = 1e-4      # router z-loss coefficient
 
@@ -476,8 +477,8 @@ def moe_forward(config, layer, x):
     cumpos = jnp.cumsum(expert_oh, axis=0) * expert_oh
     pos = (jnp.sum(cumpos, axis=-1) - 1).astype(jnp.int32)        # 0-indexed
 
-    # Capacity: ceil(N*K / E)
-    C = (N * K + E - 1) // E
+    # Capacity: ceil(N*K / E) × capacity_factor
+    C = int(((N * K + E - 1) // E) * config.capacity_factor)
     valid = pos < C
     pos_clipped = jnp.clip(pos, 0, C - 1)
 
@@ -767,7 +768,12 @@ LOG_DIR = '/content/log_dir'
 params = init_full_model(config, seed=config.param_seed)
 total_p = count_params(params)
 non_embed_p = count_non_embed_params(params)
-print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed')
+# Active params: all non-expert params + K/E fraction of expert params
+expert_params_per_layer = config.n_experts * (2 * config.n_embd * config.expert_mlp_dim)
+inactive_expert_p = config.n_layer * expert_params_per_layer * (config.n_experts - config.n_active_experts) / config.n_experts
+active_p = total_p - int(inactive_expert_p)
+print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed, '
+      f'{active_p/1e6:.1f}M active')
 print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
