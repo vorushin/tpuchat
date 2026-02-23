@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 5)
+# # 09 — MoE Training Lab (rev 7)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 5
+REVISION = 7
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -790,9 +790,16 @@ fwd_flops = (config.n_layer * moe_layer_flops(
 step_flops = 3 * fwd_flops  # fwd + 2x bwd
 
 smooth_loss = 0.0
-measure_t0 = None       # set after eval at step 100
-measure_tokens = 0      # tokens in steps 100-299
-measure_eval_secs = 0.0 # eval time at step 200 (to subtract)
+window_t0 = None
+flops_per_tok = step_flops / (config.batch_size * config.seq_len)
+ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
+
+def report_mfu(label, t0, n_steps):
+    wall = time.time() - t0
+    tok_per_s = int(n_steps * config.batch_size * config.seq_len / wall)
+    mfu_pct = (tok_per_s * flops_per_tok) / (PEAK_TFLOPS * 1e12) * 100
+    print(f'{label} MFU: {mfu_pct:.1f}% | tok/s: {tok_per_s:,} | '
+          f'ideal tok/s (100% MFU): {int(ideal_tok_s):,}')
 
 print(f'\n=== Quick Training: {NUM_QUICK_STEPS} steps ===\n')
 
@@ -801,7 +808,6 @@ for step in range(NUM_QUICK_STEPS + 1):
 
     # --- Eval ---
     if step % EVAL_EVERY == 0 or last_step:
-        eval_t0 = time.time()
         val_loader = val_loader_fn()
         val_losses = []
         for _ in range(config.eval_steps):
@@ -810,12 +816,8 @@ for step in range(NUM_QUICK_STEPS + 1):
             vl = eval_step(config, params, vx, vy)
             val_losses.append(float(vl))
         avg_val_loss = sum(val_losses) / len(val_losses)
-        if measure_t0 is not None:
-            measure_eval_secs += time.time() - eval_t0
         print(f'step {step:05d} | Val loss: {avg_val_loss:.4f}')
-        # Start measuring after eval at step 100 (clean window, no XProf)
-        if step == EVAL_EVERY:
-            measure_t0 = time.time()
+        window_t0 = time.time()
 
     if last_step:
         break
@@ -834,28 +836,18 @@ for step in range(NUM_QUICK_STEPS + 1):
                                           x_batch, y_batch)
     loss.block_until_ready()
 
-    if measure_t0 is not None:
-        measure_tokens += config.batch_size * config.seq_len
-
     loss_val = float(loss)
     ema_beta = 0.9
     smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_val
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
 
-    if step % 50 == 0:
+    if (step + 1) % 50 == 0:
+        if step >= 50:  # skip first 50 (XProf + warmup)
+            report_mfu(f'steps {step - 48}-{step}', window_t0, 50)
+        window_t0 = time.time()
         print(f'step {step:05d}/{NUM_QUICK_STEPS} | loss: {debiased_loss:.4f}')
 
 train_loader.stop()
-
-# --- MFU report (steps 100-299, excluding eval at 200) ---
-if measure_t0 is not None:
-    mfu_wall = time.time() - measure_t0 - measure_eval_secs
-    tok_per_s = int(measure_tokens / mfu_wall)
-    flops_per_tok = step_flops / (config.batch_size * config.seq_len)
-    mfu_pct = (tok_per_s * flops_per_tok) / (PEAK_TFLOPS * 1e12) * 100
-    ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
-    print(f'\nMFU: {mfu_pct:.1f}% | tok/s: {tok_per_s:,} | '
-          f'ideal tok/s (100% MFU): {int(ideal_tok_s):,}')
 
 # --- Sample text ---
 print('\n--- Samples ---')
