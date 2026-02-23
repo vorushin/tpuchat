@@ -695,3 +695,7 @@ Agent: Removed `padded_vocab` property from all 7 notebooks (02–08). `vocab_si
 Agent: Fixed lm_head einsums in TPU notebooks (02–05, 08) to use `preferred_element_type=jnp.float32` instead of `.astype(jnp.float32)` after the einsum. Previously the fp32 MXU accumulator was truncated to bf16 (default output dtype when both inputs are bf16), then cast back to fp32 — losing precision. Now the einsum outputs fp32 directly, preserving the full accumulator precision for the softcap and cross-entropy.
 
 Agent: Set default learning_rate to 1e-4 in 08_tpu_ablations.py (rev 12).
+
+## Feb 23 2026
+
+Agent: Created 09_moe.py — Mixture of Experts training lab based on 08_tpu_ablations.py. Dense MLP replaced with routed MoE: 8 experts, top-2 routing, expert_mlp_dim=512 (fine-grained SwiGLU experts). Capacity-based scatter/gather dispatch using cumsum on one-hot expert masks — no large dispatch tensors needed. Auxiliary load balancing loss (alpha=0.01, ST-MoE style) + router z-loss (alpha=1e-4) for training stability. Parameter budget: ~189M total, ~156M non-embed (1.3x more MLP params than dense, but 3x less active MLP compute per token). Same 3-mode structure as 08: Quick Training, wandb Sweep, Hero Run with HF upload. wandb project: tpuchat-moe.

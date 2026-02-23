@@ -25,7 +25,7 @@ Notebooks with a `REVISION = N` constant (currently 08) get auto-incremented by 
 
 All notebooks use `google.colab.userdata` for authentication (no interactive prompts):
 - `HF_TOKEN` — HuggingFace Hub login
-- `WANDB_TOKEN` — Weights & Biases login (notebooks 03, 08)
+- `WANDB_TOKEN` — Weights & Biases login (notebooks 03, 08, 09)
 
 ## File map
 
@@ -37,6 +37,7 @@ All notebooks use `google.colab.userdata` for authentication (no interactive pro
 | `04_maxtext.py` | MaxText-inspired ~370M variant (SwiGLU, chunked lm_head loss) |
 | `05_tpu_perf.py` | TPU v6e performance benchmarks (MXU%, HBM bandwidth) |
 | `08_tpu_ablations.py` | Ablation lab — quick training, wandb sweep, hero run with HF upload |
+| `09_moe.py` | MoE training lab — 8 experts, top-2 routing, capacity-based dispatch, wandb sweep, hero run |
 | `LOG.md` | Chronological dev log — append with `Agent:` prefix after significant work |
 | `update_notebooks.sh` | `jupytext --to ipynb` + auto-increment REVISION for changed notebooks |
 
