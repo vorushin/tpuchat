@@ -11,12 +11,12 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 2)
+# # 09 — MoE Training Lab (rev 4)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
-# Replaces the dense SwiGLU MLP with a routed MoE layer (8 experts, top-2,
-# capacity-based dispatch). Based on Karpathy's
+# Replaces the dense MLP with a routed MoE layer (8 experts, top-2,
+# capacity-based dispatch, ReLU² activation). Based on Karpathy's
 # [nanochat](https://github.com/karpathy/nanochat) — ported to JAX for a
 # single TPU v6e on Google Colab Pro+.
 #
@@ -34,7 +34,7 @@
 # | Total params | ~189M |
 # | Non-embed params | ~156M |
 # | Active params/token | ~88M (attention + 2 experts) |
-# | Experts | 8 × SwiGLU (dim=512), top-2 routed |
+# | Experts | 8 × ReLU² (dim=512), top-2 routed |
 # | Load balancing | aux_loss (0.01) + z-loss (1e-4) |
 #
 # ### Setup: Colab Secrets
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 2
+REVISION = 4
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -159,8 +159,8 @@ def moe_layer_flops(B, T, D, N, K_head, H, E, K, F_expert):
     v    = 2 * tok * D * K_head * H     # V projection
     att  = attention_flops(B, N, T, H)  # core attention
     proj = 2 * tok * N * H * D          # output projection
-    # MoE: K active experts × SwiGLU (gate + up + down = 3 matmuls)
-    moe  = K * 3 * (2 * tok * D * F_expert)
+    # MoE: K active experts × ReLU² (up + down = 2 matmuls)
+    moe  = K * 2 * (2 * tok * D * F_expert)
     router = 2 * tok * D * E
     return q + k + v + att + proj + moe + router
 
@@ -338,7 +338,7 @@ def count_non_embed_params(params):
 # ## Model
 #
 # Transformer with Mixture of Experts MLP. Architecture: RoPE, RMSNorm, MQA
-# (4 query heads, 1 KV head), QK-norm, logit softcap, **MoE SwiGLU** (8
+# (4 query heads, 1 KV head), QK-norm, logit softcap, **MoE ReLU²** (8
 # experts, top-2 routed, capacity-based dispatch), AdamW optimizer. Auxiliary
 # load balancing loss + router z-loss for training stability.
 
@@ -350,7 +350,7 @@ class Config:
     # ── MoE ────────────────────────────────────────────────────
     n_experts: int = 8              # number of routed experts
     n_active_experts: int = 2       # top-k experts activated per token
-    expert_mlp_dim: int = 512       # per-expert FFN hidden dim (SwiGLU)
+    expert_mlp_dim: int = 512       # per-expert FFN hidden dim (ReLU²)
     aux_loss_alpha: float = 0.01    # load balancing loss coefficient
     z_loss_alpha: float = 1e-4      # router z-loss coefficient
 
@@ -405,7 +405,7 @@ print(f'Training: lr={config.learning_rate:.1e}, B={config.batch_size}{mb_info}'
 # %%
 
 def init_layer_params(config, seed=42):
-    """Initialize params for one transformer layer (attention + MoE)."""
+    """Initialize params for one transformer layer (attention + MoE ReLU²)."""
     key = jax.random.key(seed)
     keys = jax.random.split(key, 7)
     s = (3.0 ** 0.5) * (config.n_embd ** -0.5)
@@ -424,11 +424,9 @@ def init_layer_params(config, seed=42):
     layer.router = jax.random.normal(keys[3], (config.n_embd, config.n_experts),
                                       dtype=jnp.bfloat16) * 0.01
 
-    # Expert SwiGLU weights: stacked (E, D, F) and (E, F, D)
+    # Expert ReLU² weights: stacked (E, D, F) and (E, F, D)
     E, D, F = config.n_experts, config.n_embd, config.expert_mlp_dim
-    layer.expert_w_gate = jax.random.uniform(keys[4], (E, D, F),
-                                              dtype=jnp.bfloat16, minval=-s, maxval=s)
-    layer.expert_w_up   = jax.random.uniform(keys[5], (E, D, F),
+    layer.expert_w_up   = jax.random.uniform(keys[4], (E, D, F),
                                               dtype=jnp.bfloat16, minval=-s, maxval=s)
     layer.expert_w_down = jnp.zeros((E, F, D), dtype=jnp.bfloat16)
     return layer
@@ -488,10 +486,10 @@ def moe_forward(config, layer, x):
     expert_input = expert_input.at[expert_flat, pos_clipped].add(
         x_rep * valid[:, None])
 
-    # ── Expert SwiGLU (batched over E dimension) ──
-    gate = jax.nn.silu(jnp.einsum('ecd,edf->ecf', expert_input, layer.expert_w_gate))
+    # ── Expert ReLU² (batched over E dimension) ──
     up = jnp.einsum('ecd,edf->ecf', expert_input, layer.expert_w_up)
-    expert_out = jnp.einsum('ecf,efd->ecd', gate * up, layer.expert_w_down)  # (E, C, D)
+    up = jax.nn.relu(up) ** 2
+    expert_out = jnp.einsum('ecf,efd->ecd', up, layer.expert_w_down)  # (E, C, D)
 
     # ── Combine ──
     gathered = expert_out[expert_flat, pos_clipped]                  # (N*K, D)
@@ -792,12 +790,9 @@ fwd_flops = (config.n_layer * moe_layer_flops(
 step_flops = 3 * fwd_flops  # fwd + 2x bwd
 
 smooth_loss = 0.0
-mfu_t0 = None
-mfu_tokens = 0
-mfu_eval_time = 0.0
-report_t0 = time.time()
-report_tokens = 0
-report_eval_time = 0.0
+measure_t0 = None       # set after eval at step 100
+measure_tokens = 0      # tokens in steps 100-299
+measure_eval_secs = 0.0 # eval time at step 200 (to subtract)
 
 print(f'\n=== Quick Training: {NUM_QUICK_STEPS} steps ===\n')
 
@@ -815,11 +810,12 @@ for step in range(NUM_QUICK_STEPS + 1):
             vl = eval_step(config, params, vx, vy)
             val_losses.append(float(vl))
         avg_val_loss = sum(val_losses) / len(val_losses)
-        eval_dt = time.time() - eval_t0
-        if mfu_t0 is not None:
-            mfu_eval_time += eval_dt
-        report_eval_time += eval_dt
+        if measure_t0 is not None:
+            measure_eval_secs += time.time() - eval_t0
         print(f'step {step:05d} | Val loss: {avg_val_loss:.4f}')
+        # Start measuring after eval at step 100 (clean window, no XProf)
+        if step == EVAL_EVERY:
+            measure_t0 = time.time()
 
     if last_step:
         break
@@ -834,18 +830,12 @@ for step in range(NUM_QUICK_STEPS + 1):
 
     # --- Train step ---
     x_batch, y_batch = next(train_loader)
-
-    t0 = time.time()
     loss, params, opt_state = train_step(config, params, opt_state,
                                           x_batch, y_batch)
     loss.block_until_ready()
-    dt = time.time() - t0
 
-    if step > XPROF_END:
-        if mfu_t0 is None:
-            mfu_t0 = time.time()
-        mfu_tokens += config.batch_size * config.seq_len
-    report_tokens += config.batch_size * config.seq_len
+    if measure_t0 is not None:
+        measure_tokens += config.batch_size * config.seq_len
 
     loss_val = float(loss)
     ema_beta = 0.9
@@ -853,20 +843,14 @@ for step in range(NUM_QUICK_STEPS + 1):
     debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
 
     if step % 50 == 0:
-        report_wall = time.time() - report_t0 - report_eval_time
-        tok_per_sec = int(report_tokens / report_wall) if report_wall > 0 else 0
-        print(f'step {step:05d}/{NUM_QUICK_STEPS} | loss: {debiased_loss:.4f} '
-              f'| tok/s: {tok_per_sec:,}')
-        report_t0 = time.time()
-        report_tokens = 0
-        report_eval_time = 0.0
+        print(f'step {step:05d}/{NUM_QUICK_STEPS} | loss: {debiased_loss:.4f}')
 
 train_loader.stop()
 
-# --- MFU report (wall clock excl. eval, steps 21-300) ---
-if mfu_t0 is not None:
-    mfu_wall = time.time() - mfu_t0 - mfu_eval_time
-    tok_per_s = int(mfu_tokens / mfu_wall)
+# --- MFU report (steps 100-299, excluding eval at 200) ---
+if measure_t0 is not None:
+    mfu_wall = time.time() - measure_t0 - measure_eval_secs
+    tok_per_s = int(measure_tokens / mfu_wall)
     flops_per_tok = step_flops / (config.batch_size * config.seq_len)
     mfu_pct = (tok_per_s * flops_per_tok) / (PEAK_TFLOPS * 1e12) * 100
     ideal_tok_s = PEAK_TFLOPS * 1e12 / flops_per_tok
