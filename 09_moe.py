@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 4)
+# # 09 — MoE Training Lab (rev 5)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 4
+REVISION = 5
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -437,7 +437,7 @@ def moe_forward(config, layer, x):
 
     1. Route: top-k expert selection with softmax weights
     2. Dispatch: scatter tokens into (E, C, D) expert buffer via cumsum positions
-    3. Compute: batched SwiGLU via einsums over expert dimension
+    3. Compute: batched ReLU² via einsums over expert dimension
     4. Combine: gather outputs, weight by routing scores, sum over K experts
 
     Returns: (output, aux_loss, z_loss)
