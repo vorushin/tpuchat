@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 10)
+# # 09 — MoE Training Lab (rev 11)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 10
+REVISION = 11
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -899,7 +899,7 @@ SWEEP_EVAL_EVERY = 250
 
 def sweep_train_fn():
     """Single training run within a wandb sweep."""
-    run = wandb.init(settings=wandb.Settings(console="off"))
+    run = wandb.init()
     lr = wandb.config.learning_rate
 
     cfg = Config(learning_rate=lr)
