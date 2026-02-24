@@ -423,7 +423,7 @@ check(rowsum_kernel, rowsum_spec, (x,),
 # accumulations.
 #
 # Inside a kernel, use `jax.lax.dot(a, b)` for the matrix multiply. This
-# maps to the TPU's MXU (Matrix Execution Unit) when running on hardware.
+# maps to the TPU's MXU (Matrix Multiplier Unit) when running on hardware.
 #
 # ```
 # A: (M, K)          B: (K, N)          C: (M, N)
