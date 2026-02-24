@@ -508,11 +508,16 @@ assert jnp.array_equal(
     compute_group_tiles(jnp.array([300, 212, 512], dtype=jnp.int32),
                         jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 128),
     jnp.array([3, 2, 4]))
-# Zero-size group gets 0 tiles
+# Zero-size group at aligned offset gets 0 tiles
 assert jnp.array_equal(
     compute_group_tiles(jnp.array([512, 0, 512], dtype=jnp.int32),
                         jnp.array([0, 512, 512, 1024], dtype=jnp.int32), 128),
     jnp.array([4, 0, 4]))
+# Zero-size group at NON-aligned offset — must still be 0, not 1
+assert jnp.array_equal(
+    compute_group_tiles(jnp.array([300, 0, 724], dtype=jnp.int32),
+                        jnp.array([0, 300, 300, 1024], dtype=jnp.int32), 128),
+    jnp.array([3, 0, 6]))
 print("Step 10b — compute_group_tiles: PASSED ✓")
 
 # %% [markdown]
@@ -623,11 +628,16 @@ assert compute_tile_visits(
     jnp.array([300, 212, 512], dtype=jnp.int32),
     jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 8, 128
 ).tolist() == [1, 1, 2, 1, 1, 1, 1, 1]
-# Zero-size group — no extra visits
+# Zero-size group at aligned offset — no extra visits
 assert compute_tile_visits(
     jnp.array([512, 0, 512], dtype=jnp.int32),
     jnp.array([0, 512, 512, 1024], dtype=jnp.int32), 8, 128
 ).tolist() == [1, 1, 1, 1, 1, 1, 1, 1]
+# Zero-size group at NON-aligned offset — must not add an extra visit
+assert compute_tile_visits(
+    jnp.array([300, 0, 724], dtype=jnp.int32),
+    jnp.array([0, 300, 300, 1024], dtype=jnp.int32), 8, 128
+).tolist() == [1, 1, 2, 1, 1, 1, 1, 1]
 print("Step 10d — compute_tile_visits: PASSED ✓")
 
 # %% [markdown]
@@ -737,8 +747,10 @@ check_metadata("Aligned groups",
                jnp.array([256, 256, 256, 256], dtype=jnp.int32), 1024, 128)
 check_metadata("Unaligned groups",
                jnp.array([300, 212, 512], dtype=jnp.int32), 1024, 128)
-check_metadata("Zero-size group",
+check_metadata("Zero-size group (aligned)",
                jnp.array([512, 0, 512], dtype=jnp.int32), 1024, 128)
+check_metadata("Zero-size group (non-aligned)",
+               jnp.array([300, 0, 724], dtype=jnp.int32), 1024, 128)
 
 # %% [markdown]
 # <details><summary>💡 Hint</summary>
