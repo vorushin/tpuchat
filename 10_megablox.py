@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 10 — MegaBlox: Dropless MoE with Grouped Matrix Multiplication (rev 2)
+# # 10 — MegaBlox: Dropless MoE with Grouped Matrix Multiplication (rev 4)
 #
 # This notebook builds up **dropless Mixture of Experts** step by step, from
 # the fundamental grouped matrix multiplication (GMM) operation to a full
@@ -66,7 +66,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-REVISION = 2
+REVISION = 4
 
 ON_TPU = any('TPU' in d.device_kind for d in jax.devices())
 
@@ -139,7 +139,7 @@ class Config:
 
 config = Config()
 print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
-      f'V={config.vocab_size}, N={config.n_head}, K_head={config.n_kv_head}, '
+      f'V={config.vocab_size}, N={config.n_head}, K={config.n_kv_head}, '
       f'H={config.head_dim}')
 print(f'MoE: E={config.n_experts}, top-{config.n_active_experts}, '
       f'F_expert={config.expert_mlp_dim}')
@@ -899,7 +899,7 @@ x_test = jax.random.normal(keys[2], (config.batch_size, config.seq_len, config.n
                             dtype=jnp.float32)
 
 print(f"Input shape: {x_test.shape}")
-print(f"Config: E={config.n_experts}, K={config.n_active_experts}, "
+print(f"Config: E={config.n_experts}, k={config.n_active_experts}, "
       f"D={config.n_embd}, F={config.expert_mlp_dim}")
 print(f"Capacity factor: {config.capacity_factor}\n")
 

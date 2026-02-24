@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 15)
+# # 09 — MoE Training Lab (rev 16)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -28,7 +28,7 @@
 # 2. **Sweep** (wandb) — Bayesian LR search
 # 3. **Hero Run** (20 tok/param) — Full training with eval + HuggingFace upload
 #
-# ### MoE Architecture: E=8, K=2, F_expert=512, D=1024, N=4, K_head=1, H=256, L=8, B=64, T=2048
+# ### MoE Architecture: E=8, k=2, F=2048, D=1024, N=4, K=1, H=256, L=8, B=64, T=2048
 # | Metric | Value |
 # |--------|-------|
 # | Total params | ~189M |
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 15
+REVISION = 16
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -133,9 +133,10 @@ def _expand_kv(k, v, n_head, n_kv_head):
 
 # %%
 # === FLOP counting helpers ===
-# Dimension notation: B=batch, T=seq_len, D=d_model, N=n_heads,
-#   K_head=n_kv_heads, H=head_dim, E=n_experts, K=n_active_experts,
-#   F=expert_mlp_dim, L=n_layers, V=vocab_size
+# Dimension letters (from "How to Scale Your Model"):
+#   B=batch, T=seq_len, D=d_model, N=query_heads, K=kv_heads,
+#   H=head_dim, F=ffn_dim, E=n_experts, k=active_experts,
+#   L=n_layers, V=vocab_size
 
 def matmul_flops(M, N, K, batch=1):
     """FLOPs for [M,K] @ [K,N].  2*M*N*K per batch element."""
@@ -147,22 +148,22 @@ def attention_flops(B, N, T, H):
     return 2 * (2 * B * N * T * T * H)
 
 
-def moe_layer_flops(B, T, D, N, K_head, H, E, K, F_expert):
+def moe_layer_flops(B, T, D, N, K, H, E, k, F):
     """MXU-relevant FLOPs for one MoE transformer layer.
 
     Counts matmul FLOPs: attention projections + attention core + MoE MLP.
-    MoE MLP counts only K active experts (not all E).
+    MoE MLP counts only k active experts (not all E).
     """
     tok = B * T
-    q    = 2 * tok * D * N * H          # Q projection
-    k    = 2 * tok * D * K_head * H     # K projection
-    v    = 2 * tok * D * K_head * H     # V projection
+    q    = 2 * tok * D * N * H      # Q projection
+    kv_k = 2 * tok * D * K * H      # K projection
+    kv_v = 2 * tok * D * K * H      # V projection
     att  = attention_flops(B, N, T, H)  # core attention
-    proj = 2 * tok * N * H * D          # output projection
-    # MoE: K active experts × ReLU² (up + down = 2 matmuls)
-    moe  = K * 2 * (2 * tok * D * F_expert)
+    proj = 2 * tok * N * H * D      # output projection
+    # MoE: k active experts × ReLU² (up + down = 2 matmuls)
+    moe  = k * 2 * (2 * tok * D * F)
     router = 2 * tok * D * E
-    return q + k + v + att + proj + moe + router
+    return q + kv_k + kv_v + att + proj + moe + router
 
 # %%
 # === Data: HF login, tokenizer, data download, tokenize_shards, PrefetchDataLoader ===
@@ -394,10 +395,10 @@ class Config:
 config = Config()
 assert config.vocab_size % 256 == 0, f"vocab_size must be divisible by 256, got {config.vocab_size}"
 print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
-      f'V={config.vocab_size}, N={config.n_head}, K_head={config.n_kv_head}, '
+      f'V={config.vocab_size}, N={config.n_head}, K={config.n_kv_head}, '
       f'H={config.head_dim}')
-print(f'MoE: E={config.n_experts}, top-{config.n_active_experts}, '
-      f'F_expert={config.expert_mlp_dim}, '
+print(f'MoE: E={config.n_experts}, k={config.n_active_experts}, '
+      f'F={config.expert_mlp_dim}, '
       f'aux_alpha={config.aux_loss_alpha}, z_alpha={config.z_loss_alpha}')
 mb_info = (f', microbatch={config.microbatch_size}, accum={config.num_microbatches}x'
            if config.num_microbatches > 1 else '')
@@ -786,7 +787,7 @@ raw_train = tokenize_shards(train_shard_indices, config.batch_size, config.seq_l
 train_loader = PrefetchDataLoader(raw_train, capacity=4)
 val_loader_fn = lambda: tokenize_shards(val_shard_indices, config.batch_size, config.seq_len)
 
-# FLOP counting (MoE: counts only K active experts)
+# FLOP counting (MoE: counts only k active experts)
 fwd_flops = (config.n_layer * moe_layer_flops(
     config.batch_size, config.seq_len, config.n_embd,
     config.n_head, config.n_kv_head, config.head_dim,
@@ -882,7 +883,7 @@ from google.colab import userdata
 wandb.login(key=userdata.get("WANDB_TOKEN"))
 
 sweep_config = {
-    "name": f"moe-E{config.n_experts}-K{config.n_active_experts}-F{config.expert_mlp_dim}",
+    "name": f"moe-E{config.n_experts}-k{config.n_active_experts}-F{config.expert_mlp_dim}",
     "method": "bayes",
     "metric": {"goal": "minimize", "name": "val_loss"},
     "parameters": {
@@ -904,7 +905,7 @@ def sweep_train_fn():
 
     cfg = Config(learning_rate=lr)
     print(f'Sweep run: lr={lr:.2e}, E={cfg.n_experts}, '
-          f'K={cfg.n_active_experts}, F={cfg.expert_mlp_dim}')
+          f'k={cfg.n_active_experts}, F={cfg.expert_mlp_dim}')
 
     wandb.define_metric("train/loss", step_metric="step")
     wandb.define_metric("train/tok_per_sec", step_metric="step")
@@ -1091,7 +1092,7 @@ step_flops = 3 * fwd_flops
 # wandb
 wandb.login(key=userdata.get("WANDB_TOKEN"))
 wandb.init(project="tpuchat-moe",
-           name=f"hero-moe-E{hero_config.n_experts}-K{hero_config.n_active_experts}-F{hero_config.expert_mlp_dim}",
+           name=f"hero-moe-E{hero_config.n_experts}-k{hero_config.n_active_experts}-F{hero_config.expert_mlp_dim}",
            config={
                "n_experts": hero_config.n_experts,
                "n_active_experts": hero_config.n_active_experts,

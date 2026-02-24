@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tpuchat** is a JAX-native GPT pretraining harness for a single Colab Pro+ TPU v6e (32 GB HBM). Port of Karpathy's NanoChat — raw JAX, no Flax/Orbax.
 
-164M param model (130M non-embed): D=1024, N=4, K=1, H=256, L=8, B=64 (16×4 microbatch). RoPE, QK-norm, SwiGLU MLP, splash attention, logit softcap. Trained on FineWeb-Edu-100B-Shuffle (50 shards, tokenized on-the-fly with custom BPE vocab 32768).
+164M param model (130M non-embed): D=1024, N=4, K=1, H=256, F=3072, L=8, B=64 (16×4 microbatch). RoPE, QK-norm, SwiGLU MLP, splash attention, logit softcap. Trained on FineWeb-Edu-100B-Shuffle (50 shards, tokenized on-the-fly with custom BPE vocab 32768).
 
 ## Editing workflow
 
@@ -60,6 +60,24 @@ All notebooks use `google.colab.userdata` for authentication (no interactive pro
 **Gradient accumulation** — `jax.lax.scan` over microbatches (microbatch_size=4, num_microbatches=16 for batch_size=64).
 
 **Profiling** — `jax.named_scope` on all components (embedding, layer_N/attention, layer_N/mlp, lm_head) for XProf/TensorBoard traces. Steps 15-20 captured by default.
+
+## Dimension letters
+
+Single-letter notation from [How to Scale Your Model](https://jax-ml.github.io/scaling-book/transformers/). Use these consistently in comments, formulas, print statements, and FLOP counting functions.
+
+| Letter | Meaning | Config field |
+|--------|---------|-------------|
+| B | Batch size | `batch_size` |
+| T | Sequence length | `seq_len` |
+| D | Model dimension | `n_embd` |
+| N | Number of query heads | `n_head` |
+| K | Number of KV heads | `n_kv_head` |
+| H | Head dimension | `head_dim` |
+| F | FFN hidden dimension | `mlp_dim` / `expert_mlp_dim` |
+| L | Number of layers | `n_layer` |
+| V | Vocabulary size | `vocab_size` |
+| E | Number of experts | `n_experts` |
+| k | Active experts per token | `n_active_experts` |
 
 ## Key conventions
 
