@@ -10,13 +10,14 @@
 #     name: python3
 #   accelerator: TPU
 #   colab:
-#     gpuType: V6E
+#     gpuType: V6E1
+#     machine_shape: hm
 # ---
 
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 08 — TPU Ablation Lab (rev 37)
+# # 08 — TPU Ablation Lab (rev 38)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-v6e-50usd).
@@ -83,7 +84,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 37
+REVISION = 38
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")

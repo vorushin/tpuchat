@@ -10,7 +10,8 @@
 #     name: python3
 #   accelerator: TPU
 #   colab:
-#     gpuType: V6E
+#     gpuType: V6E1
+#     machine_shape: hm
 # ---
 
 # %% [markdown]

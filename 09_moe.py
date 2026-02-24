@@ -10,13 +10,14 @@
 #     name: python3
 #   accelerator: TPU
 #   colab:
-#     gpuType: V6E
+#     gpuType: V6E1
+#     machine_shape: hm
 # ---
 
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 19)
+# # 09 — MoE Training Lab (rev 20)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -76,7 +77,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 19
+REVISION = 20
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
