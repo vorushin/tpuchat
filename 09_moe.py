@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 20)
+# # 09 — MoE Training Lab (rev 21)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -77,7 +77,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 20
+REVISION = 21
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -1102,19 +1102,26 @@ def save_checkpoint_to_hf(params, opt_state, config, step, best_val_loss,
     print(f'  Checkpoint uploaded to HF: {ckpt_name} (step {step})')
 
 
-# Compute steps from tok/param ratio
+# Compute steps from tok/param ratio (using activated params for MoE)
 hero_config = Config()
 hero_params = init_full_model(hero_config, seed=hero_config.param_seed)
 hero_non_embed = count_non_embed_params(hero_params)
 hero_total_p = count_params(hero_params)
 
-target_tokens = int(20 * hero_non_embed)
+# In MoE only k/E expert params are active per token
+expert_params_per_layer = (hero_config.n_experts * hero_config.n_embd * hero_config.expert_mlp_dim * 2)
+active_expert_params_per_layer = expert_params_per_layer * hero_config.n_active_experts // hero_config.n_experts
+inactive_expert_params = (expert_params_per_layer - active_expert_params_per_layer) * hero_config.n_layer
+hero_active_non_embed = hero_non_embed - inactive_expert_params
+
+target_tokens = int(20 * hero_active_non_embed)
 total_batch_size = hero_config.batch_size * hero_config.seq_len
 HERO_STEPS = target_tokens // total_batch_size
 HERO_EVAL_EVERY = 1000
 
-print(f'Params: {hero_total_p/1e6:.1f}M total, {hero_non_embed/1e6:.1f}M non-embed')
-print(f'Target tokens: {target_tokens:,} (20 tok/param)')
+print(f'Params: {hero_total_p/1e6:.1f}M total, {hero_non_embed/1e6:.1f}M non-embed, '
+      f'{hero_active_non_embed/1e6:.1f}M active non-embed')
+print(f'Target tokens: {target_tokens:,} (20 tok/active param)')
 print(f'Steps: {HERO_STEPS:,} ({total_batch_size:,} tok/step)')
 
 # Init optimizer
@@ -1171,6 +1178,7 @@ wandb.init(project="tpuchat-moe",
                "qk_norm": hero_config.qk_norm,
                "learning_rate": hero_config.learning_rate,
                "non_embed_params": hero_non_embed,
+               "active_non_embed_params": hero_active_non_embed,
                "target_tokens": target_tokens, "steps": HERO_STEPS,
            })
 wandb.define_metric("train/loss", step_metric="step")
