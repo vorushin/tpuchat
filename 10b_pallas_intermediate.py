@@ -110,10 +110,10 @@ def check(kernel_fn, spec_fn, inputs, *, grid=(), in_specs=None, out_specs=None,
 
 # %%
 M7, K7, N7 = 256, 512, 256
-tm7, tk7, tn7 = 128, 256, 128
-tiles_m7 = M7 // tm7
-tiles_n7 = N7 // tn7
-tiles_k7 = K7 // tk7
+bm7, bk7, bn7 = 128, 256, 128
+tiles_m7 = M7 // bm7
+tiles_n7 = N7 // bn7
+tiles_k7 = K7 // bk7
 
 # --- Reference ---
 def matmul_acc_spec(a, b):
@@ -122,9 +122,9 @@ def matmul_acc_spec(a, b):
 
 # --- Kernel skeleton ---
 def matmul_acc_kernel(a_ref, b_ref, o_ref, acc_ref):
-    # a_ref: (tm7, tk7), b_ref: (tk7, tn7)
-    # o_ref: (tm7, tn7) — output tile
-    # acc_ref: (tm7, tn7) — scratch VMEM accumulator
+    # a_ref: (bm7, bk7), b_ref: (bk7, bn7)
+    # o_ref: (bm7, bn7) — output tile
+    # acc_ref: (bm7, bn7) — scratch VMEM accumulator
     k_i = pl.program_id(2)
     pass  # YOUR CODE HERE
     # 1. @pl.when(k_i == 0) → zero acc_ref
@@ -140,12 +140,12 @@ b7 = jax.random.normal(jax.random.key(11), (K7, N7))
 check(matmul_acc_kernel, matmul_acc_spec, (a7, b7),
       grid=(tiles_m7, tiles_n7, tiles_k7),
       in_specs=[
-          pl.BlockSpec((tm7, tk7), lambda m, n, k: (m, k)),
-          pl.BlockSpec((tk7, tn7), lambda m, n, k: (k, n)),
+          pl.BlockSpec((bm7, bk7), lambda m, n, k: (m, k)),
+          pl.BlockSpec((bk7, bn7), lambda m, n, k: (k, n)),
       ],
-      out_specs=pl.BlockSpec((tm7, tn7), lambda m, n, k: (m, n)),
+      out_specs=pl.BlockSpec((bm7, bn7), lambda m, n, k: (m, n)),
       out_shape=jax.ShapeDtypeStruct((M7, N7), jnp.float32),
-      scratch_shapes=[pltpu.VMEM((tm7, tn7), jnp.float32)])
+      scratch_shapes=[pltpu.VMEM((bm7, bn7), jnp.float32)])
 
 # %% [markdown]
 # <details><summary>💡 Hint</summary>
@@ -153,7 +153,7 @@ check(matmul_acc_kernel, matmul_acc_spec, (a7, b7),
 # ```python
 # @pl.when(k_i == 0)
 # def _zero():
-#     acc_ref[...] = jnp.zeros((tm7, tn7), dtype=jnp.float32)
+#     acc_ref[...] = jnp.zeros((bm7, bn7), dtype=jnp.float32)
 #
 # acc_ref[...] += jax.lax.dot(a_ref[...], b_ref[...])
 #
@@ -548,7 +548,7 @@ print(f"  group_ids match: {jnp.array_equal(ref3[1][:nt3], your3[1][:ynt3])}")
 # %%
 M11 = 1024
 N11 = 64
-tm11 = 128
+bm11 = 128
 G11 = 3
 
 # Group sizes that create partial tiles
@@ -556,7 +556,7 @@ group_sizes_11 = jnp.array([300, 212, 512], dtype=jnp.int32)
 
 # Pre-compute metadata using the reference function
 (group_offsets_11, group_ids_11, m_tile_ids_11), num_tiles_11 = \
-    make_group_metadata_reference(group_sizes_11, M11, tm11)
+    make_group_metadata_reference(group_sizes_11, M11, bm11)
 
 # --- Reference ---
 def masked_copy_spec(x, group_offsets, group_ids, m_tile_ids):
@@ -571,8 +571,8 @@ def masked_copy_spec(x, group_offsets, group_ids, m_tile_ids):
         tile_id = int(m_tile_ids[grid_id])
         g_start = int(group_offsets[g])
         g_end = int(group_offsets[g + 1])
-        t_start = tile_id * tm11
-        t_end = t_start + tm11
+        t_start = tile_id * bm11
+        t_end = t_start + bm11
         for row in range(t_start, t_end):
             if g_start <= row < g_end:
                 out = out.at[row].set(x[row])
@@ -582,8 +582,8 @@ def masked_copy_spec(x, group_offsets, group_ids, m_tile_ids):
 def masked_copy_kernel(group_offsets_ref, group_ids_ref, m_tile_ids_ref,
                        x_ref, o_ref):
     # group_offsets_ref, group_ids_ref, m_tile_ids_ref: metadata in SMEM
-    # x_ref: (tm11, N11) — tile of input
-    # o_ref: (tm11, N11) — tile of output
+    # x_ref: (bm11, N11) — tile of input
+    # o_ref: (bm11, N11) — tile of output
     grid_id = pl.program_id(0)
     pass  # YOUR CODE HERE
     # 1. Look up group_id = group_ids_ref[grid_id]
@@ -602,8 +602,8 @@ actual11 = pl.pallas_call(
     masked_copy_kernel,
     grid_spec=pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
-        in_specs=[pl.BlockSpec((tm11, N11), lambda i, go, gi, mt: (mt[i], 0))],
-        out_specs=pl.BlockSpec((tm11, N11), lambda i, go, gi, mt: (mt[i], 0)),
+        in_specs=[pl.BlockSpec((bm11, N11), lambda i, go, gi, mt: (mt[i], 0))],
+        out_specs=pl.BlockSpec((bm11, N11), lambda i, go, gi, mt: (mt[i], 0)),
         grid=(num_tiles_11,),
     ),
     out_shape=jax.ShapeDtypeStruct((M11, N11), jnp.float32),
@@ -628,10 +628,10 @@ else:
 # m_tile = m_tile_ids_ref[grid_id]
 # group_start = group_offsets_ref[group_id]
 # group_end = group_offsets_ref[group_id + 1]
-# tile_start = m_tile * tm11
+# tile_start = m_tile * bm11
 #
-# # Build 2D mask: (tm11, N11)
-# row_ids = tile_start + jax.lax.broadcasted_iota(jnp.int32, (tm11, N11), 0)
+# # Build 2D mask: (bm11, N11)
+# row_ids = tile_start + jax.lax.broadcasted_iota(jnp.int32, (bm11, N11), 0)
 # mask = (row_ids >= group_start) & (row_ids < group_end)
 #
 # o_ref[...] = jnp.where(mask, x_ref[...], o_ref[...])

@@ -162,16 +162,16 @@ def get_store_mask(grid_id, group_offsets, group_ids, m_tile_ids, tm, tn):
 # %%
 G12 = 4
 M12, K12, N12 = 512, 256, 128
-tm12, tk12, tn12 = 128, 128, 128
+bm12, bk12, bn12 = 128, 128, 128
 
 # Equal groups
 group_sizes_12 = jnp.array([M12 // G12] * G12, dtype=jnp.int32)
-tiles_k12 = K12 // tk12
-tiles_n12 = N12 // tn12
+tiles_k12 = K12 // bk12
+tiles_n12 = N12 // bn12
 
 # Pre-compute metadata
 (group_offsets_12, group_ids_12, m_tile_ids_12), num_tiles_12 = \
-    make_group_metadata(group_sizes_12, M12, tm12)
+    make_group_metadata(group_sizes_12, M12, bm12)
 
 # --- Reference ---
 def simple_gmm_spec(lhs, rhs, group_sizes):
@@ -188,10 +188,10 @@ def simple_gmm_kernel(group_metadata_ref, group_offset_ref,
                       lhs_ref, rhs_ref, o_ref, acc_ref):
     # group_metadata_ref: tuple of (group_offsets, group_ids, m_tile_ids) in SMEM
     # group_offset_ref: unused here (for sharding)
-    # lhs_ref: (tm12, tk12) — tile of lhs
-    # rhs_ref: (tk12, tn12) — tile of rhs (group dim squeezed by None in BlockSpec)
-    # o_ref: (tm12, tn12) — output tile
-    # acc_ref: (tm12, tn12) — scratch accumulator
+    # lhs_ref: (bm12, bk12) — tile of lhs
+    # rhs_ref: (bk12, bn12) — tile of rhs (group dim squeezed by None in BlockSpec)
+    # o_ref: (bm12, bn12) — output tile
+    # acc_ref: (bm12, bn12) — scratch accumulator
     grid_id = pl.program_id(1)
     k_i = pl.program_id(2)
 
@@ -228,12 +228,12 @@ actual12 = pl.pallas_call(
     grid_spec=pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
         in_specs=[
-            pl.BlockSpec((tm12, tk12), lhs_imap),
-            pl.BlockSpec((None, tk12, tn12), rhs_imap),
+            pl.BlockSpec((bm12, bk12), lhs_imap),
+            pl.BlockSpec((None, bk12, bn12), rhs_imap),
         ],
-        out_specs=pl.BlockSpec((tm12, tn12), out_imap),
+        out_specs=pl.BlockSpec((bm12, bn12), out_imap),
         grid=(tiles_n12, num_tiles_12, tiles_k12),
-        scratch_shapes=[pltpu.VMEM((tm12, tn12), jnp.float32)],
+        scratch_shapes=[pltpu.VMEM((bm12, bn12), jnp.float32)],
     ),
     out_shape=jax.ShapeDtypeStruct((M12, N12), jnp.float32),
     interpret=True,
@@ -253,7 +253,7 @@ else:
 # ```python
 # @pl.when(k_i == 0)
 # def _zero():
-#     acc_ref[...] = jnp.zeros((tm12, tn12), dtype=jnp.float32)
+#     acc_ref[...] = jnp.zeros((bm12, bn12), dtype=jnp.float32)
 #
 # # With None in BlockSpec, the group dim is squeezed — rhs_ref is (tk, tn)
 # acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
@@ -300,18 +300,18 @@ else:
 # %%
 G13 = 3
 M13, K13, N13 = 1024, 256, 128
-tm13, tk13, tn13 = 128, 128, 128
+bm13, bk13, bn13 = 128, 128, 128
 
 # Unequal groups!
 group_sizes_13 = jnp.array([300, 212, 512], dtype=jnp.int32)
-tiles_k13 = K13 // tk13
-tiles_n13 = N13 // tn13
+tiles_k13 = K13 // bk13
+tiles_n13 = N13 // bn13
 
 (group_offsets_13, group_ids_13, m_tile_ids_13), num_tiles_13 = \
-    make_group_metadata(group_sizes_13, M13, tm13)
+    make_group_metadata(group_sizes_13, M13, bm13)
 
 print(f"M={M13}, G={G13}, group_sizes={group_sizes_13.tolist()}")
-print(f"num_tiles={num_tiles_13} (vs {M13//tm13} base tiles)")
+print(f"num_tiles={num_tiles_13} (vs {M13//bm13} base tiles)")
 print(f"group_ids[:num_tiles]={group_ids_13[:num_tiles_13].tolist()}")
 print(f"m_tile_ids[:num_tiles]={m_tile_ids_13[:num_tiles_13].tolist()}")
 
@@ -339,7 +339,7 @@ def ragged_dot_kernel(group_metadata_ref, group_offset_ref,
     # 2. accumulate
     # 3. @pl.when(k_i == tiles_k13 - 1):
     #    mask = get_store_mask(grid_id, group_offsets, group_ids,
-    #                          m_tile_ids, tm13, tn13)
+    #                          m_tile_ids, bm13, bn13)
     #    o_ref[...] = jnp.where(mask, acc_ref[...], o_ref[...])
 
 
@@ -356,12 +356,12 @@ actual13 = pl.pallas_call(
     grid_spec=pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
         in_specs=[
-            pl.BlockSpec((tm13, tk13), lhs_imap),
-            pl.BlockSpec((None, tk13, tn13), rhs_imap),
+            pl.BlockSpec((bm13, bk13), lhs_imap),
+            pl.BlockSpec((None, bk13, bn13), rhs_imap),
         ],
-        out_specs=pl.BlockSpec((tm13, tn13), out_imap),
+        out_specs=pl.BlockSpec((bm13, bn13), out_imap),
         grid=(tiles_n13, num_tiles_13, tiles_k13),
-        scratch_shapes=[pltpu.VMEM((tm13, tn13), jnp.float32)],
+        scratch_shapes=[pltpu.VMEM((bm13, bn13), jnp.float32)],
     ),
     out_shape=jax.ShapeDtypeStruct((M13, N13), jnp.float32),
     interpret=True,
@@ -382,7 +382,7 @@ else:
 # ```python
 # @pl.when(k_i == 0)
 # def _zero():
-#     acc_ref[...] = jnp.zeros((tm13, tn13), dtype=jnp.float32)
+#     acc_ref[...] = jnp.zeros((bm13, bn13), dtype=jnp.float32)
 #
 # # None in rhs BlockSpec squeezes the group dim — rhs_ref is (tk, tn)
 # acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
@@ -390,7 +390,7 @@ else:
 # @pl.when(k_i == tiles_k13 - 1)
 # def _store():
 #     mask = get_store_mask(grid_id, group_offsets, group_ids,
-#                           m_tile_ids, tm13, tn13)
+#                           m_tile_ids, bm13, bn13)
 #     acc = acc_ref[...]
 #     o_ref[...] = jnp.where(mask, acc, o_ref[...].astype(acc.dtype))
 # ```
@@ -435,14 +435,14 @@ else:
 # %%
 G14 = 3
 M14, K14, N14 = 1024, 128, 128
-tm14, tk14, tn14 = 128, 128, 128
+bm14, bk14, bn14 = 128, 128, 128
 
 group_sizes_14 = jnp.array([384, 256, 384], dtype=jnp.int32)
-tiles_k14 = K14 // tk14
-tiles_n14 = N14 // tn14
+tiles_k14 = K14 // bk14
+tiles_n14 = N14 // bn14
 
 (group_offsets_14, group_ids_14, m_tile_ids_14), num_tiles_14 = \
-    make_group_metadata(group_sizes_14, M14, tm14, visit_empty_groups=True)
+    make_group_metadata(group_sizes_14, M14, bm14, visit_empty_groups=True)
 
 print(f"group_sizes={group_sizes_14.tolist()}, num_tiles={num_tiles_14}")
 print(f"group_ids={group_ids_14[:num_tiles_14].tolist()}")
@@ -465,10 +465,10 @@ def tgmm_spec(lhs_t, rhs, group_sizes):
 # --- Kernel skeleton ---
 def tgmm_kernel(group_metadata_ref, group_offset_ref,
                 lhs_ref, rhs_ref, o_ref, acc_ref):
-    # lhs_ref: (tm14, tk14) — tile of lhs (M, K) — note: we transpose lhs_t to (M, K)
-    # rhs_ref: (tm14, tn14) — tile of rhs
-    # o_ref: (tk14, tn14) — output tile for one group (None dim squeezed)
-    # acc_ref: (tk14, tn14) — scratch accumulator
+    # lhs_ref: (bm14, bk14) — tile of lhs (M, K) — note: we transpose lhs_t to (M, K)
+    # rhs_ref: (bm14, bn14) — tile of rhs
+    # o_ref: (bk14, bn14) — output tile for one group (None dim squeezed)
+    # acc_ref: (bk14, bn14) — scratch accumulator
     group_offsets, group_ids, m_tile_ids = group_metadata_ref
     grid_id = pl.program_id(2)  # tgmm grid: (tiles_n, tiles_k, num_tiles)
 
@@ -518,12 +518,12 @@ actual14 = pl.pallas_call(
     grid_spec=pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
         in_specs=[
-            pl.BlockSpec((tm14, tk14), tgmm_lhs_imap),
-            pl.BlockSpec((tm14, tn14), tgmm_rhs_imap),
+            pl.BlockSpec((bm14, bk14), tgmm_lhs_imap),
+            pl.BlockSpec((bm14, bn14), tgmm_rhs_imap),
         ],
-        out_specs=pl.BlockSpec((None, tk14, tn14), tgmm_out_imap),
+        out_specs=pl.BlockSpec((None, bk14, bn14), tgmm_out_imap),
         grid=(tiles_n14, tiles_k14, num_tiles_14),
-        scratch_shapes=[pltpu.VMEM((tk14, tn14), jnp.float32)],
+        scratch_shapes=[pltpu.VMEM((bk14, bn14), jnp.float32)],
     ),
     out_shape=jax.ShapeDtypeStruct((G14, K14, N14), jnp.float32),
     interpret=True,
@@ -554,15 +554,15 @@ else:
 #
 # @pl.when(is_prologue)
 # def _zero():
-#     acc_ref[...] = jnp.zeros((tk14, tn14), dtype=jnp.float32)
+#     acc_ref[...] = jnp.zeros((bk14, bn14), dtype=jnp.float32)
 #
 # @pl.when(nonzero_gs)
 # def _compute():
 #     # Mask lhs and rhs to group boundaries
 #     mask_lhs = get_store_mask(grid_id, group_offsets, group_ids,
-#                                m_tile_ids, tm14, tk14)
+#                                m_tile_ids, bm14, bk14)
 #     mask_rhs = get_store_mask(grid_id, group_offsets, group_ids,
-#                                m_tile_ids, tm14, tn14)
+#                                m_tile_ids, bm14, bn14)
 #     lhs_masked = jnp.where(mask_lhs, lhs_ref[...], 0)
 #     rhs_masked = jnp.where(mask_rhs, rhs_ref[...], 0)
 #     acc_ref[...] += jax.lax.dot(lhs_masked.T, rhs_masked)

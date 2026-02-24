@@ -160,8 +160,8 @@ check(add10_kernel, add10_spec, (x,))
 # - `block_shape`: shape of the tile each invocation sees
 # - `index_map`: function from grid indices → tile indices
 #
-# For a 1D grid: `BlockSpec((BM,), lambda i: (i,))` means "invocation `i`
-# sees slice `[i*BM : (i+1)*BM]`".
+# For a 1D grid: `BlockSpec((bm,), lambda i: (i,))` means "invocation `i`
+# sees slice `[i*bm : (i+1)*bm]`".
 #
 # ```
 # Array:  [████████ ████████ ████████ ████████]
@@ -175,7 +175,9 @@ check(add10_kernel, add10_spec, (x,))
 
 # %%
 N0 = 256
-BM = 64
+# Tile sizes follow Pallas convention: bm, bk, bn
+# (see https://docs.jax.dev/en/latest/pallas/tpu/matmul.html)
+bm = 64
 
 # --- Reference ---
 def vadd_spec(x, y):
@@ -184,7 +186,7 @@ def vadd_spec(x, y):
 
 # --- Kernel skeleton ---
 def vadd_kernel(x_ref, y_ref, o_ref):
-    # Each invocation sees a (BM,) slice thanks to BlockSpec
+    # Each invocation sees a (bm,) slice thanks to BlockSpec
     pass  # YOUR CODE HERE
 
 
@@ -193,12 +195,12 @@ x = jax.random.uniform(jax.random.key(1), (N0,))
 y = jax.random.uniform(jax.random.key(2), (N0,))
 
 check(vadd_kernel, vadd_spec, (x, y),
-      grid=(N0 // BM,),
+      grid=(N0 // bm,),
       in_specs=[
-          pl.BlockSpec((BM,), lambda i: (i,)),
-          pl.BlockSpec((BM,), lambda i: (i,)),
+          pl.BlockSpec((bm,), lambda i: (i,)),
+          pl.BlockSpec((bm,), lambda i: (i,)),
       ],
-      out_specs=pl.BlockSpec((BM,), lambda i: (i,)))
+      out_specs=pl.BlockSpec((bm,), lambda i: (i,)))
 
 # %% [markdown]
 # <details><summary>💡 Hint</summary>
@@ -220,9 +222,9 @@ check(vadd_kernel, vadd_spec, (x, y),
 # each indexed by `(i, j)`. Use `pl.program_id(0)` for `i` and
 # `pl.program_id(1)` for `j`.
 #
-# BlockSpecs for 2D: `BlockSpec((BM, BN), lambda i, j: (i, j))`
-# means "tile `(i,j)` is the block at rows `[i*BM:(i+1)*BM]`,
-# cols `[j*BN:(j+1)*BN]`".
+# BlockSpecs for 2D: `BlockSpec((bm, bn), lambda i, j: (i, j))`
+# means "tile `(i,j)` is the block at rows `[i*bm:(i+1)*bm]`,
+# cols `[j*bn:(j+1)*bn]`".
 #
 # ```
 # Matrix (128×128):
@@ -240,7 +242,7 @@ check(vadd_kernel, vadd_spec, (x, y),
 
 # %%
 M, N1 = 128, 128
-BM2, BN2 = 32, 32
+bm2, bn2 = 32, 32
 
 # --- Reference ---
 def mul2d_spec(x):
@@ -255,9 +257,9 @@ def mul2d_kernel(x_ref, o_ref):
 # %%
 x = jax.random.uniform(jax.random.key(3), (M, N1))
 check(mul2d_kernel, mul2d_spec, (x,),
-      grid=(M // BM2, N1 // BN2),
-      in_specs=[pl.BlockSpec((BM2, BN2), lambda i, j: (i, j))],
-      out_specs=pl.BlockSpec((BM2, BN2), lambda i, j: (i, j)))
+      grid=(M // bm2, N1 // bn2),
+      in_specs=[pl.BlockSpec((bm2, bn2), lambda i, j: (i, j))],
+      out_specs=pl.BlockSpec((bm2, bn2), lambda i, j: (i, j)))
 
 # %% [markdown]
 # <details><summary>💡 Hint</summary>
@@ -285,13 +287,13 @@ check(mul2d_kernel, mul2d_spec, (x,),
 # - For `b`: grid `(i, j)` → tile `(j,)` (only depends on col)
 # - For `out`: grid `(i, j)` → tile `(i, j)`
 #
-# Inside the kernel, `a_ref` has shape `(BM,)` and `b_ref` has shape `(BN,)`.
+# Inside the kernel, `a_ref` has shape `(bm,)` and `b_ref` has shape `(bn,)`.
 # You need to broadcast them: `a_ref[...][:, None] * b_ref[...][None, :]`
-# produces shape `(BM, BN)`.
+# produces shape `(bm, bn)`.
 
 # %%
 M4, N4 = 128, 64
-BM4, BN4 = 32, 32
+bm4, bn4 = 32, 32
 
 # --- Reference ---
 def outer_spec(a, b):
@@ -300,9 +302,9 @@ def outer_spec(a, b):
 
 # --- Kernel skeleton ---
 def outer_kernel(a_ref, b_ref, o_ref):
-    # a_ref: (BM4,) — one column-block of a
-    # b_ref: (BN4,) — one row-block of b
-    # o_ref: (BM4, BN4) — output tile
+    # a_ref: (bm4,) — one column-block of a
+    # b_ref: (bn4,) — one row-block of b
+    # o_ref: (bm4, bn4) — output tile
     pass  # YOUR CODE HERE
 
 
@@ -311,12 +313,12 @@ a = jax.random.uniform(jax.random.key(4), (M4,))
 b = jax.random.uniform(jax.random.key(5), (N4,))
 
 check(outer_kernel, outer_spec, (a, b),
-      grid=(M4 // BM4, N4 // BN4),
+      grid=(M4 // bm4, N4 // bn4),
       in_specs=[
-          pl.BlockSpec((BM4,), lambda i, j: (i,)),
-          pl.BlockSpec((BN4,), lambda i, j: (j,)),
+          pl.BlockSpec((bm4,), lambda i, j: (i,)),
+          pl.BlockSpec((bn4,), lambda i, j: (j,)),
       ],
-      out_specs=pl.BlockSpec((BM4, BN4), lambda i, j: (i, j)),
+      out_specs=pl.BlockSpec((bm4, bn4), lambda i, j: (i, j)),
       out_shape=jax.ShapeDtypeStruct((M4, N4), jnp.float32))
 
 # %% [markdown]
@@ -346,9 +348,9 @@ check(outer_kernel, outer_spec, (a, b),
 # ```
 # x: (ROWS, COLS)
 #     ┌──────┬──────┬──────┬──────┐
-# r=0 │ k=0  │ k=1  │ k=2  │ k=3  │  → sum → out[0:BR]
+# r=0 │ k=0  │ k=1  │ k=2  │ k=3  │  → sum → out[0:bm5]
 #     ├──────┼──────┼──────┼──────┤
-# r=1 │ k=0  │ k=1  │ k=2  │ k=3  │  → sum → out[BR:2*BR]
+# r=1 │ k=0  │ k=1  │ k=2  │ k=3  │  → sum → out[bm5:2*bm5]
 #     └──────┴──────┴──────┴──────┘
 # ```
 #
@@ -358,8 +360,8 @@ check(outer_kernel, outer_spec, (a, b),
 
 # %%
 ROWS, COLS = 16, 256
-BR, BK = 16, 64  # row block, K block
-tiles_k = COLS // BK
+bm5, bk5 = 16, 64  # row block, K block
+tiles_k = COLS // bk5
 
 # --- Reference ---
 def rowsum_spec(x):
@@ -368,9 +370,9 @@ def rowsum_spec(x):
 
 # --- Kernel skeleton ---
 def rowsum_kernel(x_ref, o_ref):
-    # x_ref: (BR, BK) — one tile of x
-    # o_ref: (BR,) — accumulator for this row block
-    # Grid: (ROWS // BR, COLS // BK) — iterates (row_block, k_block)
+    # x_ref: (bm5, bk5) — one tile of x
+    # o_ref: (bm5,) — accumulator for this row block
+    # Grid: (ROWS // bm5, COLS // bk5) — iterates (row_block, k_block)
     k_i = pl.program_id(1)
     pass  # YOUR CODE HERE
     # 1. On first k tile (k_i == 0), zero the output
@@ -380,9 +382,9 @@ def rowsum_kernel(x_ref, o_ref):
 # %%
 x = jax.random.uniform(jax.random.key(6), (ROWS, COLS))
 check(rowsum_kernel, rowsum_spec, (x,),
-      grid=(ROWS // BR, tiles_k),
-      in_specs=[pl.BlockSpec((BR, BK), lambda i, k: (i, k))],
-      out_specs=pl.BlockSpec((BR,), lambda i, k: (i,)),
+      grid=(ROWS // bm5, tiles_k),
+      in_specs=[pl.BlockSpec((bm5, bk5), lambda i, k: (i, k))],
+      out_specs=pl.BlockSpec((bm5,), lambda i, k: (i,)),
       out_shape=jax.ShapeDtypeStruct((ROWS,), jnp.float32))
 
 # %% [markdown]
@@ -391,7 +393,7 @@ check(rowsum_kernel, rowsum_spec, (x,),
 # ```python
 # @pl.when(k_i == 0)
 # def _zero():
-#     o_ref[...] = jnp.zeros(BR, dtype=jnp.float32)
+#     o_ref[...] = jnp.zeros(bm5, dtype=jnp.float32)
 #
 # o_ref[...] += x_ref[...].sum(axis=1)
 # ```
@@ -428,7 +430,7 @@ check(rowsum_kernel, rowsum_spec, (x,),
 # ```
 # A: (M, K)          B: (K, N)          C: (M, N)
 # ┌──┬──┐            ┌──┬──┐            ┌──┬──┐
-# │  │  │  tm×tk     │  │  │  tk×tn     │  │  │  tm×tn
+# │  │  │  bm6×bk6     │  │  │  bk6×bn6     │  │  │  bm6×bn6
 # ├──┼──┤     ×      ├──┼──┤     =      ├──┼──┤
 # │  │  │            │  │  │            │  │  │
 # └──┴──┘            └──┴──┘            └──┴──┘
@@ -438,10 +440,10 @@ check(rowsum_kernel, rowsum_spec, (x,),
 
 # %%
 M6, K6, N6 = 128, 256, 128
-tm, tk, tn = 64, 128, 64
-tiles_m6 = M6 // tm
-tiles_n6 = N6 // tn
-tiles_k6 = K6 // tk
+bm6, bk6, bn6 = 64, 128, 64
+tiles_m = M6 // bm6
+tiles_n = N6 // bn6
+tiles_k = K6 // bk6
 
 # --- Reference ---
 def matmul_spec(a, b):
@@ -450,15 +452,15 @@ def matmul_spec(a, b):
 
 # --- Kernel skeleton ---
 def matmul_kernel(a_ref, b_ref, o_ref, acc_ref):
-    # a_ref: (tm, tk) — tile of A
-    # b_ref: (tk, tn) — tile of B
-    # o_ref: (tm, tn) — output tile
-    # acc_ref: (tm, tn) — scratch accumulator (VMEM on TPU)
+    # a_ref: (bm6, bk6) — tile of A
+    # b_ref: (bk6, bn6) — tile of B
+    # o_ref: (bm6, bn6) — output tile
+    # acc_ref: (bm6, bn6) — scratch accumulator (VMEM on TPU)
     k_i = pl.program_id(2)
     pass  # YOUR CODE HERE
     # 1. Zero acc_ref when k_i == 0
     # 2. Accumulate: acc_ref[...] += a_tile @ b_tile
-    # 3. Store acc_ref → o_ref when k_i == tiles_k6 - 1
+    # 3. Store acc_ref → o_ref when k_i == tiles_k - 1
 
 
 # %%
@@ -466,14 +468,14 @@ a = jax.random.normal(jax.random.key(7), (M6, K6))
 b = jax.random.normal(jax.random.key(8), (K6, N6))
 
 check(matmul_kernel, matmul_spec, (a, b),
-      grid=(tiles_m6, tiles_n6, tiles_k6),
+      grid=(tiles_m, tiles_n, tiles_k),
       in_specs=[
-          pl.BlockSpec((tm, tk), lambda m, n, k: (m, k)),
-          pl.BlockSpec((tk, tn), lambda m, n, k: (k, n)),
+          pl.BlockSpec((bm6, bk6), lambda m, n, k: (m, k)),
+          pl.BlockSpec((bk6, bn6), lambda m, n, k: (k, n)),
       ],
-      out_specs=pl.BlockSpec((tm, tn), lambda m, n, k: (m, n)),
+      out_specs=pl.BlockSpec((bm6, bn6), lambda m, n, k: (m, n)),
       out_shape=jax.ShapeDtypeStruct((M6, N6), jnp.float32),
-      scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)])
+      scratch_shapes=[pltpu.VMEM((bm6, bn6), jnp.float32)])
 
 # %% [markdown]
 # <details><summary>💡 Hint</summary>
@@ -481,11 +483,11 @@ check(matmul_kernel, matmul_spec, (a, b),
 # ```python
 # @pl.when(k_i == 0)
 # def _zero():
-#     acc_ref[...] = jnp.zeros((tm, tn), dtype=jnp.float32)
+#     acc_ref[...] = jnp.zeros((bm6, bn6), dtype=jnp.float32)
 #
 # acc_ref[...] += jax.lax.dot(a_ref[...], b_ref[...])
 #
-# @pl.when(k_i == tiles_k6 - 1)
+# @pl.when(k_i == tiles_k - 1)
 # def _store():
 #     o_ref[...] = acc_ref[...]
 # ```
