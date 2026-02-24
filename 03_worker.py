@@ -8,9 +8,14 @@
 #   kernelspec:
 #     display_name: Python 3
 #     name: python3
+#   accelerator: TPU
+#   colab:
+#     gpuType: V6E
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/03_worker.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 03 — Hyperparameter Sweep Worker (wandb)
 #
 # wandb-coordinated hyperparameter sweep for tpuchat.

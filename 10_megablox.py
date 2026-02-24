@@ -8,10 +8,15 @@
 #   kernelspec:
 #     display_name: Python 3
 #     name: python3
+#   accelerator: TPU
+#   colab:
+#     gpuType: V6E
 # ---
 
 # %% [markdown]
-# # 10 — MegaBlox: Dropless MoE with Grouped Matrix Multiplication (rev 4)
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10_megablox.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
+# # 10 — MegaBlox: Dropless MoE with Grouped Matrix Multiplication (rev 6)
 #
 # This notebook builds up **dropless Mixture of Experts** step by step, from
 # the fundamental grouped matrix multiplication (GMM) operation to a full
@@ -66,7 +71,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-REVISION = 4
+REVISION = 6
 
 ON_TPU = any('TPU' in d.device_kind for d in jax.devices())
 

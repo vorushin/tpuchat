@@ -12,6 +12,8 @@
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/01_tokenizer.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 01 — Train BPE Tokenizer
 #
 # Self-contained notebook that:

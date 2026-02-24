@@ -8,9 +8,14 @@
 #   kernelspec:
 #     display_name: Python 3
 #     name: python3
+#   accelerator: TPU
+#   colab:
+#     gpuType: V6E
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/05_tpu_perf.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 05 — TPU v6e Performance Lab
 #
 # Standalone notebook that progressively builds a modern transformer and

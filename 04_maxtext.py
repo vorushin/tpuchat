@@ -8,9 +8,14 @@
 #   kernelspec:
 #     display_name: Python 3
 #     name: python3
+#   accelerator: TPU
+#   colab:
+#     gpuType: V6E
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/04_maxtext.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 04 — MaxText-inspired GPT (~370M params)
 #
 # Self-contained notebook that:
