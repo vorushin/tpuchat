@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 12)
+# # 09 — MoE Training Lab (rev 14)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 12
+REVISION = 14
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -350,7 +350,7 @@ class Config:
     # ── MoE ────────────────────────────────────────────────────
     n_experts: int = 8              # number of routed experts
     n_active_experts: int = 2       # top-k experts activated per token
-    expert_mlp_dim: int = 512       # per-expert FFN hidden dim (ReLU²)
+    expert_mlp_dim: int = 2048      # per-expert FFN hidden dim (ReLU²)
     capacity_factor: float = 1.25   # expert buffer headroom (1.0 = exact, 1.25 = 25% extra)
     aux_loss_alpha: float = 0.01    # load balancing loss coefficient
     z_loss_alpha: float = 1e-4      # router z-loss coefficient
@@ -768,12 +768,12 @@ LOG_DIR = '/content/log_dir'
 params = init_full_model(config, seed=config.param_seed)
 total_p = count_params(params)
 non_embed_p = count_non_embed_params(params)
-# Active params: all non-expert params + K/E fraction of expert params
+# Active non-embed: non-embed params minus inactive expert params
 expert_params_per_layer = config.n_experts * (2 * config.n_embd * config.expert_mlp_dim)
 inactive_expert_p = config.n_layer * expert_params_per_layer * (config.n_experts - config.n_active_experts) / config.n_experts
-active_p = total_p - int(inactive_expert_p)
+active_non_embed_p = non_embed_p - int(inactive_expert_p)
 print(f'Params: {total_p/1e6:.1f}M total, {non_embed_p/1e6:.1f}M non-embed, '
-      f'{active_p/1e6:.1f}M active')
+      f'{active_non_embed_p/1e6:.1f}M active non-embed')
 print(f'Batch: {config.batch_size} x {config.seq_len} = '
       f'{config.batch_size * config.seq_len:,} tokens/step')
 
@@ -887,7 +887,7 @@ sweep_config = {
     "metric": {"goal": "minimize", "name": "val_loss"},
     "parameters": {
         "learning_rate": {"distribution": "log_uniform_values",
-                          "min": 8e-4, "max": 1e-2},
+                          "min": 5e-4, "max": 1e-2},
     },
 }
 
@@ -991,7 +991,7 @@ def sweep_train_fn():
 
 sweep_id = SWEEP_ID or wandb.sweep(sweep_config, project=SWEEP_PROJECT)
 print(f"{'Continuing' if SWEEP_ID else 'New'} sweep: {sweep_id}")
-wandb.agent(sweep_id, function=sweep_train_fn, count=5, project=SWEEP_PROJECT)
+wandb.agent(sweep_id, function=sweep_train_fn, count=10, project=SWEEP_PROJECT)
 
 # --- Disconnect runtime to stop billing ---
 from google.colab import runtime
