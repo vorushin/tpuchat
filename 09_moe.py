@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 11)
+# # 09 — MoE Training Lab (rev 12)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 11
+REVISION = 12
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -887,7 +887,7 @@ sweep_config = {
     "metric": {"goal": "minimize", "name": "val_loss"},
     "parameters": {
         "learning_rate": {"distribution": "log_uniform_values",
-                          "min": 5e-5, "max": 1e-3},
+                          "min": 8e-4, "max": 1e-2},
     },
 }
 
