@@ -16,7 +16,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 08 — TPU Ablation Lab (rev 36)
+# # 08 — TPU Ablation Lab (rev 37)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-v6e-50usd).
@@ -83,7 +83,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 36
+REVISION = 37
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -959,11 +959,18 @@ def sweep_train_fn():
                 print(f'step {step:05d}/{SWEEP_STEPS} | loss: {debiased_loss:.4f} '
                       f'| tok/s: {tok_per_sec:,}')
 
+    except Exception as e:
+        import traceback
+        print(f"\nSweep run crashed at step {step}: {e}")
+        print(traceback.format_exc())
+        raise
     finally:
-        # Stop prefetch thread so it doesn't linger between sweep runs
         train_loader.stop()
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
-    wandb.finish()
     print(f'Run complete. Best val loss: {best_val_loss:.4f}')
 
 
@@ -1034,8 +1041,41 @@ fig.show()
 import wandb
 from google.colab import userdata
 
-SAVE_CHECKPOINTS = False   # save params to disk every 50k steps
+RESUME_CHECKPOINT = ''  # set to e.g. 'checkpoint_08_rev12' to resume from HF
+CHECKPOINT_EVERY = 5_000
 CHECKPOINT_DIR = '/content/checkpoints'
+
+
+def save_checkpoint_to_hf(params, opt_state, config, step, best_val_loss,
+                          total_training_time, revision, hf_repo_id, notebook_id):
+    """Save training state to HF Hub. Survives Colab preemption."""
+    import json
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    params_np = jax.tree.map(
+        lambda x: np.array(x) if isinstance(x, jax.Array) else x, params)
+    with open(os.path.join(CHECKPOINT_DIR, 'params.pkl'), 'wb') as f:
+        pickle.dump(params_np, f)
+    opt_state_np = jax.tree.map(
+        lambda x: np.array(x) if isinstance(x, jax.Array) else x, opt_state)
+    with open(os.path.join(CHECKPOINT_DIR, 'opt_state.pkl'), 'wb') as f:
+        pickle.dump(opt_state_np, f)
+    config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith('_')}
+    config_dict['revision'] = revision
+    config_dict['best_val_loss'] = best_val_loss
+    config_dict['checkpoint_step'] = step
+    config_dict['total_training_time_hours'] = round(total_training_time / 3600, 2)
+    with open(os.path.join(CHECKPOINT_DIR, 'config.json'), 'w') as f:
+        json.dump(config_dict, f, indent=2, default=str)
+    from huggingface_hub import HfApi
+    api = HfApi()
+    api.create_repo(hf_repo_id, repo_type='model', exist_ok=True)
+    ckpt_name = f'checkpoint_{notebook_id}_rev{revision}'
+    api.upload_folder(
+        folder_path=CHECKPOINT_DIR, repo_id=hf_repo_id, path_in_repo=ckpt_name,
+        commit_message=f'{notebook_id} step {step}: val_loss={best_val_loss:.4f}',
+    )
+    print(f'  Checkpoint uploaded to HF: {ckpt_name} (step {step})')
+
 
 # Compute steps from tok/param ratio
 hero_config = Config()
@@ -1055,8 +1095,29 @@ print(f'Estimated time: {HERO_STEPS * 0.302 / 3600:.1f} hours (at ~302ms/step, 1
 
 # Init optimizer
 hero_opt = make_optimizer(hero_config, HERO_STEPS)
-opt_state = hero_opt.init(hero_params)
 hero_train_step = make_train_step(hero_opt)
+
+# Resume from HF checkpoint or start fresh
+start_step = 0
+if RESUME_CHECKPOINT:
+    from huggingface_hub import hf_hub_download
+    import json as _json
+    _p = hf_hub_download(HF_REPO_ID, f"{RESUME_CHECKPOINT}/params.pkl")
+    _o = hf_hub_download(HF_REPO_ID, f"{RESUME_CHECKPOINT}/opt_state.pkl")
+    _c = hf_hub_download(HF_REPO_ID, f"{RESUME_CHECKPOINT}/config.json")
+    with open(_p, 'rb') as f:
+        params = jax.tree.map(jnp.array, pickle.load(f))
+    with open(_o, 'rb') as f:
+        opt_state = jax.tree.map(jnp.array, pickle.load(f))
+    with open(_c) as f:
+        _meta = _json.load(f)
+    start_step = _meta['checkpoint_step']
+    best_val_loss = _meta.get('best_val_loss', float('inf'))
+    print(f'Resumed from {RESUME_CHECKPOINT} at step {start_step}, '
+          f'best val loss: {best_val_loss:.4f}')
+else:
+    params = hero_params
+    opt_state = hero_opt.init(hero_params)
 
 # Data
 raw_train = tokenize_shards(train_shard_indices, hero_config.batch_size, hero_config.seq_len)
@@ -1089,18 +1150,35 @@ wandb.define_metric("val/loss", step_metric="step")
 
 smooth_loss = 0.0
 debiased_loss = 0.0
-best_val_loss = float('inf')
+if not RESUME_CHECKPOINT:
+    best_val_loss = float('inf')
 total_training_time = 0.0
-params = hero_params
 
-if SAVE_CHECKPOINTS:
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+# SIGTERM handler — Colab sends SIGTERM before preempting TPU runtimes
+import signal
+_sigterm_received = False
+def _sigterm_handler(signum, frame):
+    global _sigterm_received
+    _sigterm_received = True
+    print(f"\nSIGTERM received — Colab is preempting this runtime")
+signal.signal(signal.SIGTERM, _sigterm_handler)
 
-print(f'\n=== Hero Run: {HERO_STEPS:,} steps ===\n')
+print(f'\n=== Hero Run: {HERO_STEPS:,} steps (starting from {start_step}) ===\n')
 
 try:
-    for step in range(HERO_STEPS + 1):
+    for step in range(start_step, HERO_STEPS + 1):
         last_step = (step == HERO_STEPS)
+
+        # --- SIGTERM check (Colab preemption) ---
+        if _sigterm_received:
+            print("Saving checkpoint before SIGTERM exit...")
+            try:
+                save_checkpoint_to_hf(params, opt_state, hero_config, step,
+                                      best_val_loss, total_training_time,
+                                      REVISION, HF_REPO_ID, '08')
+            except Exception as ckpt_err:
+                print(f"Checkpoint save failed: {ckpt_err}")
+            break
 
         # --- Eval ---
         if step % HERO_EVAL_EVERY == 0 or last_step:
@@ -1122,15 +1200,11 @@ try:
             print(f'step {step:06d}/{HERO_STEPS} | Val loss: {avg_val_loss:.4f} '
                   f'(best: {best_val_loss:.4f})')
 
-        # --- Checkpoint ---
-        if SAVE_CHECKPOINTS and step > 0 and step % 50_000 == 0:
-            import pickle as pkl
-            ckpt_path = os.path.join(CHECKPOINT_DIR, f'params_step{step}.pkl')
-            params_np = jax.tree.map(
-                lambda x: np.array(x) if isinstance(x, jax.Array) else x, params)
-            with open(ckpt_path, 'wb') as f:
-                pkl.dump(params_np, f)
-            print(f'  Checkpoint saved: {ckpt_path}')
+        # --- Checkpoint to HF Hub ---
+        if step > 0 and step % CHECKPOINT_EVERY == 0:
+            save_checkpoint_to_hf(params, opt_state, hero_config, step,
+                                  best_val_loss, total_training_time,
+                                  REVISION, HF_REPO_ID, '08')
 
         if last_step:
             break
@@ -1171,10 +1245,25 @@ try:
                   f'loss: {debiased_loss:.4f} | MFU: {mfu_pct:.1f}% | '
                   f'tok/s: {tok_per_sec:,}{eta}')
 
+except Exception as e:
+    import traceback
+    print(f"\nHERO RUN CRASHED at step {step}: {e}")
+    print(traceback.format_exc())
+    try:
+        wandb.log({"step": step, "error": type(e).__name__})
+        wandb.alert(title=f"Hero run crashed at step {step}",
+                    text=f"{type(e).__name__}: {e}\n\nLast loss: {debiased_loss:.4f}",
+                    level=wandb.AlertLevel.ERROR)
+    except Exception:
+        pass
+    raise
 finally:
     train_loader.stop()
+    try:
+        wandb.finish()
+    except Exception:
+        pass
 
-wandb.finish()
 print(f'\nHero run complete. Best val loss: {best_val_loss:.4f}')
 print(f'Total training time: {total_training_time/3600:.1f}h')
 
@@ -1185,37 +1274,10 @@ for prompt in ['The capital of France is', 'In a distant galaxy, scientists disc
     text = generate(hero_config, params, enc, prompt, max_new_tokens=100)
     print(f'Prompt: {prompt}\nOutput: {text}\n')
 
-# --- Upload checkpoint to HF Hub ---
-import json
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-params_np = jax.tree.map(
-    lambda x: np.array(x) if isinstance(x, jax.Array) else x, params)
-with open(os.path.join(CHECKPOINT_DIR, 'params.pkl'), 'wb') as f:
-    pickle.dump(params_np, f)
-
-config_dict = {k: v for k, v in hero_config.__dict__.items()
-               if not k.startswith('_')}
-config_dict['revision'] = REVISION
-config_dict['best_val_loss'] = best_val_loss
-config_dict['total_steps'] = HERO_STEPS
-config_dict['total_training_time_hours'] = round(total_training_time / 3600, 2)
-with open(os.path.join(CHECKPOINT_DIR, 'config.json'), 'w') as f:
-    json.dump(config_dict, f, indent=2, default=str)
-
-from huggingface_hub import HfApi
-api = HfApi()
-api.create_repo(HF_REPO_ID, repo_type='model', exist_ok=True)
-ckpt_name = f'checkpoint_08_rev{REVISION}'
-api.upload_folder(
-    folder_path=CHECKPOINT_DIR,
-    repo_id=HF_REPO_ID,
-    path_in_repo=ckpt_name,
-    commit_message=f'08 ablation hero run rev{REVISION}: '
-                   f'val_loss={best_val_loss:.4f}, {HERO_STEPS} steps',
-)
-print(f'\nUploaded to https://huggingface.co/{HF_REPO_ID}/tree/main/{ckpt_name}')
+# --- Final checkpoint upload to HF Hub ---
+save_checkpoint_to_hf(params, opt_state, hero_config, HERO_STEPS,
+                      best_val_loss, total_training_time,
+                      REVISION, HF_REPO_ID, '08')
 
 # --- Disconnect runtime to stop billing ---
 from google.colab import runtime
