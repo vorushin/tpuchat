@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Local development
+
+Use `uv` for Python package management. Run scripts with `uv run` (e.g. `uv run python script.py`).
+
 ## Project overview
 
 **tpuchat** is a JAX-native GPT pretraining harness for a single Colab Pro+ TPU v6e (32 GB HBM). Port of Karpathy's NanoChat — raw JAX, no Flax/Orbax.

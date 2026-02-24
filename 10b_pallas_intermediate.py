@@ -181,8 +181,8 @@ check(matmul_acc_kernel, matmul_acc_spec, (a7, b7),
 # **`None` vs integer in block_shape**: Using `None` means "load the entire
 # axis and **squeeze** that dimension". The ref will NOT have that dim.
 # Using an integer (e.g. `1`) means "load 1 element" — the ref keeps that
-# dim with size 1. For a batch dim we typically want to keep the dim, so
-# we use `1`.
+# dim with size 1. For a batch dim, `None` is convenient — the kernel
+# sees simple 2D shapes like `(M, K)` instead of `(1, M, K)`.
 #
 # This is the precursor to ragged_dot, where different row-ranges of a
 # single LHS matrix are multiplied by different group weight matrices.
@@ -414,75 +414,181 @@ def make_group_metadata_reference(group_sizes, m, tm):
     return (group_offsets.astype(jnp.int32), group_ids, m_tile_ids), num_tiles
 
 
-# --- Your implementation ---
+# %% [markdown]
+# ### Your implementation — decomposed into 5 testable steps
+#
+# We break `make_group_metadata` into independent functions,
+# each tested before combining them.
+
+# %%
+# --- Step 1: Group offsets (CSR-style prefix sum) ---
+def compute_group_offsets(group_sizes):
+    """[0, cumsum(group_sizes)] — maps group id → start row."""
+    return jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(group_sizes)])
+
+# Test
+assert jnp.array_equal(
+    compute_group_offsets(jnp.array([256, 256, 256, 256], dtype=jnp.int32)),
+    jnp.array([0, 256, 512, 768, 1024], dtype=jnp.int32))
+assert jnp.array_equal(
+    compute_group_offsets(jnp.array([300, 212, 512], dtype=jnp.int32)),
+    jnp.array([0, 300, 512, 1024], dtype=jnp.int32))
+assert jnp.array_equal(
+    compute_group_offsets(jnp.array([512, 0, 512], dtype=jnp.int32)),
+    jnp.array([0, 512, 512, 1024], dtype=jnp.int32))
+print("Step 1 — compute_group_offsets: PASSED ✓")
+
+
+# %% [markdown]
+# **Step 2 — Tiles per group.** Round group starts DOWN and ends UP to
+# tile boundaries. Group 0 (rows 0–299, tm=128): rounded [0, 384) → 3 tiles.
+# Group 1 (rows 300–511): rounded [256, 512) → 2 tiles. Total 3+2+4 = 9 > 8
+# physical tiles — tile 2 is counted by both g0 and g1.
+
+# %%
+def compute_group_tiles(group_sizes, group_offsets, tm):
+    """Number of tile visits per group (boundary tiles counted by both neighbors)."""
+    group_starts = group_offsets[:-1]
+    group_ends = group_offsets[1:]
+    rounded_starts = (group_starts // tm * tm).astype(jnp.int32)
+    rounded_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
+    rounded_sizes = jnp.where(group_sizes == 0, 0, rounded_ends - rounded_starts)
+    return rounded_sizes // tm
+
+# Test — aligned groups: 256/128 = 2 tiles each, no sharing
+assert jnp.array_equal(
+    compute_group_tiles(jnp.array([256, 256, 256, 256], dtype=jnp.int32),
+                        jnp.array([0, 256, 512, 768, 1024], dtype=jnp.int32), 128),
+    jnp.array([2, 2, 2, 2]))
+# Test — unaligned: g0 gets 3, g1 gets 2, g2 gets 4
+assert jnp.array_equal(
+    compute_group_tiles(jnp.array([300, 212, 512], dtype=jnp.int32),
+                        jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 128),
+    jnp.array([3, 2, 4]))
+# Test — zero-size group gets 0 tiles
+assert jnp.array_equal(
+    compute_group_tiles(jnp.array([512, 0, 512], dtype=jnp.int32),
+                        jnp.array([0, 512, 512, 1024], dtype=jnp.int32), 128),
+    jnp.array([4, 0, 4]))
+print("Step 2 — compute_group_tiles: PASSED ✓")
+
+
+# %% [markdown]
+# **Step 3 — Group IDs.** Expand `group_tiles` into a flat mapping:
+# `[3, 2, 4]` → `[0,0,0, 1,1, 2,2,2,2]`.
+
+# %%
+def compute_group_ids(group_tiles, num_groups, max_len):
+    """Flat array mapping grid index → group id."""
+    return jnp.repeat(
+        jnp.arange(num_groups, dtype=jnp.int32),
+        group_tiles,
+        total_repeat_length=max_len,
+    )
+
+# Test
+assert compute_group_ids(jnp.array([2, 2, 2, 2]), 4, 11)[:8].tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
+assert compute_group_ids(jnp.array([3, 2, 4]), 3, 10)[:9].tolist() == [0, 0, 0, 1, 1, 2, 2, 2, 2]
+print("Step 3 — compute_group_ids: PASSED ✓")
+
+
+# %% [markdown]
+# **Step 4 — Tile visits.** Each tile is visited once by default. A group
+# boundary falling *inside* a tile adds an extra visit. Detect this by
+# checking `group_offsets[g] % tm != 0` (non-aligned start).
+
+# %%
+def compute_tile_visits(group_sizes, group_offsets, tiles_m, tm):
+    """Visit count per tile (1 + extra for each mid-tile group boundary)."""
+    group_starts = group_offsets[:-1]
+    aligned_or_empty = ((group_starts % tm) == 0) | (group_sizes == 0)
+    partial_tile_ids = jnp.where(aligned_or_empty, tiles_m, group_starts // tm)
+    extra_visits = jnp.histogram(
+        partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1)
+    )[0]
+    return (extra_visits + 1).astype(jnp.int32)
+
+# Test — aligned: all visits = 1
+assert compute_tile_visits(
+    jnp.array([256, 256, 256, 256], dtype=jnp.int32),
+    jnp.array([0, 256, 512, 768, 1024], dtype=jnp.int32), 8, 128
+).tolist() == [1, 1, 1, 1, 1, 1, 1, 1]
+# Test — unaligned: tile 2 (rows 256-383) visited twice
+assert compute_tile_visits(
+    jnp.array([300, 212, 512], dtype=jnp.int32),
+    jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 8, 128
+).tolist() == [1, 1, 2, 1, 1, 1, 1, 1]
+# Test — zero-size group: no extra visits
+assert compute_tile_visits(
+    jnp.array([512, 0, 512], dtype=jnp.int32),
+    jnp.array([0, 512, 512, 1024], dtype=jnp.int32), 8, 128
+).tolist() == [1, 1, 1, 1, 1, 1, 1, 1]
+print("Step 4 — compute_tile_visits: PASSED ✓")
+
+
+# %% [markdown]
+# **Step 5 — M-tile IDs.** Expand `tile_visits` into a flat mapping:
+# `[1,1,2,1,1,1,1,1]` → `[0,1,2,2,3,4,5,6,7]` — tile 2 appears twice.
+
+# %%
+def compute_m_tile_ids(tile_visits, tiles_m, max_len):
+    """Flat array mapping grid index → m-tile id."""
+    return jnp.repeat(
+        jnp.arange(tiles_m, dtype=jnp.int32),
+        tile_visits,
+        total_repeat_length=max_len,
+    )
+
+# Test
+assert compute_m_tile_ids(jnp.array([1,1,1,1,1,1,1,1]), 8, 11)[:8].tolist() == [0,1,2,3,4,5,6,7]
+assert compute_m_tile_ids(jnp.array([1,1,2,1,1,1,1,1]), 8, 10)[:9].tolist() == [0,1,2,2,3,4,5,6,7]
+print("Step 5 — compute_m_tile_ids: PASSED ✓")
+
+
+# %% [markdown]
+# ### Combined: `make_group_metadata`
+
+# %%
 def make_group_metadata(group_sizes, m, tm):
-    """Vectorized group metadata computation.
-
-    Args:
-        group_sizes: jnp.array of shape (num_groups,), dtype int32
-        m: total number of rows
-        tm: tile size for m dimension
-
-    Returns:
-        (group_offsets, group_ids, m_tile_ids), num_tiles
-    """
+    """Vectorized group metadata — chains the 5 steps above."""
     num_groups = group_sizes.shape[0]
     tiles_m = m // tm
+    max_len = tiles_m + num_groups - 1
 
-    # Step 1: Compute group_offsets (CSR-style)
-    group_ends = jnp.cumsum(group_sizes)
-    group_offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends])
-
-    # Step 2: Compute tiles per group, accounting for partial tiles
-    pass  # YOUR CODE HERE
-    # Hint: Round group_ends UP to nearest tm, group_starts DOWN to nearest tm
-    # Then: group_tiles = (rounded_end - rounded_start) // tm
-    # Handle zero-sized groups specially
-
-    # Step 3: Build group_ids via jnp.repeat
-    pass  # YOUR CODE HERE
-    # group_ids = jnp.repeat(jnp.arange(num_groups), group_tiles,
-    #                        total_repeat_length=tiles_m + num_groups - 1)
-
-    # Step 4: Build m_tile_ids via tile visit counting
-    pass  # YOUR CODE HERE
-    # Count how many times each tile is visited, then repeat tile indices
-
-    # Step 5: Compute num_tiles
-    pass  # YOUR CODE HERE
+    group_offsets = compute_group_offsets(group_sizes)
+    group_tiles = compute_group_tiles(group_sizes, group_offsets, tm)
+    group_ids = compute_group_ids(group_tiles, num_groups, max_len)
+    tile_visits = compute_tile_visits(group_sizes, group_offsets, tiles_m, tm)
+    m_tile_ids = compute_m_tile_ids(tile_visits, tiles_m, max_len)
+    num_tiles = int(group_tiles.sum())
 
     return (group_offsets, group_ids, m_tile_ids), num_tiles
 
 
 # %%
-# Test cases
-print("=== Test 1: Equal groups, tile-aligned ===")
-gs1 = jnp.array([256, 256, 256, 256], dtype=jnp.int32)
-ref1, nt1 = make_group_metadata_reference(gs1, 1024, 128)
-your1, ynt1 = make_group_metadata(gs1, 1024, 128)
+# Integration tests — compare against reference
+def check_metadata(name, group_sizes, m, tm):
+    ref, ref_nt = make_group_metadata_reference(group_sizes, m, tm)
+    yours, your_nt = make_group_metadata(group_sizes, m, tm)
+    ok = (ref_nt == your_nt
+          and bool(jnp.array_equal(ref[0], yours[0]))
+          and bool(jnp.array_equal(ref[1][:ref_nt], yours[1][:your_nt]))
+          and bool(jnp.array_equal(ref[2][:ref_nt], yours[2][:your_nt])))
+    status = "PASSED ✓" if ok else "FAILED ✗"
+    print(f"  {name}: {status}  (num_tiles: ref={ref_nt}, yours={your_nt})")
+    if not ok:
+        print(f"    group_ids ref:   {ref[1][:ref_nt].tolist()}")
+        print(f"    group_ids yours: {yours[1][:your_nt].tolist()}")
+        print(f"    m_tile_ids ref:   {ref[2][:ref_nt].tolist()}")
+        print(f"    m_tile_ids yours: {yours[2][:your_nt].tolist()}")
 
-print(f"  num_tiles: ref={nt1}, yours={ynt1}")
-print(f"  group_ids match: {jnp.array_equal(ref1[1][:nt1], your1[1][:ynt1])}")
-print(f"  m_tile_ids match: {jnp.array_equal(ref1[2][:nt1], your1[2][:ynt1])}")
-
-print("\n=== Test 2: Unequal groups with partial tiles ===")
-gs2 = jnp.array([300, 212, 512], dtype=jnp.int32)
-ref2, nt2 = make_group_metadata_reference(gs2, 1024, 128)
-your2, ynt2 = make_group_metadata(gs2, 1024, 128)
-
-print(f"  num_tiles: ref={nt2}, yours={ynt2}")
-print(f"  group_ids[:num_tiles]:  ref={ref2[1][:nt2].tolist()}")
-print(f"  group_ids[:num_tiles]:  yours={your2[1][:ynt2].tolist()}")
-print(f"  m_tile_ids[:num_tiles]: ref={ref2[2][:nt2].tolist()}")
-print(f"  m_tile_ids[:num_tiles]: yours={your2[2][:ynt2].tolist()}")
-
-print("\n=== Test 3: Groups with zero sizes ===")
-gs3 = jnp.array([512, 0, 512], dtype=jnp.int32)
-ref3, nt3 = make_group_metadata_reference(gs3, 1024, 128)
-your3, ynt3 = make_group_metadata(gs3, 1024, 128)
-
-print(f"  num_tiles: ref={nt3}, yours={ynt3}")
-print(f"  group_ids match: {jnp.array_equal(ref3[1][:nt3], your3[1][:ynt3])}")
+print("=== Integration tests ===")
+check_metadata("Aligned groups",
+               jnp.array([256, 256, 256, 256], dtype=jnp.int32), 1024, 128)
+check_metadata("Unaligned groups",
+               jnp.array([300, 212, 512], dtype=jnp.int32), 1024, 128)
+check_metadata("Zero-size group",
+               jnp.array([512, 0, 512], dtype=jnp.int32), 1024, 128)
 
 # %% [markdown]
 # <details><summary>💡 Hint — Step by step</summary>
