@@ -419,14 +419,31 @@ def make_group_metadata_reference(group_sizes, m, tm):
 #
 # We break `make_group_metadata` into independent functions,
 # each tested before combining them.
+#
+# ### Step 10a: Group Offsets
+#
+# **Goal**: Compute CSR-style prefix sum `[0, cumsum(group_sizes)]`.
+#
+# ```
+# group_sizes = [300, 212, 512]
+# group_offsets = [0, 300, 512, 1024]
+#                  ^    ^    ^     ^
+#                  g0   g1   g2   end
+# ```
 
 # %%
-# --- Step 1: Group offsets (CSR-style prefix sum) ---
 def compute_group_offsets(group_sizes):
-    """[0, cumsum(group_sizes)] — maps group id → start row."""
-    return jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(group_sizes)])
+    """[0, cumsum(group_sizes)] — maps group id → start row.
 
-# Test
+    Args:
+        group_sizes: (G,) int32
+    Returns:
+        (G+1,) int32
+    """
+    pass  # YOUR CODE HERE
+
+
+# %%
 assert jnp.array_equal(
     compute_group_offsets(jnp.array([256, 256, 256, 256], dtype=jnp.int32)),
     jnp.array([0, 256, 512, 768, 1024], dtype=jnp.int32))
@@ -436,131 +453,264 @@ assert jnp.array_equal(
 assert jnp.array_equal(
     compute_group_offsets(jnp.array([512, 0, 512], dtype=jnp.int32)),
     jnp.array([0, 512, 512, 1024], dtype=jnp.int32))
-print("Step 1 — compute_group_offsets: PASSED ✓")
-
+print("Step 10a — compute_group_offsets: PASSED ✓")
 
 # %% [markdown]
-# **Step 2 — Tiles per group.** Round group starts DOWN and ends UP to
-# tile boundaries. Group 0 (rows 0–299, tm=128): rounded [0, 384) → 3 tiles.
-# Group 1 (rows 300–511): rounded [256, 512) → 2 tiles. Total 3+2+4 = 9 > 8
-# physical tiles — tile 2 is counted by both g0 and g1.
+# <details><summary>💡 Hint</summary>
+#
+# ```python
+# return jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(group_sizes)])
+# ```
+# </details>
+
+# %% [markdown]
+# ### Step 10b: Tiles per Group
+#
+# **Goal**: Compute how many tile visits each group requires, accounting
+# for boundary tiles shared between neighbors.
+#
+# Round group starts DOWN and ends UP to tile boundaries:
+# ```
+# group 0: rows 0–299   → rounded to tiles [0, 384)   → 3 tiles
+# group 1: rows 300–511  → rounded to tiles [256, 512)  → 2 tiles
+# group 2: rows 512–1023 → rounded to tiles [512, 1024) → 4 tiles
+#                                              total = 9 (> 8 physical tiles)
+# ```
+# Zero-size groups get zero tiles.
 
 # %%
 def compute_group_tiles(group_sizes, group_offsets, tm):
-    """Number of tile visits per group (boundary tiles counted by both neighbors)."""
-    group_starts = group_offsets[:-1]
-    group_ends = group_offsets[1:]
-    rounded_starts = (group_starts // tm * tm).astype(jnp.int32)
-    rounded_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
-    rounded_sizes = jnp.where(group_sizes == 0, 0, rounded_ends - rounded_starts)
-    return rounded_sizes // tm
+    """Number of tile visits per group (boundary tiles counted by both neighbors).
 
-# Test — aligned groups: 256/128 = 2 tiles each, no sharing
+    Args:
+        group_sizes: (G,) int32
+        group_offsets: (G+1,) int32 from compute_group_offsets
+        tm: tile size
+    Returns:
+        (G,) int32
+    """
+    pass  # YOUR CODE HERE
+    # 1. Extract group_starts = group_offsets[:-1], group_ends = group_offsets[1:]
+    # 2. Round starts DOWN to tile boundary: start // tm * tm
+    # 3. Round ends UP to tile boundary: (end + tm - 1) // tm * tm
+    # 4. Handle zero-size groups with jnp.where
+    # 5. Return rounded_sizes // tm
+
+
+# %%
+# Aligned groups — no sharing: 256/128 = 2 tiles each
 assert jnp.array_equal(
     compute_group_tiles(jnp.array([256, 256, 256, 256], dtype=jnp.int32),
                         jnp.array([0, 256, 512, 768, 1024], dtype=jnp.int32), 128),
     jnp.array([2, 2, 2, 2]))
-# Test — unaligned: g0 gets 3, g1 gets 2, g2 gets 4
+# Unaligned — g0 gets 3, g1 gets 2, g2 gets 4
 assert jnp.array_equal(
     compute_group_tiles(jnp.array([300, 212, 512], dtype=jnp.int32),
                         jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 128),
     jnp.array([3, 2, 4]))
-# Test — zero-size group gets 0 tiles
+# Zero-size group gets 0 tiles
 assert jnp.array_equal(
     compute_group_tiles(jnp.array([512, 0, 512], dtype=jnp.int32),
                         jnp.array([0, 512, 512, 1024], dtype=jnp.int32), 128),
     jnp.array([4, 0, 4]))
-print("Step 2 — compute_group_tiles: PASSED ✓")
-
+print("Step 10b — compute_group_tiles: PASSED ✓")
 
 # %% [markdown]
-# **Step 3 — Group IDs.** Expand `group_tiles` into a flat mapping:
-# `[3, 2, 4]` → `[0,0,0, 1,1, 2,2,2,2]`.
+# <details><summary>💡 Hint</summary>
+#
+# ```python
+# group_starts = group_offsets[:-1]
+# group_ends = group_offsets[1:]
+# rounded_starts = (group_starts // tm * tm).astype(jnp.int32)
+# rounded_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
+# rounded_sizes = jnp.where(group_sizes == 0, 0, rounded_ends - rounded_starts)
+# return rounded_sizes // tm
+# ```
+# </details>
+
+# %% [markdown]
+# ### Step 10c: Group IDs
+#
+# **Goal**: Expand `group_tiles` into a flat mapping from grid index to
+# group id.
+#
+# ```
+# group_tiles = [3, 2, 4]  →  group_ids = [0,0,0, 1,1, 2,2,2,2]
+# ```
+#
+# Use `jnp.repeat` with `total_repeat_length` for fixed output size.
 
 # %%
 def compute_group_ids(group_tiles, num_groups, max_len):
-    """Flat array mapping grid index → group id."""
-    return jnp.repeat(
-        jnp.arange(num_groups, dtype=jnp.int32),
-        group_tiles,
-        total_repeat_length=max_len,
-    )
+    """Flat array mapping grid index → group id.
 
-# Test
+    Args:
+        group_tiles: (G,) int32 from compute_group_tiles
+        num_groups: G
+        max_len: output array length (padded)
+    Returns:
+        (max_len,) int32
+    """
+    pass  # YOUR CODE HERE
+
+
+# %%
 assert compute_group_ids(jnp.array([2, 2, 2, 2]), 4, 11)[:8].tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
 assert compute_group_ids(jnp.array([3, 2, 4]), 3, 10)[:9].tolist() == [0, 0, 0, 1, 1, 2, 2, 2, 2]
-print("Step 3 — compute_group_ids: PASSED ✓")
-
+print("Step 10c — compute_group_ids: PASSED ✓")
 
 # %% [markdown]
-# **Step 4 — Tile visits.** Each tile is visited once by default. A group
-# boundary falling *inside* a tile adds an extra visit. Detect this by
-# checking `group_offsets[g] % tm != 0` (non-aligned start).
+# <details><summary>💡 Hint</summary>
+#
+# ```python
+# return jnp.repeat(
+#     jnp.arange(num_groups, dtype=jnp.int32),
+#     group_tiles,
+#     total_repeat_length=max_len,
+# )
+# ```
+# </details>
+
+# %% [markdown]
+# ### Step 10d: Tile Visits
+#
+# **Goal**: Compute how many times each physical m-tile is visited.
+# Each tile is visited once by default. A group boundary falling *inside*
+# a tile adds an extra visit.
+#
+# ```
+# group_offsets = [0, 300, 512, 1024],  tm = 128
+#
+# Group 1 starts at row 300 → inside tile 2 (rows 256–383) → extra visit
+# Group 2 starts at row 512 → tile-aligned → no extra visit
+#
+# tile_visits = [1, 1, 2, 1, 1, 1, 1, 1]
+#                         ^ tile 2 visited by both g0 and g1
+# ```
+#
+# Strategy: find non-aligned group starts, use `jnp.histogram` to count
+# extra visits per tile, add 1 for the base visit.
 
 # %%
 def compute_tile_visits(group_sizes, group_offsets, tiles_m, tm):
-    """Visit count per tile (1 + extra for each mid-tile group boundary)."""
-    group_starts = group_offsets[:-1]
-    aligned_or_empty = ((group_starts % tm) == 0) | (group_sizes == 0)
-    partial_tile_ids = jnp.where(aligned_or_empty, tiles_m, group_starts // tm)
-    extra_visits = jnp.histogram(
-        partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1)
-    )[0]
-    return (extra_visits + 1).astype(jnp.int32)
+    """Visit count per tile (1 + extra for each mid-tile group boundary).
 
-# Test — aligned: all visits = 1
+    Args:
+        group_sizes: (G,) int32
+        group_offsets: (G+1,) int32
+        tiles_m: M // tm
+        tm: tile size
+    Returns:
+        (tiles_m,) int32
+    """
+    pass  # YOUR CODE HERE
+    # 1. group_starts = group_offsets[:-1]
+    # 2. Build mask: aligned (start % tm == 0) or empty group → no extra visit
+    # 3. For non-aligned starts: partial_tile_id = start // tm
+    #    For aligned/empty: use tiles_m as sentinel (out of histogram range)
+    # 4. jnp.histogram(..., bins=tiles_m, range=(0, tiles_m - 1)) counts extras
+    # 5. Return extra_visits + 1
+
+
+# %%
+# Aligned — all tiles visited once
 assert compute_tile_visits(
     jnp.array([256, 256, 256, 256], dtype=jnp.int32),
     jnp.array([0, 256, 512, 768, 1024], dtype=jnp.int32), 8, 128
 ).tolist() == [1, 1, 1, 1, 1, 1, 1, 1]
-# Test — unaligned: tile 2 (rows 256-383) visited twice
+# Unaligned — tile 2 (rows 256–383) visited twice
 assert compute_tile_visits(
     jnp.array([300, 212, 512], dtype=jnp.int32),
     jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 8, 128
 ).tolist() == [1, 1, 2, 1, 1, 1, 1, 1]
-# Test — zero-size group: no extra visits
+# Zero-size group — no extra visits
 assert compute_tile_visits(
     jnp.array([512, 0, 512], dtype=jnp.int32),
     jnp.array([0, 512, 512, 1024], dtype=jnp.int32), 8, 128
 ).tolist() == [1, 1, 1, 1, 1, 1, 1, 1]
-print("Step 4 — compute_tile_visits: PASSED ✓")
-
+print("Step 10d — compute_tile_visits: PASSED ✓")
 
 # %% [markdown]
-# **Step 5 — M-tile IDs.** Expand `tile_visits` into a flat mapping:
-# `[1,1,2,1,1,1,1,1]` → `[0,1,2,2,3,4,5,6,7]` — tile 2 appears twice.
+# <details><summary>💡 Hint</summary>
+#
+# ```python
+# group_starts = group_offsets[:-1]
+# aligned_or_empty = ((group_starts % tm) == 0) | (group_sizes == 0)
+# partial_tile_ids = jnp.where(aligned_or_empty, tiles_m, group_starts // tm)
+# extra_visits = jnp.histogram(
+#     partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1)
+# )[0]
+# return (extra_visits + 1).astype(jnp.int32)
+# ```
+# </details>
+
+# %% [markdown]
+# ### Step 10e: M-tile IDs
+#
+# **Goal**: Expand `tile_visits` into a flat mapping from grid index to
+# m-tile id. Same idea as Step 10c but for tiles.
+#
+# ```
+# tile_visits = [1,1,2,1,1,1,1,1]  →  m_tile_ids = [0,1,2,2,3,4,5,6,7]
+#                    ^ tile 2 visited twice              ^^^ appears twice
+# ```
 
 # %%
 def compute_m_tile_ids(tile_visits, tiles_m, max_len):
-    """Flat array mapping grid index → m-tile id."""
-    return jnp.repeat(
-        jnp.arange(tiles_m, dtype=jnp.int32),
-        tile_visits,
-        total_repeat_length=max_len,
-    )
+    """Flat array mapping grid index → m-tile id.
 
-# Test
+    Args:
+        tile_visits: (tiles_m,) int32 from compute_tile_visits
+        tiles_m: M // tm
+        max_len: output array length (padded)
+    Returns:
+        (max_len,) int32
+    """
+    pass  # YOUR CODE HERE
+
+
+# %%
 assert compute_m_tile_ids(jnp.array([1,1,1,1,1,1,1,1]), 8, 11)[:8].tolist() == [0,1,2,3,4,5,6,7]
 assert compute_m_tile_ids(jnp.array([1,1,2,1,1,1,1,1]), 8, 10)[:9].tolist() == [0,1,2,2,3,4,5,6,7]
-print("Step 5 — compute_m_tile_ids: PASSED ✓")
-
+print("Step 10e — compute_m_tile_ids: PASSED ✓")
 
 # %% [markdown]
-# ### Combined: `make_group_metadata`
+# <details><summary>💡 Hint</summary>
+#
+# ```python
+# return jnp.repeat(
+#     jnp.arange(tiles_m, dtype=jnp.int32),
+#     tile_visits,
+#     total_repeat_length=max_len,
+# )
+# ```
+# </details>
+
+# %% [markdown]
+# ### Step 10f: Combined `make_group_metadata`
+#
+# **Goal**: Chain the 5 steps above into the complete function.
 
 # %%
 def make_group_metadata(group_sizes, m, tm):
-    """Vectorized group metadata — chains the 5 steps above."""
+    """Vectorized group metadata — chains steps 10a–10e.
+
+    Args:
+        group_sizes: jnp.array of shape (num_groups,), dtype int32
+        m: total number of rows
+        tm: tile size for m dimension
+
+    Returns:
+        (group_offsets, group_ids, m_tile_ids), num_tiles
+    """
     num_groups = group_sizes.shape[0]
     tiles_m = m // tm
     max_len = tiles_m + num_groups - 1
 
-    group_offsets = compute_group_offsets(group_sizes)
-    group_tiles = compute_group_tiles(group_sizes, group_offsets, tm)
-    group_ids = compute_group_ids(group_tiles, num_groups, max_len)
-    tile_visits = compute_tile_visits(group_sizes, group_offsets, tiles_m, tm)
-    m_tile_ids = compute_m_tile_ids(tile_visits, tiles_m, max_len)
-    num_tiles = int(group_tiles.sum())
+    pass  # YOUR CODE HERE
+    # Call compute_group_offsets, compute_group_tiles, compute_group_ids,
+    # compute_tile_visits, compute_m_tile_ids in sequence.
+    # num_tiles = int(group_tiles.sum())
 
     return (group_offsets, group_ids, m_tile_ids), num_tiles
 
@@ -591,37 +741,15 @@ check_metadata("Zero-size group",
                jnp.array([512, 0, 512], dtype=jnp.int32), 1024, 128)
 
 # %% [markdown]
-# <details><summary>💡 Hint — Step by step</summary>
+# <details><summary>💡 Hint</summary>
 #
 # ```python
-# # Step 2: Tiles per group
-# group_starts = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends[:-1]])
-# rounded_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
-# rounded_starts = (group_starts // tm * tm).astype(jnp.int32)
-# rounded_sizes = rounded_ends - rounded_starts
-# rounded_sizes = jnp.where(group_sizes == 0, 0, rounded_sizes)
-# group_tiles = rounded_sizes // tm
-#
-# # Step 3: group_ids
-# group_ids = jnp.repeat(
-#     jnp.arange(num_groups, dtype=jnp.int32),
-#     group_tiles,
-#     total_repeat_length=tiles_m + num_groups - 1,
-# )
-#
-# # Step 4: m_tile_ids
-# # Which tiles are "partial" (visited by a group that doesn't own them)?
-# partial_mask = ((group_offsets[:-1] % tm) == 0) | (group_sizes == 0)
-# partial_tile_ids = jnp.where(partial_mask, tiles_m, group_offsets[:-1] // tm)
-# tile_visits = jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1
-# m_tile_ids = jnp.repeat(
-#     jnp.arange(tiles_m, dtype=jnp.int32),
-#     tile_visits.astype(jnp.int32),
-#     total_repeat_length=tiles_m + num_groups - 1,
-# )
-#
-# # Step 5:
-# num_tiles = group_tiles.sum()
+# group_offsets = compute_group_offsets(group_sizes)
+# group_tiles = compute_group_tiles(group_sizes, group_offsets, tm)
+# group_ids = compute_group_ids(group_tiles, num_groups, max_len)
+# tile_visits = compute_tile_visits(group_sizes, group_offsets, tiles_m, tm)
+# m_tile_ids = compute_m_tile_ids(tile_visits, tiles_m, max_len)
+# num_tiles = int(group_tiles.sum())
 # ```
 # </details>
 
