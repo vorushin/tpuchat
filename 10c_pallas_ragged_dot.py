@@ -11,6 +11,8 @@
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10c_pallas_ragged_dot.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 10c — Pallas Ragged Dot: Building Grouped Matmul
 #
 # This is the culminating notebook. We combine everything from `10a` (Pallas

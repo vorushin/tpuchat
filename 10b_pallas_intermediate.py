@@ -11,6 +11,8 @@
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10b_pallas_intermediate.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 10b — Pallas Intermediate: Toward Grouped Operations
 #
 # This notebook builds on the Pallas foundations from `10a` and introduces the

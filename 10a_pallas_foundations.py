@@ -11,6 +11,8 @@
 # ---
 
 # %% [markdown]
+# <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10a_pallas_foundations.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+#
 # # 10a — Pallas Foundations
 #
 # **Pallas** is JAX's kernel language for writing custom operations that run on
