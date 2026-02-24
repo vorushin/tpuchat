@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 09 — MoE Training Lab (rev 14)
+# # 09 — MoE Training Lab (rev 15)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -71,7 +71,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 14
+REVISION = 15
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")

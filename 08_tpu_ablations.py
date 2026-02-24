@@ -11,7 +11,7 @@
 # ---
 
 # %% [markdown]
-# # 08 — TPU Ablation Lab (rev 33)
+# # 08 — TPU Ablation Lab (rev 34)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-v6e-50usd).
@@ -78,7 +78,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 33
+REVISION = 34
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
