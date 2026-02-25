@@ -884,6 +884,7 @@ check(batched_matmul_kernel, batched_matmul_spec, (lhs9, rhs9),
           pl.BlockSpec((None, K9, N9), lambda g: (g, 0, 0)),
       ],
       out_specs=pl.BlockSpec((None, M9, N9), lambda g: (g, 0, 0)),
+      # Full output is (G, M, N) even though each kernel invocation writes (M, N)
       out_shape=jax.ShapeDtypeStruct((G9, M9, N9), jnp.float32))
 
 # %% [markdown]
