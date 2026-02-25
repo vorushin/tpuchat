@@ -645,8 +645,8 @@ else:
 # With double-buffered pipelining:
 #
 # ```
-# Time:  [DMA load 0] [DMA load 1 | compute 0] [DMA load 2 | compute 1] ...
-#                      ^^^^^^^^^^overlap^^^^^^^^^
+# DMA:      [load 0] [load 1] [load 2] [load 3] ...
+# Compute:           [comp 0] [comp 1] [comp 2] ...
 # ```
 #
 # The DMA engine and compute engine run in parallel, hiding memory latency.
