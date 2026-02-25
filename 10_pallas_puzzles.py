@@ -614,7 +614,8 @@ check(rowsum_kernel, rowsum_spec, (x6,),
 #
 # This is the bread-and-butter of Pallas. Tiled matmul has a **3D grid**:
 # `(tiles_m, tiles_n, tiles_k)`. For each `(m, n)` output tile, we iterate
-# over K tiles and accumulate `A_tile @ B_tile`.
+# over K tiles (K for "Kontracting" dimension) and accumulate
+# `A_tile @ B_tile`.
 #
 # We use **scratch memory** (`scratch_shapes`) for the accumulator.
 # Scratch is allocated in **VMEM** — TPU's fast on-chip SRAM (like shared
