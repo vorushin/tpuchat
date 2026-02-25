@@ -628,8 +628,8 @@ check(rowsum_kernel, rowsum_spec, (x6,),
 #
 # Specify scratch with `pltpu.VMEM(shape, dtype)`.
 #
-# Inside a kernel, use `jax.lax.dot(a, b)` for the matrix multiply. This
-# maps to the TPU's MXU (Matrix Multiplier Unit) when running on hardware.
+# Inside a kernel, use `a @ b` (or equivalently `jax.lax.dot(a, b)`) for
+# the matrix multiply. Both map to the TPU's MXU (Matrix Multiplier Unit).
 #
 # The production-ready pattern uses `@pl.when` guards:
 # ```python
@@ -678,7 +678,7 @@ def matmul_kernel(a_ref, b_ref, o_ref, acc_ref):
     k_i = pl.program_id(2)
     pass  # YOUR CODE HERE
     # 1. Zero acc_ref when k_i == 0
-    # 2. Accumulate: acc_ref[...] += a_tile @ b_tile
+    # 2. Accumulate: acc_ref[...] += a_ref[...] @ b_ref[...]
     # 3. Store acc_ref → o_ref when k_i == tiles_k7 - 1
 
 
@@ -719,7 +719,7 @@ check(matmul_kernel, matmul_spec, (a7, b7),
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm7, bn7), dtype=jnp.float32)
 #
-# acc_ref[...] += jax.lax.dot(a_ref[...], b_ref[...])
+# acc_ref[...] += a_ref[...] @ b_ref[...]
 #
 # @pl.when(k_i == tiles_k7 - 1)
 # def _store():
@@ -765,7 +765,7 @@ def matmul_kernel_solved(a_ref, b_ref, o_ref, acc_ref):
     @pl.when(k_i == 0)
     def _zero():
         acc_ref[...] = jnp.zeros((bm8, bn8), dtype=jnp.float32)
-    acc_ref[...] += jax.lax.dot(a_ref[...], b_ref[...])
+    acc_ref[...] += a_ref[...] @ b_ref[...]
     @pl.when(k_i == tiles_k8 - 1)
     def _store():
         o_ref[...] = acc_ref[...]
@@ -882,7 +882,7 @@ check(batched_matmul_kernel, batched_matmul_spec, (lhs9, rhs9),
 # <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
-# o_ref[...] = jax.lax.dot(lhs_ref[...], rhs_ref[...])
+# o_ref[...] = lhs_ref[...] @ rhs_ref[...]
 # ```
 # </details>
 
@@ -958,7 +958,7 @@ check(fused_relu_kernel, fused_relu_spec, (a10, b10),
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm10, bn10), dtype=jnp.float32)
 #
-# acc_ref[...] += jax.lax.dot(a_ref[...], b_ref[...])
+# acc_ref[...] += a_ref[...] @ b_ref[...]
 #
 # @pl.when(k_i == tiles_k10 - 1)
 # def _store():
@@ -1072,13 +1072,13 @@ else:
 # %% [markdown]
 # <details><summary>Hint 1 of 2 — Approach</summary>
 #
-# The index maps handle the permutation using `perm_ref[g]`. By the time the kernel runs, `rhs_ref` already points to the correct permuted group. So the kernel body is identical to Puzzle 9 — just a single `jax.lax.dot`.
+# The index maps handle the permutation using `perm_ref[g]`. By the time the kernel runs, `rhs_ref` already points to the correct permuted group. So the kernel body is identical to Puzzle 9 — just `lhs_ref[...] @ rhs_ref[...]`.
 # </details>
 #
 # <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
-# o_ref[...] = jax.lax.dot(lhs_ref[...], rhs_ref[...])
+# o_ref[...] = lhs_ref[...] @ rhs_ref[...]
 # ```
 # </details>
 
@@ -2044,7 +2044,7 @@ else:
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm16, bn16), dtype=jnp.float32)
 #
-# acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
+# acc_ref[...] += lhs_ref[...] @ rhs_ref[...]
 #
 # @pl.when(k_i == tiles_k16 - 1)
 # def _store():
@@ -2177,7 +2177,7 @@ else:
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm17, bn17), dtype=jnp.float32)
 #
-# acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
+# acc_ref[...] += lhs_ref[...] @ rhs_ref[...]
 #
 # @pl.when(k_i == tiles_k17 - 1)
 # def _store():
@@ -2364,7 +2364,7 @@ else:
 #                            m_tile_ids, bm18, bn18)
 # lhs_masked = jnp.where(mask_lhs, lhs_ref[...], 0)
 # rhs_masked = jnp.where(mask_rhs, rhs_ref[...], 0)
-# acc_ref[...] += jax.lax.dot(lhs_masked.T, rhs_masked)
+# acc_ref[...] += lhs_masked.T @ rhs_masked
 # ```
 # </details>
 #
@@ -2394,7 +2394,7 @@ else:
 #                                m_tile_ids, bm18, bn18)
 #     lhs_masked = jnp.where(mask_lhs, lhs_ref[...], 0)
 #     rhs_masked = jnp.where(mask_rhs, rhs_ref[...], 0)
-#     acc_ref[...] += jax.lax.dot(lhs_masked.T, rhs_masked)
+#     acc_ref[...] += lhs_masked.T @ rhs_masked
 #
 # @pl.when(is_epilogue)
 # def _store():
@@ -2650,7 +2650,7 @@ else:
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm20, bn20), dtype=jnp.float32)
 #
-# acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
+# acc_ref[...] += lhs_ref[...] @ rhs_ref[...]
 #
 # @pl.when(k_i == tiles_k20 - 1)
 # def _store():
