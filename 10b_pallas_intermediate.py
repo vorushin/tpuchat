@@ -127,9 +127,9 @@ def matmul_acc_kernel(a_ref, b_ref, o_ref, acc_ref):
     # acc_ref: (bm7, bn7) — scratch VMEM accumulator
     k_i = pl.program_id(2)
     pass  # YOUR CODE HERE
-    # 1. @pl.when(k_i == 0) → zero acc_ref
-    # 2. acc_ref[...] += a_ref[...] @ b_ref[...]  (use jax.lax.dot)
-    # 3. @pl.when(k_i == tiles_k7 - 1) → copy acc_ref to o_ref
+    # 1. Zero accumulator on first K tile
+    # 2. Accumulate tile matmul
+    # 3. Store result on last K tile
 
 
 # %%
@@ -207,7 +207,6 @@ def batched_matmul_kernel(lhs_ref, rhs_ref, o_ref):
     # rhs_ref: (K8, N8) — one group's rhs (batch dim squeezed)
     # o_ref: (M8, N8) — one group's output (batch dim squeezed)
     pass  # YOUR CODE HERE
-    # Just compute lhs @ rhs and store
 
 
 # %%
@@ -288,7 +287,6 @@ def permuted_matmul_kernel(perm_ref, lhs_ref, rhs_ref, o_ref):
     # rhs_ref: (K9, N9) — permuted group's rhs (loaded via index map)
     # o_ref: (M9, N9) — output tile
     pass  # YOUR CODE HERE
-    # Just compute the matmul — the index map already selected the right rhs!
 
 
 # --- Index maps ---
@@ -506,11 +504,10 @@ def compute_group_tiles(group_sizes, group_offsets, bm):
         (G,) int32
     """
     pass  # YOUR CODE HERE
-    # 1. Extract group_starts = group_offsets[:-1], group_ends = group_offsets[1:]
-    # 2. Round starts DOWN to tile boundary: start // bm * bm
-    # 3. Round ends UP to tile boundary: (end + bm - 1) // bm * bm
-    # 4. Handle zero-size groups with jnp.where
-    # 5. Return rounded_sizes // bm
+    # 1. Extract group starts and ends from offsets
+    # 2. Round starts DOWN and ends UP to tile boundaries
+    # 3. Handle zero-size groups
+    # 4. Convert rounded range sizes to tile counts
 
 
 # %%
@@ -646,12 +643,10 @@ def compute_tile_visits(group_sizes, group_offsets, tiles_m, bm):
         (tiles_m,) int32
     """
     pass  # YOUR CODE HERE
-    # 1. group_starts = group_offsets[:-1]
-    # 2. Build mask: aligned (start % bm == 0) or empty group → no extra visit
-    # 3. For non-aligned starts: partial_tile_id = start // bm
-    #    For aligned/empty: use tiles_m + 1 as sentinel (out of histogram range)
-    # 4. jnp.histogram(..., bins=tiles_m, range=(0, tiles_m)) counts extras
-    # 5. Return extra_visits + 1
+    # 1. Find group start positions
+    # 2. Identify which starts are non-aligned (cause an extra tile visit)
+    # 3. Count extra visits per tile (hint: histogram)
+    # 4. Add base visit count of 1
 
 
 # %%
@@ -781,9 +776,7 @@ def make_group_metadata(group_sizes, m, bm):
     max_len = tiles_m + num_groups - 1
 
     pass  # YOUR CODE HERE
-    # Call compute_group_offsets, compute_group_tiles, compute_group_ids,
-    # compute_tile_visits, compute_m_tile_ids in sequence.
-    # num_tiles = int(group_tiles.sum())
+    # Chain steps 10a–10e, then compute num_tiles from group_tiles
 
     return (group_offsets, group_ids, m_tile_ids), num_tiles
 
@@ -900,11 +893,10 @@ def masked_copy_kernel(group_offsets_ref, group_ids_ref, m_tile_ids_ref,
     # o_ref: (bm11, N11) — tile of output
     grid_id = pl.program_id(0)
     pass  # YOUR CODE HERE
-    # 1. Look up group_id = group_ids_ref[grid_id]
-    # 2. Look up m_tile = m_tile_ids_ref[grid_id]
-    # 3. Get group_start and group_end from group_offsets_ref
-    # 4. Build row mask: tile_start + arange(bm) in [group_start, group_end)
-    # 5. Store: o_ref[...] = jnp.where(mask, x_ref[...], o_ref[...])
+    # 1. Look up which group and tile this grid iteration processes
+    # 2. Get the group's row boundaries
+    # 3. Build a 2D boolean mask for rows inside this group
+    # 4. Masked store: only write rows belonging to this group
 
 
 # %%

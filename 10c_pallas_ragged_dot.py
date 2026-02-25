@@ -196,9 +196,9 @@ def simple_gmm_kernel(group_metadata_ref, group_offset_ref,
     k_i = pl.program_id(2)
 
     pass  # YOUR CODE HERE
-    # 1. @pl.when(k_i == 0): zero acc_ref
-    # 2. acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
-    # 3. @pl.when(k_i == tiles_k12 - 1): store acc_ref → o_ref
+    # 1. Zero accumulator on first K tile
+    # 2. Accumulate tile matmul
+    # 3. Store result on last K tile
 
 
 # --- Index maps (these are provided — study them!) ---
@@ -339,13 +339,8 @@ def ragged_dot_kernel(group_metadata_ref, group_offset_ref,
     k_i = pl.program_id(2)
 
     pass  # YOUR CODE HERE
-    # Same as Puzzle 12, but on the last k_i, apply mask:
-    # 1. @pl.when(k_i == 0): zero acc
-    # 2. accumulate
-    # 3. @pl.when(k_i == tiles_k13 - 1):
-    #    mask = get_store_mask(grid_id, group_offsets, group_ids,
-    #                          m_tile_ids, bm13, bn13)
-    #    o_ref[...] = jnp.where(mask, acc_ref[...], o_ref[...])
+    # Same as Puzzle 12, but on the last K tile, apply a masked store
+    # so only rows belonging to the current group are written.
 
 
 # %%
@@ -498,19 +493,10 @@ def tgmm_kernel(group_metadata_ref, group_offset_ref,
     grid_id = pl.program_id(2)  # tgmm grid: (tiles_n, tiles_k, num_tiles)
 
     pass  # YOUR CODE HERE
-    # 1. Detect prologue: grid_id == 0 or group changed
-    #    group = group_ids[grid_id]
-    #    prev_group = group_ids[jnp.where(grid_id > 0, grid_id - 1, 0)]
-    #    is_prologue = (grid_id == 0) | (group != prev_group)
-    #
-    # 2. Detect epilogue: last grid point or group about to change
-    #    is_end = grid_id == (pl.num_programs(2) - 1)
-    #    next_group = group_ids[jnp.where(is_end, grid_id, grid_id + 1)]
-    #    is_epilogue = is_end | (group != next_group)
-    #
-    # 3. @pl.when(is_prologue): zero acc
-    # 4. Mask lhs and rhs to group boundaries, then acc += lhs.T @ rhs
-    # 5. @pl.when(is_epilogue): store acc to output
+    # 1. Detect group transitions: when does a new group start? end?
+    # 2. Zero accumulator at the start of each group
+    # 3. Accumulate masked lhs.T @ rhs
+    # 4. Store accumulator at the end of each group
 
 
 # --- Index maps for tgmm ---
