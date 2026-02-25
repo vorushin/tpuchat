@@ -629,6 +629,15 @@ check(rowsum_kernel, rowsum_spec, (x6,),
 #
 # Specify scratch with `pltpu.VMEM(shape, dtype)`.
 #
+# **`out_shape`** tells `pallas_call` the shape and dtype of the output
+# array to allocate. It's a `jax.ShapeDtypeStruct` — just metadata, no
+# actual data:
+# ```python
+# out_shape = jax.ShapeDtypeStruct((M, N), jnp.float32)
+# ```
+# (In earlier puzzles, the `check` helper inferred this automatically
+# from the reference output. From here on, you'll see it explicitly.)
+#
 # Inside a kernel, use `a @ b` (or equivalently `jax.lax.dot(a, b)`) for
 # the matrix multiply. Both map to the TPU's MXU (Matrix Multiplier Unit).
 #
@@ -749,6 +758,9 @@ check(matmul_kernel, matmul_spec, (a7, b7),
 #   → index map: `lambda m, n, k: (k, n)`
 # - `C` tile `(m, n)` is at `C[m*bm:(m+1)*bm, n*bn:(n+1)*bn]`
 #   → index map: `lambda m, n, k: (m, n)` (no K dependency!)
+#
+# Don't forget `out_shape` (the full output shape, not the tile shape)
+# and `scratch_shapes` (the VMEM accumulator from Puzzle 7).
 
 # %%
 M8, K8, N8 = 128, 256, 128
