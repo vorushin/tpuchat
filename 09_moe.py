@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 22)
+# # 09 — MoE Training Lab (rev 24)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -51,7 +51,8 @@
 # | `WANDB_TOKEN` | [wandb.ai/authorize](https://wandb.ai/authorize) | Sweep and Hero Run |
 
 # %%
-# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile plotly tokamax
+# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile plotly
+# !pip install -q "tokamax @ git+https://github.com/openxla/tokamax.git"
 
 # %% [markdown]
 # ## Prerequisites
@@ -78,7 +79,7 @@ import tokamax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 22
+REVISION = 24
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -864,23 +865,26 @@ def generate(config, params, enc, prompt, max_new_tokens=64,
 # %%
 # === Tokamax autotuning (capless MoE only) ===
 if config.moe_impl == 'capless':
-    N_auto = config.microbatch_size * config.seq_len * config.n_active_experts
-    dummy_lhs = jax.ShapeDtypeStruct((N_auto, config.n_embd), jnp.bfloat16)
-    dummy_rhs = jax.ShapeDtypeStruct(
-        (config.n_experts, config.n_embd, config.expert_mlp_dim), jnp.bfloat16)
-    dummy_gs = tokamax.RaggedDotGroupSizes(
-        jnp.array([N_auto // config.n_experts] * config.n_experts, jnp.int32),
-        representative_value=(N_auto // config.n_experts,) * config.n_experts)
-    tokamax.autotune(lambda: tokamax.ragged_dot(dummy_lhs, dummy_rhs, dummy_gs))
+    _N = config.microbatch_size * config.seq_len * config.n_active_experts
+    _gs_val = [_N // config.n_experts] * config.n_experts
+    _gs = tokamax.RaggedDotGroupSizes(
+        jnp.array(_gs_val, jnp.int32),
+        representative_value=tuple(_gs_val))
 
-    # Also autotune the down-projection shape (F -> D)
-    dummy_lhs_down = jax.ShapeDtypeStruct(
-        (N_auto, config.expert_mlp_dim), jnp.bfloat16)
-    dummy_rhs_down = jax.ShapeDtypeStruct(
-        (config.n_experts, config.expert_mlp_dim, config.n_embd), jnp.bfloat16)
-    tokamax.autotune(
-        lambda: tokamax.ragged_dot(dummy_lhs_down, dummy_rhs_down, dummy_gs))
-    print(f'Tokamax autotuning complete (N={N_auto}, E={config.n_experts})')
+    # Up-projection: (N*K, D) @ (E, D, F) -> (N*K, F)
+    _up_result = tokamax.autotune(
+        tokamax.ragged_dot,
+        jax.ShapeDtypeStruct((_N, config.n_embd), jnp.bfloat16),
+        jax.ShapeDtypeStruct((config.n_experts, config.n_embd, config.expert_mlp_dim), jnp.bfloat16),
+        _gs)
+
+    # Down-projection: (N*K, F) @ (E, F, D) -> (N*K, D)
+    _down_result = tokamax.autotune(
+        tokamax.ragged_dot,
+        jax.ShapeDtypeStruct((_N, config.expert_mlp_dim), jnp.bfloat16),
+        jax.ShapeDtypeStruct((config.n_experts, config.expert_mlp_dim, config.n_embd), jnp.bfloat16),
+        _gs)
+    print(f'Tokamax autotuning complete (N={_N}, E={config.n_experts})')
 
 # %% [markdown]
 # ## Quick Training (XProf)

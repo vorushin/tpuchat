@@ -699,3 +699,14 @@ Agent: Set default learning_rate to 1e-4 in 08_tpu_ablations.py (rev 12).
 ## Feb 23 2026
 
 Agent: Created 09_moe.py — Mixture of Experts training lab based on 08_tpu_ablations.py. Dense MLP replaced with routed MoE: 8 experts, top-2 routing, expert_mlp_dim=512 (fine-grained SwiGLU experts). Capacity-based scatter/gather dispatch using cumsum on one-hot expert masks — no large dispatch tensors needed. Auxiliary load balancing loss (alpha=0.01, ST-MoE style) + router z-loss (alpha=1e-4) for training stability. Parameter budget: ~189M total, ~156M non-embed (1.3x more MLP params than dense, but 3x less active MLP compute per token). Same 3-mode structure as 08: Quick Training, wandb Sweep, Hero Run with HF upload. wandb project: tpuchat-moe.
+
+## Feb 25 2026
+
+Agent: Added capless (dropless) MoE dispatch to 09_moe.py using `tokamax.ragged_dot`. Config-switchable via `moe_impl='capless'` (default stays `'capped'`). Tokens are sorted by expert assignment and processed via grouped matmul — no capacity buffer, no token dropping. Functions added: `dropless_routing` (sort + group_sizes), `dropless_combine` (unsort + weighted sum), `moe_capless_forward` (full forward using `tokamax.ragged_dot`). Autotuning cell uses `tokamax.autotune()` for both up/down projection shapes. Aux/z losses identical to capped path.
+
+Roman: Capped baseline (expert_mlp_dim=2048, E=8, k=2):
+Params: 356.6M total, 323.0M non-embed, 121.7M active non-embed
+B=64, T=2048, 131k tokens/step
+MFU: 21.8%, 214k tok/s, val loss 10.38→5.47 in 300 steps.
+
+Capless autotuning cell failed: `AttributeError: module 'tokamax' has no attribute 'RaggedDotGroupSizes'`. Likely version mismatch — Colab's `pip install -U tokamax` installed an older version (0.0.5?) that doesn't export `RaggedDotGroupSizes`. Local `uv pip install tokamax` gets 0.0.10 which has it. Fixed autotuning cell to use correct `tokamax.autotune(f, *args)` API (was passing a lambda). Still need to verify on Colab with a newer tokamax version.
