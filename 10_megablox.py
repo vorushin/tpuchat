@@ -16,7 +16,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10_megablox.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 10 — MegaBlox: Dropless MoE with Grouped Matrix Multiplication (rev 6)
+# # 10 — MegaBlox: Dropless MoE with Grouped Matrix Multiplication (rev 7)
 #
 # This notebook builds up **dropless Mixture of Experts** step by step, from
 # the fundamental grouped matrix multiplication (GMM) operation to a full
@@ -71,7 +71,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-REVISION = 6
+REVISION = 7
 
 ON_TPU = any('TPU' in d.device_kind for d in jax.devices())
 
@@ -408,9 +408,9 @@ def make_group_metadata(*, group_sizes, m, tm, visit_empty_groups=False):
         (group_offsets[:-1] % tm) == 0, group_sizes == 0)
     if visit_empty_groups:
         partial_tile_mask = jnp.where(group_sizes == 0, 0, partial_tile_mask)
-    partial_tile_ids = jnp.where(partial_tile_mask, tiles_m, group_offsets[:-1] // tm)
+    partial_tile_ids = jnp.where(partial_tile_mask, tiles_m + 1, group_offsets[:-1] // tm)
     tile_visits = jnp.histogram(
-        partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1
+        partial_tile_ids, bins=tiles_m, range=(0, tiles_m))[0] + 1
     m_tile_ids = jnp.repeat(
         jnp.arange(tiles_m, dtype=jnp.int32), tile_visits.astype(jnp.int32),
         total_repeat_length=tiles_m + num_groups - 1)

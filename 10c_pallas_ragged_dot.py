@@ -100,9 +100,9 @@ def make_group_metadata(group_sizes, m, tm, *, visit_empty_groups=False):
     partial_mask = ((group_offsets[:-1] % tm) == 0) | (group_sizes == 0)
     if visit_empty_groups:
         partial_mask = jnp.where(group_sizes == 0, 0, partial_mask)
-    partial_tile_ids = jnp.where(partial_mask, tiles_m, group_offsets[:-1] // tm)
+    partial_tile_ids = jnp.where(partial_mask, tiles_m + 1, group_offsets[:-1] // tm)
     tile_visits = (
-        jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1
+        jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m))[0] + 1
     )
     m_tile_ids = jnp.repeat(
         jnp.arange(tiles_m, dtype=jnp.int32),

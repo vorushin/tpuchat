@@ -649,8 +649,8 @@ def compute_tile_visits(group_sizes, group_offsets, tiles_m, tm):
     # 1. group_starts = group_offsets[:-1]
     # 2. Build mask: aligned (start % tm == 0) or empty group → no extra visit
     # 3. For non-aligned starts: partial_tile_id = start // tm
-    #    For aligned/empty: use tiles_m as sentinel (out of histogram range)
-    # 4. jnp.histogram(..., bins=tiles_m, range=(0, tiles_m - 1)) counts extras
+    #    For aligned/empty: use tiles_m + 1 as sentinel (out of histogram range)
+    # 4. jnp.histogram(..., bins=tiles_m, range=(0, tiles_m)) counts extras
     # 5. Return extra_visits + 1
 
 
@@ -680,7 +680,7 @@ print("Step 10d — compute_tile_visits: PASSED ✓")
 # %% [markdown]
 # <details><summary>Hint 1 of 3 — Approach</summary>
 #
-# Each tile starts with 1 visit. A group boundary that falls *inside* a tile (not tile-aligned) adds +1. Count how many non-aligned group starts land in each tile using `jnp.histogram`. Use `tiles_m` as a sentinel value for aligned/empty groups so they fall outside the histogram range.
+# Each tile starts with 1 visit. A group boundary that falls *inside* a tile (not tile-aligned) adds +1. Count how many non-aligned group starts land in each tile using `jnp.histogram`. Use `tiles_m + 1` as a sentinel value for aligned/empty groups so they fall outside the histogram range `(0, tiles_m)`.
 # </details>
 #
 # <details><summary>Hint 2 of 3 — Key pattern</summary>
@@ -688,8 +688,8 @@ print("Step 10d — compute_tile_visits: PASSED ✓")
 # ```python
 # group_starts = group_offsets[:-1]
 # aligned_or_empty = ((group_starts % tm) == 0) | (group_sizes == 0)
-# partial_tile_ids = jnp.where(aligned_or_empty, tiles_m, group_starts // tm)
-# # Use jnp.histogram to count extra visits per tile...
+# partial_tile_ids = jnp.where(aligned_or_empty, tiles_m + 1, group_starts // tm)
+# # Use jnp.histogram(..., bins=tiles_m, range=(0, tiles_m)) to count extra visits...
 # # Then add 1 for the base visit
 # ```
 # </details>
@@ -699,9 +699,9 @@ print("Step 10d — compute_tile_visits: PASSED ✓")
 # ```python
 # group_starts = group_offsets[:-1]
 # aligned_or_empty = ((group_starts % tm) == 0) | (group_sizes == 0)
-# partial_tile_ids = jnp.where(aligned_or_empty, tiles_m, group_starts // tm)
+# partial_tile_ids = jnp.where(aligned_or_empty, tiles_m + 1, group_starts // tm)
 # extra_visits = jnp.histogram(
-#     partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1)
+#     partial_tile_ids, bins=tiles_m, range=(0, tiles_m)
 # )[0]
 # return (extra_visits + 1).astype(jnp.int32)
 # ```
