@@ -194,8 +194,8 @@ check(add10_kernel, add10_spec, (x1,))
 # The kernel body stays identical whether you have 4 blocks or 400.
 
 # %%
-N2 = 256
-bm2 = 64
+N2 = 256   # vector length
+bm2 = 64   # tile (block) size — each kernel invocation processes bm2 elements
 
 # --- Reference ---
 def vadd_spec(x, y):
@@ -213,18 +213,87 @@ x2 = jax.random.uniform(jax.random.key(1), (N2,))
 y2 = jax.random.uniform(jax.random.key(2), (N2,))
 
 check(vadd_kernel, vadd_spec, (x2, y2),
-      grid=(N2 // bm2,),
+      grid=(N2 // bm2,),              # 256 // 64 = 4 invocations
       in_specs=[
-          pl.BlockSpec((bm2,), lambda i: (i,)),
-          pl.BlockSpec((bm2,), lambda i: (i,)),
+          pl.BlockSpec((bm2,), lambda i: (i,)),  # x: invocation i → block i
+          pl.BlockSpec((bm2,), lambda i: (i,)),  # y: invocation i → block i
       ],
-      out_specs=pl.BlockSpec((bm2,), lambda i: (i,)))
+      out_specs=pl.BlockSpec((bm2,), lambda i: (i,)))  # out: invocation i → block i
 
 # %% [markdown]
 # <details><summary>Hint</summary>
 #
 # The BlockSpecs handle all the slicing. Your kernel just needs:
 # `o_ref[...] = x_ref[...] + y_ref[...]`
+# </details>
+
+# %% [markdown]
+# ---
+# ## Puzzle 2a: Reversed Block Add — Index Map Manipulation
+#
+# **Goal**: Add `x` to a **block-reversed** version of `y` by changing
+# only the index map. The kernel body is identical to Puzzle 2!
+#
+# ### Theory
+#
+# The index map in a `BlockSpec` controls **which block** each grid
+# invocation sees. So far every index map was `lambda i: (i,)` — grid
+# invocation `i` sees block `i` (sequential order). But the map can
+# be any function: `lambda i: (3 - i,)` would read blocks in reverse.
+#
+# ```
+# y = [  y₀  |  y₁  |  y₂  |  y₃  ]      4 blocks, bm=64
+#
+# Normal index map     λi: (i,)         → y₀  y₁  y₂  y₃
+# Reversed index map   λi: (3-i,)       → y₃  y₂  y₁  y₀
+#
+# x:          [  x₀  ][  x₁  ][  x₂  ][  x₃  ]
+# y reversed: [  y₃  ][  y₂  ][  y₁  ][  y₀  ]
+# result:     [x₀+y₃ ][x₁+y₂ ][x₂+y₁ ][x₃+y₀]
+# ```
+#
+# This is the key insight behind all advanced Pallas kernels: the index
+# map decides what data the kernel sees, while the kernel body stays
+# simple and generic.
+
+# %%
+N2a = 256   # vector length (same as Puzzle 2)
+bm2a = 64   # tile size
+num_blocks_2a = N2a // bm2a   # 4 blocks total
+
+# --- Reference ---
+def vadd_rev_spec(x, y):
+    """x, y: (N2a,) → x + block_reverse(y)"""
+    y_rev = y.reshape(num_blocks_2a, bm2a)[::-1].reshape(N2a)
+    return x + y_rev
+
+# Kernel is provided (same body as Puzzle 2):
+def vadd_rev_kernel(x_ref, y_ref, o_ref):
+    o_ref[...] = x_ref[...] + y_ref[...]
+
+
+# %%
+x2a = jax.random.uniform(jax.random.key(100), (N2a,))
+y2a = jax.random.uniform(jax.random.key(101), (N2a,))
+
+# YOUR TASK: Fix the y BlockSpec so it reads blocks in reversed order.
+# Only the y index map needs to change — x and out are correct.
+check(vadd_rev_kernel, vadd_rev_spec, (x2a, y2a),
+      grid=(num_blocks_2a,),
+      in_specs=[
+          pl.BlockSpec((bm2a,), lambda i: (i,)),              # x: block i (correct)
+          pl.BlockSpec((bm2a,), lambda i: (i,)),              # y: block i — FIX THIS
+      ],
+      out_specs=pl.BlockSpec((bm2a,), lambda i: (i,)))
+
+# %% [markdown]
+# <details><summary>Hint</summary>
+#
+# The y index map should map grid index `i` to the reversed block position.
+# With 4 blocks, `i=0 → block 3`, `i=1 → block 2`, etc.:
+# ```python
+# pl.BlockSpec((bm2a,), lambda i: (num_blocks_2a - 1 - i,))
+# ```
 # </details>
 
 # %% [markdown]
