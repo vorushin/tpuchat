@@ -63,7 +63,7 @@ print(f"JAX {jax.__version__}")
 # here so you can focus on the kernel logic.
 
 # %%
-def make_group_metadata(group_sizes, m, tm, *, visit_empty_groups=False):
+def make_group_metadata(group_sizes, m, bm, *, visit_empty_groups=False):
     """Compute tile-to-group mapping for ragged_dot.
 
     Returns:
@@ -72,7 +72,7 @@ def make_group_metadata(group_sizes, m, tm, *, visit_empty_groups=False):
     This is the same algorithm as tokamax's make_group_metadata.
     """
     num_groups = group_sizes.shape[0]
-    tiles_m = m // tm
+    tiles_m = m // bm
 
     # CSR-style offsets
     group_ends = jnp.cumsum(group_sizes)
@@ -80,11 +80,11 @@ def make_group_metadata(group_sizes, m, tm, *, visit_empty_groups=False):
 
     # Round boundaries to tile boundaries
     group_starts = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends[:-1]])
-    rounded_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
-    rounded_starts = (group_starts // tm * tm).astype(jnp.int32)
+    rounded_ends = ((group_ends + bm - 1) // bm * bm).astype(jnp.int32)
+    rounded_starts = (group_starts // bm * bm).astype(jnp.int32)
     rounded_sizes = rounded_ends - rounded_starts
     rounded_sizes = jnp.where(group_sizes == 0, 0, rounded_sizes)
-    group_tiles = rounded_sizes // tm
+    group_tiles = rounded_sizes // bm
 
     if visit_empty_groups:
         group_tiles = jnp.where(group_sizes == 0, 1, group_tiles)
@@ -97,10 +97,10 @@ def make_group_metadata(group_sizes, m, tm, *, visit_empty_groups=False):
     )
 
     # Build m_tile_ids
-    partial_mask = ((group_offsets[:-1] % tm) == 0) | (group_sizes == 0)
+    partial_mask = ((group_offsets[:-1] % bm) == 0) | (group_sizes == 0)
     if visit_empty_groups:
         partial_mask = jnp.where(group_sizes == 0, 0, partial_mask)
-    partial_tile_ids = jnp.where(partial_mask, tiles_m + 1, group_offsets[:-1] // tm)
+    partial_tile_ids = jnp.where(partial_mask, tiles_m + 1, group_offsets[:-1] // bm)
     tile_visits = (
         jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m))[0] + 1
     )
@@ -114,13 +114,13 @@ def make_group_metadata(group_sizes, m, tm, *, visit_empty_groups=False):
     return (group_offsets, group_ids, m_tile_ids), num_tiles
 
 
-def get_store_mask(grid_id, group_offsets, group_ids, m_tile_ids, tm, tn):
-    """Build a (tm, tn) boolean mask for rows belonging to the current group."""
+def get_store_mask(grid_id, group_offsets, group_ids, m_tile_ids, bm, bn):
+    """Build a (bm, bn) boolean mask for rows belonging to the current group."""
     group_id = group_ids[grid_id]
     group_start = group_offsets[group_id]
     group_end = group_offsets[group_id + 1]
-    m_id = m_tile_ids[grid_id] * tm
-    iota = jax.lax.broadcasted_iota(jnp.int32, (tm, tn), 0) + m_id
+    m_id = m_tile_ids[grid_id] * bm
+    iota = jax.lax.broadcasted_iota(jnp.int32, (bm, bn), 0) + m_id
     return (iota >= group_start) & (iota < group_end)
 
 
@@ -260,7 +260,7 @@ else:
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm12, bn12), dtype=jnp.float32)
 #
-# # With None in BlockSpec, the group dim is squeezed — rhs_ref is (tk, tn)
+# # With None in BlockSpec, the group dim is squeezed — rhs_ref is (bk, bn)
 # acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
 #
 # @pl.when(k_i == tiles_k12 - 1)
@@ -288,14 +288,14 @@ else:
 # needs to add the mask at store time:
 #
 # ```python
-# mask = get_store_mask(grid_id, group_offsets, group_ids, m_tile_ids, tm, tn)
+# mask = get_store_mask(grid_id, group_offsets, group_ids, m_tile_ids, bm, bn)
 # o_ref[...] = jnp.where(mask, acc[...], o_ref[...])
 # ```
 #
 # This preserves previously-written values from other groups in the same tile.
 #
 # ```
-# Tile at row 256, tm=128:
+# Tile at row 256, bm=128:
 # ┌────────────────────────┐
 # │ rows 256-299: group 0  │ ← Visit 1: mask=True for rows 256-299
 # │ rows 300-383: group 1  │ ← Visit 2: mask=True for rows 300-383
@@ -409,7 +409,7 @@ else:
 # def _zero():
 #     acc_ref[...] = jnp.zeros((bm13, bn13), dtype=jnp.float32)
 #
-# # None in rhs BlockSpec squeezes the group dim — rhs_ref is (tk, tn)
+# # None in rhs BlockSpec squeezes the group dim — rhs_ref is (bk, bn)
 # acc_ref[...] += jax.lax.dot(lhs_ref[...], rhs_ref[...])
 #
 # @pl.when(k_i == tiles_k13 - 1)
@@ -435,8 +435,8 @@ else:
 # - `drhs[g] = lhs[g_rows].T @ dout[g_rows]` (gradient w.r.t. rhs — this is tgmm)
 #
 # **tgmm** computes `lhs.T @ rhs` accumulated per group:
-# - `lhs`: `(K, M)` (transposed) → tiles `(tm, tk)` after transposing to `(M, K)`
-# - `rhs`: `(M, N)` → tiles `(tm, tn)`
+# - `lhs`: `(K, M)` (transposed) → tiles `(bm, bk)` after transposing to `(M, K)`
+# - `rhs`: `(M, N)` → tiles `(bm, bn)`
 # - `out`: `(G, K, N)` — one output per group
 #
 # **Key difference from gmm**: In gmm, multiple K tiles contribute to the
