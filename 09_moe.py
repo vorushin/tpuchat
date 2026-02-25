@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 24)
+# # 09 — MoE Training Lab (rev 25)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -63,6 +63,7 @@
 # %%
 # === Imports, TPU constants, dot_dict ===
 import functools as ft
+import sys
 import time
 import os
 import pickle
@@ -75,11 +76,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tokamax
+from absl import flags
+flags.FLAGS(sys.argv, known_only=True)  # parse before tokamax to avoid Colab's -f flag error
 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 24
+REVISION = 25
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
