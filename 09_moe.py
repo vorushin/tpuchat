@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 28)
+# # 09 — MoE Training Lab (rev 30)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -76,13 +76,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tokamax
+from tokamax._src.ops.ragged_dot.pallas_mosaic_tpu import PallasMosaicTpuRaggedDot
 from absl import flags
 flags.FLAGS(sys.argv, known_only=True)  # parse before tokamax to avoid Colab's -f flag error
+
+_RAGGED_DOT_CONFIG = PallasMosaicTpuRaggedDot.Config(
+    tile_m=1024, tile_k=1024, tile_n=1024)
 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 28
+REVISION = 30
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -602,9 +606,11 @@ def moe_capless_forward(config, layer, x):
     aux_loss = E * jnp.sum(f * P)
 
     # ── Expert ReLU² via tokamax grouped matmul ──
-    up = tokamax.ragged_dot(sorted_inputs, layer.expert_w_up, group_sizes)
+    up = tokamax.ragged_dot(sorted_inputs, layer.expert_w_up, group_sizes,
+                            implementation='mosaic', config=_RAGGED_DOT_CONFIG)
     up = jax.nn.relu(up) ** 2
-    down = tokamax.ragged_dot(up, layer.expert_w_down, group_sizes)
+    down = tokamax.ragged_dot(up, layer.expert_w_down, group_sizes,
+                              implementation='mosaic', config=_RAGGED_DOT_CONFIG)
 
     # ── Combine ──
     output = dropless_combine(down, sorted_indices, top_k_weights, N, K, D)
@@ -865,31 +871,6 @@ def generate(config, params, enc, prompt, max_new_tokens=64,
 
     return enc.decode(ids)
 
-# %%
-# === Tokamax autotuning (capless MoE only) ===
-if config.moe_impl == 'capless':
-    _N = config.microbatch_size * config.seq_len * config.n_active_experts
-    _gs_val = [_N // config.n_experts] * config.n_experts
-    _gs = tokamax.RaggedDotGroupSizes(
-        jnp.array(_gs_val, jnp.int32),
-        representative_value=tuple(_gs_val))
-
-    # Up-projection: (N*K, D) @ (E, D, F) -> (N*K, F)
-    _up_result = tokamax.autotune(
-        tokamax.ragged_dot,
-        jax.ShapeDtypeStruct((_N, config.n_embd), jnp.bfloat16),
-        jax.ShapeDtypeStruct((config.n_experts, config.n_embd, config.expert_mlp_dim), jnp.bfloat16),
-        _gs)
-
-    # Down-projection: (N*K, F) @ (E, F, D) -> (N*K, D)
-    _down_result = tokamax.autotune(
-        tokamax.ragged_dot,
-        jax.ShapeDtypeStruct((_N, config.expert_mlp_dim), jnp.bfloat16),
-        jax.ShapeDtypeStruct((config.n_experts, config.expert_mlp_dim, config.n_embd), jnp.bfloat16),
-        _gs)
-    _up_result.__enter__()
-    _down_result.__enter__()
-    print(f'Tokamax autotuning complete (N={_N}, E={config.n_experts})')
 
 # %% [markdown]
 # ## Quick Training (XProf)
