@@ -35,7 +35,7 @@
 # | I — Foundations | 1–6 | Refs, grids, BlockSpec, `@pl.when` |
 # | II — Matmul Patterns | 7–10 | Scratch, accumulation, fusion |
 # | III — Scalar Prefetch | 11–15 | Runtime index maps, group metadata, masking |
-# | IV — Ragged Dot | 16–20 | Grouped matmul, tgmm, pipelining |
+# | IV — Ragged Dot | 16–19 | Grouped matmul, tgmm, pipelining |
 
 # %% [markdown]
 # ## Setup
@@ -2570,113 +2570,6 @@ print("Study the code above — on real TPU, this is what makes the kernel fast!
 
 # %% [markdown]
 # ---
-# ## Puzzle 20: Challenge — Fused Ragged Dot + ReLU
-#
-# **Goal**: Combine Puzzle 17's ragged_dot with Puzzle 10's activation
-# fusion: apply ReLU at the masked store step.
-#
-# ### Theory
-#
-# This ties together all the concepts from the notebook:
-# - Zero/accumulate/store pattern (Puzzle 7)
-# - Activation fusion (Puzzle 10)
-# - Group metadata and masked stores (Puzzles 12, 14)
-# - Ragged dot (Puzzle 17)
-#
-# The change from Puzzle 17 is minimal: apply `jnp.maximum(..., 0)` to
-# the accumulated result **before** the masked store. This avoids a
-# separate kernel pass for the activation.
-#
-# **Minimal scaffolding** — modify your Puzzle 17 solution.
-
-# %%
-G20 = 3
-M20, K20, N20 = 1024, 256, 128
-bm20, bk20, bn20 = 128, 128, 128
-
-group_sizes_20 = jnp.array([300, 212, 512], dtype=jnp.int32)
-tiles_k20 = K20 // bk20
-tiles_n20 = N20 // bn20
-
-(group_offsets_20, group_ids_20, m_tile_ids_20), num_tiles_20 = \
-    make_group_metadata(group_sizes_20, M20, bm20)
-
-# --- Reference ---
-def fused_ragged_relu_spec(lhs, rhs, group_sizes):
-    """ragged_dot + ReLU"""
-    offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(group_sizes)])
-    out = jnp.zeros((lhs.shape[0], rhs.shape[2]), dtype=jnp.float32)
-    for g in range(len(group_sizes)):
-        s, e = int(offsets[g]), int(offsets[g + 1])
-        if s < e:
-            out = out.at[s:e].set(jnp.maximum(lhs[s:e] @ rhs[g], 0))
-    return out
-
-# --- Kernel skeleton ---
-def fused_ragged_relu_kernel(group_metadata_ref, group_offset_ref,
-                              lhs_ref, rhs_ref, o_ref, acc_ref):
-    group_offsets, group_ids, m_tile_ids = group_metadata_ref
-    grid_id = pl.program_id(1)
-    k_i = pl.program_id(2)
-
-    pass  # YOUR CODE HERE
-    # Modify Puzzle 17's solution: apply jnp.maximum(acc, 0) at the
-    # masked store step.
-
-
-# %%
-lhs20 = jax.random.normal(jax.random.key(60), (M20, K20))
-rhs20 = jax.random.normal(jax.random.key(61), (G20, K20, N20))
-expected20 = fused_ragged_relu_spec(lhs20, rhs20, group_sizes_20)
-
-group_metadata_20 = (group_offsets_20, group_ids_20, m_tile_ids_20)
-group_offset_20 = jnp.array([0], dtype=jnp.int32)
-
-actual20 = pl.pallas_call(
-    fused_ragged_relu_kernel,
-    grid_spec=pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=2,
-        in_specs=[
-            pl.BlockSpec((bm20, bk20), lhs_imap),
-            pl.BlockSpec((None, bk20, bn20), rhs_imap),
-        ],
-        out_specs=pl.BlockSpec((bm20, bn20), out_imap),
-        grid=(tiles_n20, num_tiles_20, tiles_k20),
-        scratch_shapes=[pltpu.VMEM((bm20, bn20), jnp.float32)],
-    ),
-    out_shape=jax.ShapeDtypeStruct((M20, N20), jnp.float32),
-    interpret=True,
-)(group_metadata_20, group_offset_20, lhs20, rhs20)
-
-total_rows20 = int(group_sizes_20.sum())
-if jnp.allclose(actual20[:total_rows20], expected20[:total_rows20], atol=1e-2, rtol=1e-2):
-    print(f"PASSED ✓  (shape={actual20.shape})")
-    print(f"  Verified {total_rows20} active rows")
-else:
-    max_err = float(jnp.max(jnp.abs(actual20[:total_rows20] - expected20[:total_rows20])))
-    print(f"FAILED ✗  max error: {max_err:.6f}")
-
-# %% [markdown]
-# <details><summary>Hint — Full solution</summary>
-#
-# ```python
-# @pl.when(k_i == 0)
-# def _zero():
-#     acc_ref[...] = jnp.zeros((bm20, bn20), dtype=jnp.float32)
-#
-# acc_ref[...] += lhs_ref[...] @ rhs_ref[...]
-#
-# @pl.when(k_i == tiles_k20 - 1)
-# def _store():
-#     mask = get_store_mask(grid_id, group_offsets, group_ids,
-#                           m_tile_ids, bm20, bn20)
-#     acc = jnp.maximum(acc_ref[...], 0)  # fused ReLU!
-#     o_ref[...] = jnp.where(mask, acc, o_ref[...].astype(acc.dtype))
-# ```
-# </details>
-
-# %% [markdown]
-# ---
 # ## Summary
 #
 # You've built every component of a production ragged_dot kernel:
@@ -2691,7 +2584,7 @@ else:
 # | `@pl.when` conditional execution | 6 |
 # | Matmul with scratch accumulator (VMEM) | 7 |
 # | Batched matmul, `None` dim squeeze | 9 |
-# | Activation fusion | 10, 20 |
+# | Activation fusion | 10 |
 # | `PrefetchScalarGridSpec` + SMEM | 11 |
 # | `make_group_metadata` (CSR mapping) | 12 |
 # | `get_store_mask`, `broadcasted_iota` | 14 |
@@ -2700,7 +2593,6 @@ else:
 # | Full ragged_dot with masking | 17 |
 # | tgmm, `pl.num_programs`, prologue/epilogue | 18 |
 # | `emit_pipeline` for pipelining | 19 |
-# | Fused ragged_dot + ReLU | 20 |
 #
 # ### What's left for production?
 #
@@ -2708,7 +2600,7 @@ else:
 # - **Quantization**: int8/int4 inputs with scale factors
 # - **Transpose RHS**: `rhs` shape `(G, N, K)` for the backward pass
 # - **Dynamic in-kernel quantization**: quantize lhs/rhs on the fly
-# - **Activation fusion**: apply ReLU/tanh after the dot (Puzzle 10, 20)
+# - **Activation fusion**: apply ReLU/tanh after the dot (Puzzle 10)
 # - **Sharding**: `group_offset` for processing a subset of groups
 # - **Autotuning**: lookup tables for optimal tile sizes per problem shape
 # - **Cost estimation**: FLOPs and bytes-accessed hints for the compiler
