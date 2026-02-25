@@ -718,3 +718,15 @@ MFU: 14.8-14.9%, 146k tok/s, val loss 10.38→6.31 at step 149 (still training).
 vs capped: 21.8% MFU, 214k tok/s. XLA capless is 32% slower throughput.
 
 Agent: Implementing Option A — construct `PallasMosaicTpuRaggedDot` manually with explicit configs for forward AND backward ops. This bypasses the autotuning cache entirely: `vjp=partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)` where `fn` creates `PallasMosaicTpuRaggedDot(config=tile_config)`. Tile sizes: 1024x1024x1024 for all ops.
+
+Roman: Capless Pallas mosaic (Option A, 1024x1024x1024 tiles):
+MFU: 19.0%, 187k tok/s, val loss 10.38→5.62 in 300 steps. No cache miss warnings.
+
+Summary (300 steps, same model/data):
+| Dispatch     | MFU   | tok/s | val loss |
+|-------------|-------|-------|----------|
+| Capped       | 21.8% | 214k  | 5.47     |
+| Capless Pallas| 19.0% | 187k  | 5.62     |
+| Capless XLA  | 14.8% | 146k  | (partial)|
+
+Capless Pallas is 13% slower than capped but 28% faster than XLA fallback. Val loss slightly higher (5.62 vs 5.47) — possibly from different routing dynamics (no token dropping).
