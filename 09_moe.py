@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 25)
+# # 09 — MoE Training Lab (rev 26)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -82,7 +82,7 @@ flags.FLAGS(sys.argv, known_only=True)  # parse before tokamax to avoid Colab's 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 25
+REVISION = 26
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -364,7 +364,7 @@ class Config:
     n_active_experts: int = 2       # top-k experts activated per token
     expert_mlp_dim: int = 2048      # per-expert FFN hidden dim (ReLU²)
     capacity_factor: float = 1.25   # expert buffer headroom (1.0 = exact, 1.25 = 25% extra)
-    moe_impl: str = 'capped'       # 'capped' | 'capless' (tokamax grouped matmul)
+    moe_impl: str = 'capless'      # 'capped' | 'capless' (tokamax grouped matmul)
     aux_loss_alpha: float = 0.01    # load balancing loss coefficient
     z_loss_alpha: float = 1e-4      # router z-loss coefficient
 
@@ -386,7 +386,7 @@ class Config:
     microbatch_size: int = 4
 
     # ── Training ───────────────────────────────────────────────
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
