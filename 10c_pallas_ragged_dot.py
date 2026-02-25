@@ -248,7 +248,12 @@ else:
     print(f"  Actual[:2,:4]:\n{actual12[:2,:4]}")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# The kernel body is identical to Puzzle 7: zero / accumulate / store with `@pl.when`. The index maps (already provided) handle all the group-to-tile routing via `group_ids` and `m_tile_ids`. With `None` in the rhs BlockSpec, the group dimension is squeezed — `rhs_ref` is just `(bk, bn)`.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # @pl.when(k_i == 0)
@@ -377,7 +382,27 @@ else:
     print(f"FAILED ✗  max error: {max_err:.6f}")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 3 — Approach</summary>
+#
+# This is Puzzle 12 plus one change: on the last K tile, apply a **mask** before storing. When a tile straddles a group boundary, only the rows belonging to the current group should be written. Use the provided `get_store_mask()` helper and `jnp.where(mask, acc, o_ref[...])` to preserve previously-written values.
+# </details>
+#
+# <details><summary>Hint 2 of 3 — The masked store block</summary>
+#
+# ```python
+# # Steps 1-2 are the same as Puzzle 12 (zero + accumulate)
+# # ...
+#
+# @pl.when(k_i == tiles_k13 - 1)
+# def _store():
+#     mask = get_store_mask(grid_id, group_offsets, group_ids,
+#                           m_tile_ids, bm13, bn13)
+#     acc = acc_ref[...]
+#     o_ref[...] = jnp.where(mask, acc, o_ref[...].astype(acc.dtype))
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 3 — Full solution</summary>
 #
 # ```python
 # @pl.when(k_i == 0)
@@ -538,7 +563,47 @@ else:
     print(f"  Actual[0,:2,:4]:\n{actual14[0,:2,:4]}")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 4 — Approach</summary>
+#
+# Unlike gmm (accumulate over K tiles), tgmm accumulates over **M tiles within each group**. Detect group transitions by comparing `group_ids[grid_id]` with the previous and next entries. **Prologue** (entering a new group): zero the accumulator. **Epilogue** (leaving a group): store to output. Mask both `lhs` and `rhs` to group boundaries before computing `lhs_masked.T @ rhs_masked`.
+# </details>
+#
+# <details><summary>Hint 2 of 4 — Prologue/epilogue detection</summary>
+#
+# ```python
+# group = group_ids[grid_id]
+# prev_group = group_ids[jnp.where(grid_id > 0, grid_id - 1, 0)]
+# is_prologue = (grid_id == 0) | (group != prev_group)
+#
+# is_end = grid_id == (pl.num_programs(2) - 1)
+# next_group = group_ids[jnp.where(is_end, grid_id, grid_id + 1)]
+# is_epilogue = is_end | (group != next_group)
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 4 — Masked accumulation + store</summary>
+#
+# ```python
+# # After prologue/epilogue detection...
+#
+# @pl.when(is_prologue)
+# def _zero():
+#     acc_ref[...] = jnp.zeros((bk14, bn14), dtype=jnp.float32)
+#
+# # Mask both inputs to current group boundaries
+# mask_lhs = get_store_mask(grid_id, group_offsets, group_ids,
+#                            m_tile_ids, bm14, bk14)
+# mask_rhs = get_store_mask(grid_id, group_offsets, group_ids,
+#                            m_tile_ids, bm14, bn14)
+# lhs_masked = jnp.where(mask_lhs, lhs_ref[...], 0)
+# rhs_masked = jnp.where(mask_rhs, rhs_ref[...], 0)
+# acc_ref[...] += jax.lax.dot(lhs_masked.T, rhs_masked)
+#
+# # Still need: epilogue store and empty-group guard...
+# ```
+# </details>
+#
+# <details><summary>Hint 4 of 4 — Full solution</summary>
 #
 # ```python
 # group = group_ids[grid_id]

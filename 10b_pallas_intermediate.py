@@ -148,7 +148,12 @@ check(matmul_acc_kernel, matmul_acc_spec, (a7, b7),
       scratch_shapes=[pltpu.VMEM((bm7, bn7), jnp.float32)])
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# This is the same zero / accumulate / store pattern as Puzzle 6. The only difference is that the accumulator comes from `scratch_shapes` instead of an extra BlockSpec input. Use `jax.lax.dot` for the tile matmul.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # @pl.when(k_i == 0)
@@ -219,13 +224,16 @@ check(batched_matmul_kernel, batched_matmul_spec, (lhs8, rhs8),
       out_shape=jax.ShapeDtypeStruct((G8, M8, N8), jnp.float32))
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# With `None` in BlockSpec, the batch dimension is **squeezed** — the refs have shape `(M8, K8)` and `(K8, N8)` directly (no leading dim). So the kernel just needs a single matmul.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # o_ref[...] = jax.lax.dot(lhs_ref[...], rhs_ref[...])
 # ```
-# With `None` in BlockSpec, the batch dimension is **squeezed** — the refs
-# have shape `(M8, K8)` and `(K8, N8)` directly (no leading dim).
 # </details>
 
 # %% [markdown]
@@ -323,13 +331,16 @@ else:
     print(f"FAILED ✗  max error: {max_err:.6f}")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
 #
-# The index maps handle the permutation. The kernel is just:
+# The index maps handle the permutation using `perm_ref[g]`. By the time the kernel runs, `rhs_ref` already points to the correct permuted group. So the kernel body is identical to Puzzle 8 — just a single `jax.lax.dot`.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
+#
 # ```python
 # o_ref[...] = jax.lax.dot(lhs_ref[...], rhs_ref[...])
 # ```
-# With `None` in BlockSpec, the batch dim is squeezed.
 # </details>
 
 # %% [markdown]
@@ -456,7 +467,12 @@ assert jnp.array_equal(
 print("Step 10a — compute_group_offsets: PASSED ✓")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# You need `[0, cumsum(group_sizes)]` — a prefix sum with a leading zero. `jnp.cumsum` alone starts at the first element, so you need to prepend a zero with `jnp.concatenate`.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # return jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(group_sizes)])
@@ -521,7 +537,23 @@ assert jnp.array_equal(
 print("Step 10b — compute_group_tiles: PASSED ✓")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 3 — Approach</summary>
+#
+# Round each group's start DOWN and end UP to tile boundaries, then compute the number of tiles from the rounded range. Zero-size groups must get zero tiles regardless of their offset alignment — use `jnp.where(group_sizes == 0, ...)` to handle this.
+# </details>
+#
+# <details><summary>Hint 2 of 3 — Key formulas</summary>
+#
+# ```python
+# group_starts = group_offsets[:-1]
+# group_ends = group_offsets[1:]
+# rounded_starts = (group_starts // tm * tm).astype(jnp.int32)
+# rounded_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
+# # Now handle zero-size groups and compute tile count...
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 3 — Full solution</summary>
 #
 # ```python
 # group_starts = group_offsets[:-1]
@@ -565,7 +597,12 @@ assert compute_group_ids(jnp.array([3, 2, 4]), 3, 10)[:9].tolist() == [0, 0, 0, 
 print("Step 10c — compute_group_ids: PASSED ✓")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# `jnp.repeat` can take an **array** as the repeat count — each element specifies how many times to repeat the corresponding input element. Use `total_repeat_length` to fix the output size (required for JIT). Repeat `jnp.arange(num_groups)` with `group_tiles` as the per-element repeat count.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # return jnp.repeat(
@@ -641,7 +678,23 @@ assert compute_tile_visits(
 print("Step 10d — compute_tile_visits: PASSED ✓")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 3 — Approach</summary>
+#
+# Each tile starts with 1 visit. A group boundary that falls *inside* a tile (not tile-aligned) adds +1. Count how many non-aligned group starts land in each tile using `jnp.histogram`. Use `tiles_m` as a sentinel value for aligned/empty groups so they fall outside the histogram range.
+# </details>
+#
+# <details><summary>Hint 2 of 3 — Key pattern</summary>
+#
+# ```python
+# group_starts = group_offsets[:-1]
+# aligned_or_empty = ((group_starts % tm) == 0) | (group_sizes == 0)
+# partial_tile_ids = jnp.where(aligned_or_empty, tiles_m, group_starts // tm)
+# # Use jnp.histogram to count extra visits per tile...
+# # Then add 1 for the base visit
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 3 — Full solution</summary>
 #
 # ```python
 # group_starts = group_offsets[:-1]
@@ -685,7 +738,12 @@ assert compute_m_tile_ids(jnp.array([1,1,2,1,1,1,1,1]), 8, 10)[:9].tolist() == [
 print("Step 10e — compute_m_tile_ids: PASSED ✓")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# Same `jnp.repeat` pattern as Step 10c: repeat `jnp.arange(tiles_m)` with `tile_visits` as the per-element repeat count, so tile IDs with 2 visits appear twice in the output.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # return jnp.repeat(
@@ -753,7 +811,12 @@ check_metadata("Zero-size group (non-aligned)",
                jnp.array([300, 0, 724], dtype=jnp.int32), 1024, 128)
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# Call the 5 functions in order: `compute_group_offsets` -> `compute_group_tiles` -> `compute_group_ids`, `compute_tile_visits` -> `compute_m_tile_ids`. The total number of grid iterations is `num_tiles = int(group_tiles.sum())`.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # group_offsets = compute_group_offsets(group_sizes)
@@ -867,7 +930,27 @@ else:
     print(f"    actual[296:304] nonzero cols:   {[int(actual11[r].any()) for r in range(296, 304)]}")
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 3 — Approach</summary>
+#
+# Look up `group_id` and `m_tile` from the metadata refs using `grid_id`. Compute the group's row range from `group_offsets_ref`. Build a 2D boolean mask where `True` means the row belongs to the current group. Use `jnp.where(mask, x_ref[...], o_ref[...])` to preserve existing values outside the group.
+# </details>
+#
+# <details><summary>Hint 2 of 3 — Key pattern</summary>
+#
+# ```python
+# group_id = group_ids_ref[grid_id]
+# m_tile = m_tile_ids_ref[grid_id]
+# group_start = group_offsets_ref[group_id]
+# group_end = group_offsets_ref[group_id + 1]
+# tile_start = m_tile * bm11
+#
+# # Build a (bm11, N11) mask where row_index in [group_start, group_end)
+# # Tip: jax.lax.broadcasted_iota(dtype, shape, dimension) creates
+# # an array where values along the given dimension are 0, 1, 2, ...
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 3 — Full solution</summary>
 #
 # ```python
 # group_id = group_ids_ref[grid_id]

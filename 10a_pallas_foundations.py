@@ -322,7 +322,12 @@ check(outer_kernel, outer_spec, (a, b),
       out_shape=jax.ShapeDtypeStruct((M4, N4), jnp.float32))
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 2 — Approach</summary>
+#
+# You need to broadcast `a_ref[...]` (shape `(bm4,)`) and `b_ref[...]` (shape `(bn4,)`) to produce shape `(bm4, bn4)`. Use NumPy-style broadcasting: add a new axis with `[:, None]` and `[None, :]`.
+# </details>
+#
+# <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
 # o_ref[...] = a_ref[...][:, None] * b_ref[...][None, :]
@@ -388,7 +393,23 @@ check(rowsum_kernel, rowsum_spec, (x,),
       out_shape=jax.ShapeDtypeStruct((ROWS,), jnp.float32))
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 3 — Approach</summary>
+#
+# Use `@pl.when(k_i == 0)` to conditionally zero the output on the first K tile. On every tile, accumulate the partial row sum with `o_ref[...] += x_ref[...].sum(axis=1)`.
+# </details>
+#
+# <details><summary>Hint 2 of 3 — Pattern skeleton</summary>
+#
+# ```python
+# @pl.when(k_i == 0)
+# def _zero():
+#     o_ref[...] = jnp.zeros(bm5, dtype=jnp.float32)
+#
+# o_ref[...] += ...  # partial row sum of x_ref
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 3 — Full solution</summary>
 #
 # ```python
 # @pl.when(k_i == 0)
@@ -478,7 +499,27 @@ check(matmul_kernel, matmul_spec, (a, b),
       scratch_shapes=[pltpu.VMEM((bm6, bn6), jnp.float32)])
 
 # %% [markdown]
-# <details><summary>💡 Hint</summary>
+# <details><summary>Hint 1 of 3 — Approach</summary>
+#
+# Follow the zero / accumulate / store pattern. Use `jax.lax.dot(a_ref[...], b_ref[...])` for the tile matmul — this is the Pallas way to multiply matrices inside a kernel.
+# </details>
+#
+# <details><summary>Hint 2 of 3 — Pattern skeleton</summary>
+#
+# ```python
+# @pl.when(k_i == 0)
+# def _zero():
+#     acc_ref[...] = jnp.zeros((bm6, bn6), dtype=jnp.float32)
+#
+# acc_ref[...] += ...  # A_tile @ B_tile
+#
+# @pl.when(k_i == tiles_k - 1)
+# def _store():
+#     o_ref[...] = acc_ref[...]
+# ```
+# </details>
+#
+# <details><summary>Hint 3 of 3 — Full solution</summary>
 #
 # ```python
 # @pl.when(k_i == 0)
