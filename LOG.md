@@ -709,4 +709,12 @@ Params: 356.6M total, 323.0M non-embed, 121.7M active non-embed
 B=64, T=2048, 131k tokens/step
 MFU: 21.8%, 214k tok/s, val loss 10.38→5.47 in 300 steps.
 
-Capless autotuning cell failed: `AttributeError: module 'tokamax' has no attribute 'RaggedDotGroupSizes'`. Likely version mismatch — Colab's `pip install -U tokamax` installed an older version (0.0.5?) that doesn't export `RaggedDotGroupSizes`. Local `uv pip install tokamax` gets 0.0.10 which has it. Fixed autotuning cell to use correct `tokamax.autotune(f, *args)` API (was passing a lambda). Still need to verify on Colab with a newer tokamax version.
+Capless autotuning cell failed: `AttributeError: module 'tokamax' has no attribute 'RaggedDotGroupSizes'`. Fixed by installing from GitHub (`git+https://github.com/openxla/tokamax.git`). Also fixed absl flags parse error (`-f` flag from Colab) with `flags.FLAGS(sys.argv, known_only=True)`.
+
+Agent: tokamax autotuning fundamentally broken with `jax.lax.scan` training loop. The autotuning cache keys include function pointers from `custom_vjp` lambdas — each scan iteration creates new closures with different pointers, so cache always misses. Tried: (1) autotuning overlay context manager, (2) explicit `config=` on forward calls (backward still gets `config=None` — hard-coded in `PallasMosaicTpuRaggedDot.__post_init__`), (3) `implementation='mosaic'` with tile config. All produce cache miss warnings on every scan iteration. Removed autotuning cell.
+
+Roman: Capless XLA baseline (`implementation='xla'`, no Pallas):
+MFU: 14.8-14.9%, 146k tok/s, val loss 10.38→6.31 at step 149 (still training).
+vs capped: 21.8% MFU, 214k tok/s. XLA capless is 32% slower throughput.
+
+Agent: Implementing Option A — construct `PallasMosaicTpuRaggedDot` manually with explicit configs for forward AND backward ops. This bypasses the autotuning cache entirely: `vjp=partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)` where `fn` creates `PallasMosaicTpuRaggedDot(config=tile_config)`. Tile sizes: 1024x1024x1024 for all ops.

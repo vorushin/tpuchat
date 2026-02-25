@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 32)
+# # 09 — MoE Training Lab (rev 33)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -76,13 +76,26 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tokamax
+from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+from tokamax._src.ops.ragged_dot.pallas_mosaic_tpu import (
+    Config as TpuRaggedDotConfig, PallasMosaicTpuRaggedDot)
+from functools import partial
 from absl import flags
 flags.FLAGS(sys.argv, known_only=True)  # parse before tokamax to avoid Colab's -f flag error
+
+# Pallas mosaic ragged_dot with explicit tile sizes for fwd + bwd.
+# Bypasses tokamax autotuning cache (no TPU v6e entries, causes spam).
+_TILE = TpuRaggedDotConfig(tile_m=1024, tile_k=1024, tile_n=1024)
+_bwd_fn = lambda *a, **kw: PallasMosaicTpuRaggedDot(config=_TILE)(*a, **kw)
+_ragged_dot_op = PallasMosaicTpuRaggedDot(
+    config=_TILE,
+    vjp=partial(ragged_dot_base.vjp,
+                dlhs_ragged_dot=_bwd_fn, drhs_ragged_dot=_bwd_fn))
 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 32
+REVISION = 33
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -601,12 +614,10 @@ def moe_capless_forward(config, layer, x):
     P = jnp.mean(router_probs, axis=0)
     aux_loss = E * jnp.sum(f * P)
 
-    # ── Expert ReLU² via tokamax grouped matmul ──
-    up = tokamax.ragged_dot(sorted_inputs, layer.expert_w_up, group_sizes,
-                            implementation='xla')
+    # ── Expert ReLU² via tokamax grouped matmul (Pallas mosaic, explicit tiles) ──
+    up = _ragged_dot_op(sorted_inputs, layer.expert_w_up, group_sizes=group_sizes)
     up = jax.nn.relu(up) ** 2
-    down = tokamax.ragged_dot(up, layer.expert_w_down, group_sizes,
-                              implementation='xla')
+    down = _ragged_dot_op(up, layer.expert_w_down, group_sizes=group_sizes)
 
     # ── Combine ──
     output = dropless_combine(down, sorted_indices, top_k_weights, N, K, D)
