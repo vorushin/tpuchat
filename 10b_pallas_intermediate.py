@@ -904,7 +904,7 @@ def masked_copy_kernel(group_offsets_ref, group_ids_ref, m_tile_ids_ref,
     # 2. Look up m_tile = m_tile_ids_ref[grid_id]
     # 3. Get group_start and group_end from group_offsets_ref
     # 4. Build row mask: tile_start + arange(tm) in [group_start, group_end)
-    # 5. Store: o_ref[...] = jnp.where(mask[:, None], x_ref[...], o_ref[...])
+    # 5. Store: o_ref[...] = jnp.where(mask, x_ref[...], o_ref[...])
 
 
 # %%
