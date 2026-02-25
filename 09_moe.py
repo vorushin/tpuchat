@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 21)
+# # 09 — MoE Training Lab (rev 22)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -51,7 +51,7 @@
 # | `WANDB_TOKEN` | [wandb.ai/authorize](https://wandb.ai/authorize) | Sweep and Hero Run |
 
 # %%
-# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile plotly
+# !pip install -q "jax[tpu]" optax huggingface_hub tiktoken pyarrow requests wandb tensorboard tensorboard-plugin-profile plotly tokamax
 
 # %% [markdown]
 # ## Prerequisites
@@ -73,11 +73,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import tokamax
 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 21
+REVISION = 22
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -359,6 +360,7 @@ class Config:
     n_active_experts: int = 2       # top-k experts activated per token
     expert_mlp_dim: int = 2048      # per-expert FFN hidden dim (ReLU²)
     capacity_factor: float = 1.25   # expert buffer headroom (1.0 = exact, 1.25 = 25% extra)
+    moe_impl: str = 'capped'       # 'capped' | 'capless' (tokamax grouped matmul)
     aux_loss_alpha: float = 0.01    # load balancing loss coefficient
     z_loss_alpha: float = 1e-4      # router z-loss coefficient
 
@@ -404,7 +406,7 @@ print(f'Config: D={config.n_embd}, L={config.n_layer}, T={config.seq_len}, '
       f'V={config.vocab_size}, N={config.n_head}, K={config.n_kv_head}, '
       f'H={config.head_dim}')
 print(f'MoE: E={config.n_experts}, k={config.n_active_experts}, '
-      f'F={config.expert_mlp_dim}, '
+      f'F={config.expert_mlp_dim}, impl={config.moe_impl}, '
       f'aux_alpha={config.aux_loss_alpha}, z_alpha={config.z_loss_alpha}')
 mb_info = (f', microbatch={config.microbatch_size}, accum={config.num_microbatches}x'
            if config.num_microbatches > 1 else '')
@@ -507,6 +509,104 @@ def moe_forward(config, layer, x):
     return output.reshape(B, T, D), aux_loss, z_loss
 
 
+def dropless_routing(config, router_weights, x_flat):
+    """Dropless MoE routing: sort tokens by expert, compute group_sizes.
+
+    Args:
+        config: Config with n_experts, n_active_experts
+        router_weights: [D, E] router projection
+        x_flat: [N, D] flattened input tokens
+
+    Returns:
+        sorted_inputs:    [N*K, D] tokens sorted by expert assignment
+        sorted_indices:   [N*K] permutation (for unsorting)
+        group_sizes:      [E] int32 — tokens per expert
+        top_k_weights:    [N, K] routing weights
+        top_k_idx:        [N, K] expert assignments
+        router_logits:    [N, E] raw logits (for aux/z loss)
+    """
+    N, D = x_flat.shape
+    E = config.n_experts
+    K = config.n_active_experts
+
+    # Step 1: Route
+    router_logits = jnp.einsum('nd,de->ne', x_flat, router_weights)  # [N, E]
+    top_k_logits, top_k_idx = jax.lax.top_k(router_logits, K)        # [N, K]
+    top_k_weights = jax.nn.softmax(top_k_logits, axis=-1)             # [N, K]
+
+    # Step 2: Flatten
+    expert_flat = top_k_idx.reshape(N * K)       # [N*K]
+    x_rep = jnp.repeat(x_flat, K, axis=0)        # [N*K, D]
+
+    # Step 3: Sort by expert assignment
+    sorted_indices = jnp.argsort(expert_flat)
+    sorted_inputs = x_rep[sorted_indices]         # [N*K, D]
+
+    # Step 4: Count tokens per expert
+    group_sizes = jnp.bincount(expert_flat, length=E).astype(jnp.int32)
+
+    return sorted_inputs, sorted_indices, group_sizes, top_k_weights, top_k_idx, router_logits
+
+
+def dropless_combine(down_sorted, sorted_indices, top_k_weights, N, K, D):
+    """Unsort expert outputs and combine with routing weights.
+
+    Args:
+        down_sorted: [N*K, D] expert outputs in sorted order
+        sorted_indices: [N*K] permutation used for sorting
+        top_k_weights: [N, K] routing weights
+        N, K, D: dimensions
+
+    Returns:
+        output: [N, D]
+    """
+    # Unsort back to original token order
+    unsorted = jnp.zeros_like(down_sorted)
+    unsorted = unsorted.at[sorted_indices].set(down_sorted)
+
+    # Weight by routing scores and sum over K experts
+    weight_flat = top_k_weights.reshape(N * K)
+    weighted = unsorted * weight_flat[:, None]
+    return weighted.reshape(N, K, D).sum(axis=1)
+
+
+def moe_capless_forward(config, layer, x):
+    """Capless (dropless) MoE forward using tokamax grouped matmul.
+
+    Same interface as moe_forward but uses sorted grouped matmul instead of
+    capacity-based dispatch. No tokens are dropped.
+
+    Returns: (output, aux_loss, z_loss)
+    """
+    B, T, D = x.shape
+    N = B * T
+    E = config.n_experts
+    K = config.n_active_experts
+    x_flat = x.reshape(N, D)
+
+    # ── Route + sort ──
+    (sorted_inputs, sorted_indices, group_sizes,
+     top_k_weights, top_k_idx, router_logits) = dropless_routing(
+        config, layer.router, x_flat)
+
+    # ── Aux + z losses (same as capped) ──
+    z_loss = jnp.mean(jax.nn.logsumexp(router_logits, axis=-1) ** 2)
+    router_probs = jax.nn.softmax(router_logits, axis=-1)
+    expert_mask = jax.nn.one_hot(top_k_idx, E)
+    f = jnp.sum(expert_mask, axis=(0, 1)) / (N * K)
+    P = jnp.mean(router_probs, axis=0)
+    aux_loss = E * jnp.sum(f * P)
+
+    # ── Expert ReLU² via tokamax grouped matmul ──
+    up = tokamax.ragged_dot(sorted_inputs, layer.expert_w_up, group_sizes)
+    up = jax.nn.relu(up) ** 2
+    down = tokamax.ragged_dot(up, layer.expert_w_down, group_sizes)
+
+    # ── Combine ──
+    output = dropless_combine(down, sorted_indices, top_k_weights, N, K, D)
+    return output.reshape(B, T, D), aux_loss, z_loss
+
+
 def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
     """Forward pass for one transformer layer (attention + MoE)."""
     h = rms_norm(x)
@@ -560,7 +660,10 @@ def single_layer_forward(config, layer, x, cos, sin, layer_idx=0):
 
     with jax.named_scope(f'layer_{layer_idx}/moe'):
         h2 = rms_norm(x)
-        moe_out, aux_loss, z_loss = moe_forward(config, layer, h2)
+        if config.moe_impl == 'capless':
+            moe_out, aux_loss, z_loss = moe_capless_forward(config, layer, h2)
+        else:
+            moe_out, aux_loss, z_loss = moe_forward(config, layer, h2)
 
     x = x + moe_out
     return x, aux_loss, z_loss
@@ -757,6 +860,27 @@ def generate(config, params, enc, prompt, max_new_tokens=64,
         ids.append(next_id)
 
     return enc.decode(ids)
+
+# %%
+# === Tokamax autotuning (capless MoE only) ===
+if config.moe_impl == 'capless':
+    N_auto = config.microbatch_size * config.seq_len * config.n_active_experts
+    dummy_lhs = jax.ShapeDtypeStruct((N_auto, config.n_embd), jnp.bfloat16)
+    dummy_rhs = jax.ShapeDtypeStruct(
+        (config.n_experts, config.n_embd, config.expert_mlp_dim), jnp.bfloat16)
+    dummy_gs = tokamax.RaggedDotGroupSizes(
+        jnp.array([N_auto // config.n_experts] * config.n_experts, jnp.int32),
+        representative_value=(N_auto // config.n_experts,) * config.n_experts)
+    tokamax.autotune(lambda: tokamax.ragged_dot(dummy_lhs, dummy_rhs, dummy_gs))
+
+    # Also autotune the down-projection shape (F -> D)
+    dummy_lhs_down = jax.ShapeDtypeStruct(
+        (N_auto, config.expert_mlp_dim), jnp.bfloat16)
+    dummy_rhs_down = jax.ShapeDtypeStruct(
+        (config.n_experts, config.expert_mlp_dim, config.n_embd), jnp.bfloat16)
+    tokamax.autotune(
+        lambda: tokamax.ragged_dot(dummy_lhs_down, dummy_rhs_down, dummy_gs))
+    print(f'Tokamax autotuning complete (N={N_auto}, E={config.n_experts})')
 
 # %% [markdown]
 # ## Quick Training (XProf)
