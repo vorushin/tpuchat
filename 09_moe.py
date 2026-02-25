@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 27)
+# # 09 — MoE Training Lab (rev 28)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -82,7 +82,7 @@ flags.FLAGS(sys.argv, known_only=True)  # parse before tokamax to avoid Colab's 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 27
+REVISION = 28
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -887,7 +887,8 @@ if config.moe_impl == 'capless':
         jax.ShapeDtypeStruct((_N, config.expert_mlp_dim), jnp.bfloat16),
         jax.ShapeDtypeStruct((config.n_experts, config.expert_mlp_dim, config.n_embd), jnp.bfloat16),
         _gs)
-    _tokamax_ctx = (_up_result + _down_result).__enter__()
+    _up_result.__enter__()
+    _down_result.__enter__()
     print(f'Tokamax autotuning complete (N={_N}, E={config.n_experts})')
 
 # %% [markdown]
