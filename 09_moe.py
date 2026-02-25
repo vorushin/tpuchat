@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/09_moe.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 09 — MoE Training Lab (rev 31)
+# # 09 — MoE Training Lab (rev 32)
 #
 # Mixture of Experts variant of the
 # [TPU Ablation Lab](https://github.com/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb).
@@ -76,17 +76,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tokamax
-from tokamax._src.ops.ragged_dot.pallas_mosaic_tpu import Config as TpuRaggedDotConfig
 from absl import flags
 flags.FLAGS(sys.argv, known_only=True)  # parse before tokamax to avoid Colab's -f flag error
-
-_RAGGED_DOT_CONFIG = TpuRaggedDotConfig(
-    tile_m=1024, tile_k=1024, tile_n=1024)
 
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 31
+REVISION = 32
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -607,10 +603,10 @@ def moe_capless_forward(config, layer, x):
 
     # ── Expert ReLU² via tokamax grouped matmul ──
     up = tokamax.ragged_dot(sorted_inputs, layer.expert_w_up, group_sizes,
-                            implementation='mosaic', config=_RAGGED_DOT_CONFIG)
+                            implementation='xla')
     up = jax.nn.relu(up) ** 2
     down = tokamax.ragged_dot(up, layer.expert_w_down, group_sizes,
-                              implementation='mosaic', config=_RAGGED_DOT_CONFIG)
+                              implementation='xla')
 
     # ── Combine ──
     output = dropless_combine(down, sorted_indices, top_k_weights, N, K, D)
