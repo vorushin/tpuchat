@@ -1525,13 +1525,13 @@ check_metadata("Zero-size group (non-aligned)",
 #   regular inputs.
 
 # %%
-M13c, N13c = 1024, 64
-bm13c = 128
-G13c = 3
+M13, N13 = 1024, 64
+bm13 = 128
+G13 = 3
 
-group_sizes_13c = jnp.array([300, 212, 512], dtype=jnp.int32)
-(group_offsets_13c, group_ids_13c, m_tile_ids_13c), num_tiles_13c = \
-    make_group_metadata_reference(group_sizes_13c, M13c, bm13c)
+group_sizes_13 = jnp.array([300, 212, 512], dtype=jnp.int32)
+(group_offsets_13, group_ids_13, m_tile_ids_13), num_tiles_13 = \
+    make_group_metadata_reference(group_sizes_13, M13, bm13)
 
 # The kernel is provided (solved):
 def masked_copy_kernel_solved(group_offsets_ref, group_ids_ref, m_tile_ids_ref,
@@ -1542,22 +1542,22 @@ def masked_copy_kernel_solved(group_offsets_ref, group_ids_ref, m_tile_ids_ref,
     m_tile = m_tile_ids_ref[grid_id]
     group_start = group_offsets_ref[group_id]
     group_end = group_offsets_ref[group_id + 1]
-    tile_start = m_tile * bm13c
+    tile_start = m_tile * bm13
 
-    row_ids = tile_start + jax.lax.broadcasted_iota(jnp.int32, (bm13c, N13c), 0)
+    row_ids = tile_start + jax.lax.broadcasted_iota(jnp.int32, (bm13, N13), 0)
     mask = (row_ids >= group_start) & (row_ids < group_end)
     o_ref[...] = jnp.where(mask, x_ref[...], o_ref[...])
 
 # Reference spec
-def masked_copy_spec_13c(x, group_offsets, group_ids, m_tile_ids):
+def masked_copy_spec_13(x, group_offsets, group_ids, m_tile_ids):
     out = jnp.zeros_like(x)
-    for grid_id in range(num_tiles_13c):
+    for grid_id in range(num_tiles_13):
         g = int(group_ids[grid_id])
         tile_id = int(m_tile_ids[grid_id])
         g_start = int(group_offsets[g])
         g_end = int(group_offsets[g + 1])
-        t_start = tile_id * bm13c
-        t_end = t_start + bm13c
+        t_start = tile_id * bm13
+        t_end = t_start + bm13
         for row in range(t_start, t_end):
             if g_start <= row < g_end:
                 out = out.at[row].set(x[row])
@@ -1565,8 +1565,8 @@ def masked_copy_spec_13c(x, group_offsets, group_ids, m_tile_ids):
 
 
 # %%
-x13c = jax.random.normal(jax.random.key(26), (M13c, N13c))
-expected13c = masked_copy_spec_13c(x13c, group_offsets_13c, group_ids_13c, m_tile_ids_13c)
+x13 = jax.random.normal(jax.random.key(26), (M13, N13))
+expected13 = masked_copy_spec_13(x13, group_offsets_13, group_ids_13, m_tile_ids_13)
 
 # YOUR TASK: Write the complete pl.pallas_call invocation.
 # Replace `None` with your working code.
@@ -1575,14 +1575,14 @@ expected13c = masked_copy_spec_13c(x13c, group_offsets_13c, group_ids_13c, m_til
 # - PrefetchScalarGridSpec with num_scalar_prefetch=3
 # - in_specs: BlockSpec that uses m_tile_ids to route tiles
 # - out_specs: BlockSpec that uses m_tile_ids to route tiles
-# - grid=(num_tiles_13c,)
+# - grid=(num_tiles_13,)
 # - Call args: (group_offsets, group_ids, m_tile_ids, x) — scalar prefetch first!
-actual13c = None  # Replace with pl.pallas_call(...)(...) invocation
+actual13 = None  # Replace with pl.pallas_call(...)(...) invocation
 
 
 # %%
-if actual13c is not None and jnp.allclose(actual13c, expected13c, atol=1e-5):
-    print(f"PASSED ✓  (shape={actual13c.shape})")
+if actual13 is not None and jnp.allclose(actual13, expected13, atol=1e-5):
+    print(f"PASSED ✓  (shape={actual13.shape})")
 else:
     print("FAILED ✗  (fill in the cell above)")
 
@@ -1590,13 +1590,13 @@ else:
 # <details><summary>Hint 1 of 2 — Structure</summary>
 #
 # ```python
-# actual13c = pl.pallas_call(
+# actual13 = pl.pallas_call(
 #     masked_copy_kernel_solved,
 #     grid_spec=pltpu.PrefetchScalarGridSpec(
 #         num_scalar_prefetch=3,
-#         in_specs=[pl.BlockSpec((bm13c, N13c), lambda i, go, gi, mt: (mt[i], 0))],
-#         out_specs=pl.BlockSpec((bm13c, N13c), lambda i, go, gi, mt: (mt[i], 0)),
-#         grid=(num_tiles_13c,),
+#         in_specs=[pl.BlockSpec((bm13, N13), lambda i, go, gi, mt: (mt[i], 0))],
+#         out_specs=pl.BlockSpec((bm13, N13), lambda i, go, gi, mt: (mt[i], 0)),
+#         grid=(num_tiles_13,),
 #     ),
 #     out_shape=...,
 #     interpret=True,
@@ -1607,17 +1607,17 @@ else:
 # <details><summary>Hint 2 of 2 — Full solution</summary>
 #
 # ```python
-# actual13c = pl.pallas_call(
+# actual13 = pl.pallas_call(
 #     masked_copy_kernel_solved,
 #     grid_spec=pltpu.PrefetchScalarGridSpec(
 #         num_scalar_prefetch=3,
-#         in_specs=[pl.BlockSpec((bm13c, N13c), lambda i, go, gi, mt: (mt[i], 0))],
-#         out_specs=pl.BlockSpec((bm13c, N13c), lambda i, go, gi, mt: (mt[i], 0)),
-#         grid=(num_tiles_13c,),
+#         in_specs=[pl.BlockSpec((bm13, N13), lambda i, go, gi, mt: (mt[i], 0))],
+#         out_specs=pl.BlockSpec((bm13, N13), lambda i, go, gi, mt: (mt[i], 0)),
+#         grid=(num_tiles_13,),
 #     ),
-#     out_shape=jax.ShapeDtypeStruct((M13c, N13c), jnp.float32),
+#     out_shape=jax.ShapeDtypeStruct((M13, N13), jnp.float32),
 #     interpret=True,
-# )(group_offsets_13c, group_ids_13c, m_tile_ids_13c, x13c)
+# )(group_offsets_13, group_ids_13, m_tile_ids_13, x13)
 # ```
 # </details>
 
