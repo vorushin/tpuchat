@@ -162,7 +162,7 @@ check(add10_kernel, add10_spec, (x1,))
 
 # %% [markdown]
 # ---
-# ## Puzzle 2: Tiled Vector Add
+# ## Puzzle 2a: Tiled Vector Add
 #
 # **Goal**: Add two vectors using a 1D grid with block tiling.
 #
@@ -229,10 +229,10 @@ check(vadd_kernel, vadd_spec, (x2, y2),
 
 # %% [markdown]
 # ---
-# ## Puzzle 2a: Reversed Block Add — Index Map Manipulation
+# ## Puzzle 2b: Reversed Block Add — Index Map Manipulation
 #
 # **Goal**: Add `x` to a **block-reversed** version of `y` by changing
-# only the index map. The kernel body is identical to Puzzle 2!
+# only the index map. The kernel body is identical to Puzzle 2a!
 #
 # ### Theory
 #
@@ -257,7 +257,7 @@ check(vadd_kernel, vadd_spec, (x2, y2),
 # simple and generic.
 
 # %%
-N2a = 256   # vector length (same as Puzzle 2)
+N2a = 256   # vector length (same as Puzzle 2a)
 bm2a = 64   # tile size
 num_blocks_2a = N2a // bm2a   # 4 blocks total
 
@@ -267,7 +267,7 @@ def vadd_rev_spec(x, y):
     y_rev = y.reshape(num_blocks_2a, bm2a)[::-1].reshape(N2a)
     return x + y_rev
 
-# Kernel is provided (same body as Puzzle 2):
+# Kernel is provided (same body as Puzzle 2a):
 def vadd_rev_kernel(x_ref, y_ref, o_ref):
     o_ref[...] = x_ref[...] + y_ref[...]
 
@@ -313,7 +313,7 @@ check(vadd_rev_kernel, vadd_rev_spec, (x2a, y2a),
 # means "tile `(i,j)` is the block at rows `[i*bm:(i+1)*bm]`,
 # cols `[j*bn:(j+1)*bn]`".
 #
-# **Key insight**: The kernel body is identical to Puzzle 2 — just
+# **Key insight**: The kernel body is identical to Puzzle 2a — just
 # `o_ref[...] = f(x_ref[...])`. The BlockSpec handles all the 2D
 # indexing. This is the power of Pallas's tiling abstraction: the
 # kernel doesn't care whether the grid is 1D, 2D, or 3D.
@@ -356,7 +356,7 @@ check(mul2d_kernel, mul2d_spec, (x3,),
 # %% [markdown]
 # <details><summary>Hint</summary>
 #
-# Same as Puzzle 2 — `o_ref[...] = x_ref[...] * 2.0`. The 2D BlockSpec
+# Same as Puzzle 2a — `o_ref[...] = x_ref[...] * 2.0`. The 2D BlockSpec
 # handles the tiling.
 # </details>
 
@@ -446,7 +446,7 @@ check(outer_kernel, outer_spec, (a4, b4),
 #
 # 3. **`out_specs`**: a single `BlockSpec` for the output.
 #
-# The kernel below is the solved version from Puzzle 2. Your task is to
+# The kernel below is the solved version from Puzzle 2a. Your task is to
 # wire up the tiling so it processes `N5`-element vectors in blocks of
 # `bm5`.
 
@@ -2670,7 +2670,8 @@ else:
 # | Concept | Puzzle |
 # |---------|--------|
 # | `pallas_call`, Refs, `ref[...]` syntax | 1 |
-# | `grid`, `BlockSpec`, `program_id` | 2, 3 |
+# | `grid`, `BlockSpec`, `program_id` | 2a, 3 |
+# | Index map manipulation | 2b |
 # | Broadcasting inside kernels | 4 |
 # | Configure your own `pallas_call` | 5, 8, 13, 15 |
 # | `@pl.when` conditional execution | 6 |
