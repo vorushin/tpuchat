@@ -675,6 +675,11 @@ assert compute_tile_visits(
     jnp.array([300, 0, 724], dtype=jnp.int32),
     jnp.array([0, 300, 300, 1024], dtype=jnp.int32), 8, 128
 ).tolist() == [1, 1, 2, 1, 1, 1, 1, 1]
+# Must return int32 (jnp.histogram returns float32 — don't forget .astype)
+assert compute_tile_visits(
+    jnp.array([300, 212, 512], dtype=jnp.int32),
+    jnp.array([0, 300, 512, 1024], dtype=jnp.int32), 8, 128
+).dtype == jnp.int32, "compute_tile_visits must return int32, not float32"
 print("Step 10d — compute_tile_visits: PASSED ✓")
 
 # %% [markdown]
