@@ -60,6 +60,3 @@ Notebooks are stored as `.py` files in [jupytext percent format](https://jupytex
 | `02_train.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/02_train.ipynb) | Pretrain GPT model in raw JAX on single TPU |
 | `03_worker.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/03_worker.ipynb) | wandb hyperparameter sweep worker |
 | `04_maxtext.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/04_maxtext.ipynb) | MaxText-inspired ~370M model (SwiGLU, 256-aligned dims) |
-| `10a_pallas_foundations.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10a_pallas_foundations.ipynb) | Pallas Foundations — 6 puzzles teaching core TPU kernel concepts |
-| `10b_pallas_intermediate.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10b_pallas_intermediate.ipynb) | Toward Grouped Operations — dynamic indexing, group metadata, store masks |
-| `10c_pallas_ragged_dot.py` | [Open](https://colab.research.google.com/github/vorushin/tpuchat/blob/master/10c_pallas_ragged_dot.ipynb) | Building Ragged Dot — full GMM and tgmm kernel puzzles |
