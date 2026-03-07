@@ -31,10 +31,20 @@ def load_connection(path="pallas/.colab_connection", connect=None):
     return url.strip(), token.strip()
 
 
+def _parse_response(resp):
+    """Parse JSON response, show raw body on failure."""
+    try:
+        return resp.json()
+    except Exception:
+        print(f"HTTP {resp.status_code} — non-JSON response:", file=sys.stderr)
+        print(resp.text[:500], file=sys.stderr)
+        sys.exit(1)
+
+
 def do_health(url, token):
     resp = requests.get(f"{url}/health",
                         headers={"X-Auth-Token": token}, timeout=30)
-    data = resp.json()
+    data = _parse_response(resp)
     if "error" in data:
         print(f"Error: {data['error']}", file=sys.stderr)
         return 1
@@ -50,7 +60,7 @@ def do_exec(url, token, code, timeout):
                          headers={"X-Auth-Token": token},
                          json={"code": code},
                          timeout=timeout)
-    data = resp.json()
+    data = _parse_response(resp)
 
     if data.get("stdout"):
         print(data["stdout"], end="")
