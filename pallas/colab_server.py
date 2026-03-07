@@ -23,7 +23,7 @@
 # iterate on Pallas kernels without restarting the runtime.
 
 # %%
-# !pip install -q flask pyngrok
+# !pip install -q --ignore-installed flask pyngrok
 
 # %%
 import functools as ft, io, json, os, secrets, sys, time, traceback, threading
