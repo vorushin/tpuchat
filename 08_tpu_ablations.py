@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 08 — TPU Ablation Lab (rev 40)
+# # 08 — TPU Ablation Lab (rev 41)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-v6e-50usd).
@@ -84,7 +84,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 40
+REVISION = 41
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -553,46 +553,29 @@ def _logit_dtype(config):
 # Vocab-dimension chunked LM head loss — splits lm_head weight along V,
 # never materializing the full (B, T, V) logit tensor.
 # Loss accumulated via logaddexp across chunks for numerical stability.
-# custom_vjp controls backward memory: recomputes logits per chunk instead of
-# saving all intermediates from the unrolled forward loop.
+# custom_vjp controls backward memory; lax.scan keeps XLA graph small
+# (Python for-loops unroll and exhaust host RAM during compilation).
 
 
-def _vocab_chunk_fwd_pass(hidden, lm_head, config):
-    """Forward pass: compute total_lse and target_logits chunk by chunk."""
-    B, T, D = hidden.shape
-    V = config.vocab_size
-    N = config.num_lm_head_chunks
-    chunk_size = V // N
-    logit_dtype = jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
-
-    total_lse = jnp.full((B, T), -jnp.inf, dtype=jnp.float32)
-
-    for c in range(N):
-        v_start = c * chunk_size
-        w_chunk = lm_head[:, v_start:v_start + chunk_size]
-        logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk,
-                              preferred_element_type=logit_dtype)
-        logits_c = config.softcap * jnp.tanh(logits_c / config.softcap)
-        total_lse = jnp.logaddexp(total_lse,
-                                  jax.nn.logsumexp(logits_c, axis=-1))
-    return total_lse
+def _reshape_lm_chunks(lm_head, num_chunks):
+    """Reshape (D, V) -> (N, D, V//N) for scanning over vocab chunks."""
+    D, V = lm_head.shape
+    return lm_head.reshape(D, num_chunks, V // num_chunks).transpose(1, 0, 2)
 
 
 @ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def chunked_lm_head_loss(hidden, lm_head, labels, config):
     """Vocab-dim chunked cross-entropy. Inputs are pre-shifted (x=tokens[:,:-1], y=tokens[:,1:])."""
     B, T, D = hidden.shape
-    V = config.vocab_size
     N = config.num_lm_head_chunks
-    chunk_size = V // N
+    chunk_size = config.vocab_size // N
     logit_dtype = jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
+    lm_chunks = _reshape_lm_chunks(lm_head, N)
+    v_starts = jnp.arange(N) * chunk_size
 
-    total_lse = jnp.full((B, T), -jnp.inf, dtype=jnp.float32)
-    target_logits = jnp.zeros((B, T), dtype=jnp.float32)
-
-    for c in range(N):
-        v_start = c * chunk_size
-        w_chunk = lm_head[:, v_start:v_start + chunk_size]
+    def fwd_body(carry, data):
+        total_lse, target_logits = carry
+        w_chunk, v_start = data
         logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk,
                               preferred_element_type=logit_dtype)
         logits_c = config.softcap * jnp.tanh(logits_c / config.softcap)
@@ -604,7 +587,12 @@ def chunked_lm_head_loss(hidden, lm_head, labels, config):
         gathered = jnp.take_along_axis(
             logits_c, safe_targets[..., None], axis=-1)[..., 0]
         target_logits = target_logits + jnp.where(in_chunk, gathered, 0.0)
+        return (total_lse, target_logits), None
 
+    init = (jnp.full((B, T), -jnp.inf, dtype=jnp.float32),
+            jnp.zeros((B, T), dtype=jnp.float32))
+    (total_lse, target_logits), _ = jax.lax.scan(
+        fwd_body, init, (lm_chunks, v_starts))
     return -jnp.mean(target_logits - total_lse)
 
 
@@ -616,47 +604,48 @@ def _chunked_lm_loss_fwd(hidden, lm_head, labels, config):
 def _chunked_lm_loss_bwd(config, residuals, g):
     hidden, lm_head, labels = residuals
     B, T, D = hidden.shape
-    V = config.vocab_size
     N = config.num_lm_head_chunks
-    chunk_size = V // N
+    chunk_size = config.vocab_size // N
     logit_dtype = jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
+    lm_chunks = _reshape_lm_chunks(lm_head, N)
+    v_starts = jnp.arange(N) * chunk_size
 
-    # Pass 1: recompute total_lse (needed for softmax probabilities)
-    total_lse = _vocab_chunk_fwd_pass(hidden, lm_head, config)
-
-    # Pass 2: compute gradients chunk by chunk
-    scale = g / (B * T)
-    d_hidden = jnp.zeros_like(hidden)
-    d_lm_head = jnp.zeros_like(lm_head)
-
-    for c in range(N):
-        v_start = c * chunk_size
-        w_chunk = lm_head[:, v_start:v_start + chunk_size]
-
-        # Recompute logits for this chunk
+    # Pass 1: recompute total_lse via scan
+    def lse_body(total_lse, w_chunk):
         logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk,
                               preferred_element_type=logit_dtype)
         logits_c = config.softcap * jnp.tanh(logits_c / config.softcap)
+        return jnp.logaddexp(total_lse,
+                             jax.nn.logsumexp(logits_c, axis=-1)), None
 
-        # Softmax probabilities (using full total_lse from all chunks)
+    total_lse, _ = jax.lax.scan(
+        lse_body, jnp.full((B, T), -jnp.inf, dtype=jnp.float32), lm_chunks)
+
+    # Pass 2: compute gradients chunk by chunk via scan
+    scale = g / (B * T)
+
+    def grad_body(d_hidden, data):
+        w_chunk, v_start = data
+        logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk,
+                              preferred_element_type=logit_dtype)
+        logits_c = config.softcap * jnp.tanh(logits_c / config.softcap)
         probs_c = jnp.exp(logits_c.astype(jnp.float32) - total_lse[..., None])
-
-        # Target indicator
         chunk_targets = labels - v_start
         in_chunk = (chunk_targets >= 0) & (chunk_targets < chunk_size)
         safe_targets = jnp.where(in_chunk, chunk_targets, 0)
         one_hot_c = (jax.nn.one_hot(safe_targets, chunk_size, dtype=jnp.float32)
                      * in_chunk[..., None].astype(jnp.float32))
-
-        # d_loss/d_logits * d_logits/d_raw (chain through softcap)
         d_logits_c = scale * (probs_c - one_hot_c)
         softcap_deriv = 1.0 - (logits_c.astype(jnp.float32) / config.softcap) ** 2
         d_raw_c = (d_logits_c * softcap_deriv).astype(hidden.dtype)
-
-        # Accumulate gradients
         d_hidden = d_hidden + jnp.einsum('btc,dc->btd', d_raw_c, w_chunk)
-        d_lm_head = d_lm_head.at[:, v_start:v_start + chunk_size].set(
-            jnp.einsum('btd,btc->dc', hidden, d_raw_c))
+        d_lm_chunk = jnp.einsum('btd,btc->dc', hidden, d_raw_c)
+        return d_hidden, d_lm_chunk
+
+    d_hidden, d_lm_chunks = jax.lax.scan(
+        grad_body, jnp.zeros_like(hidden), (lm_chunks, v_starts))
+    # (N, D, chunk_size) -> (D, V)
+    d_lm_head = d_lm_chunks.transpose(1, 0, 2).reshape(D, config.vocab_size)
 
     return d_hidden, d_lm_head, jnp.zeros_like(labels)
 

@@ -1,4 +1,4 @@
-# Test vocab-dim chunked loss with custom_vjp matches non-chunked reference
+# Test vocab-dim chunked loss (lax.scan + custom_vjp) matches non-chunked reference
 import jax
 import jax.numpy as jnp
 import functools as ft
@@ -12,30 +12,22 @@ def loss_reference(hidden, lm_head, labels):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     return -jnp.mean(jnp.take_along_axis(log_probs, labels[..., None], axis=-1))
 
-# Vocab-dim chunked with custom_vjp (matching 08_tpu_ablations.py)
-def _vocab_chunk_fwd_pass(hidden, lm_head, num_chunks):
-    B, T, D = hidden.shape
-    V = lm_head.shape[1]
-    chunk_size = V // num_chunks
-    total_lse = jnp.full((B, T), -jnp.inf, dtype=jnp.float32)
-    for c in range(num_chunks):
-        v_start = c * chunk_size
-        w_chunk = lm_head[:, v_start:v_start + chunk_size]
-        logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk)
-        logits_c = softcap * jnp.tanh(logits_c / softcap)
-        total_lse = jnp.logaddexp(total_lse, jax.nn.logsumexp(logits_c, axis=-1))
-    return total_lse
+# Vocab-dim chunked with lax.scan + custom_vjp (matching 08_tpu_ablations.py)
+def _reshape_lm_chunks(lm_head, num_chunks):
+    D, V = lm_head.shape
+    return lm_head.reshape(D, num_chunks, V // num_chunks).transpose(1, 0, 2)
 
 @ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def loss_chunked(hidden, lm_head, labels, num_chunks):
     B, T, D = hidden.shape
     V = lm_head.shape[1]
     chunk_size = V // num_chunks
-    total_lse = jnp.full((B, T), -jnp.inf, dtype=jnp.float32)
-    target_logits = jnp.zeros((B, T), dtype=jnp.float32)
-    for c in range(num_chunks):
-        v_start = c * chunk_size
-        w_chunk = lm_head[:, v_start:v_start + chunk_size]
+    lm_chunks = _reshape_lm_chunks(lm_head, num_chunks)
+    v_starts = jnp.arange(num_chunks) * chunk_size
+
+    def fwd_body(carry, data):
+        total_lse, target_logits = carry
+        w_chunk, v_start = data
         logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk)
         logits_c = softcap * jnp.tanh(logits_c / softcap)
         total_lse = jnp.logaddexp(total_lse, jax.nn.logsumexp(logits_c, axis=-1))
@@ -44,6 +36,11 @@ def loss_chunked(hidden, lm_head, labels, num_chunks):
         safe_targets = jnp.where(in_chunk, chunk_targets, 0)
         gathered = jnp.take_along_axis(logits_c, safe_targets[..., None], axis=-1)[..., 0]
         target_logits = target_logits + jnp.where(in_chunk, gathered, 0.0)
+        return (total_lse, target_logits), None
+
+    init = (jnp.full((B, T), -jnp.inf, dtype=jnp.float32),
+            jnp.zeros((B, T), dtype=jnp.float32))
+    (total_lse, target_logits), _ = jax.lax.scan(fwd_body, init, (lm_chunks, v_starts))
     return -jnp.mean(target_logits - total_lse)
 
 def _fwd(hidden, lm_head, labels, num_chunks):
@@ -55,13 +52,21 @@ def _bwd(num_chunks, residuals, g):
     B, T, D = hidden.shape
     V = lm_head.shape[1]
     chunk_size = V // num_chunks
-    total_lse = _vocab_chunk_fwd_pass(hidden, lm_head, num_chunks)
+    lm_chunks = _reshape_lm_chunks(lm_head, num_chunks)
+    v_starts = jnp.arange(num_chunks) * chunk_size
+
+    # Pass 1: recompute total_lse
+    def lse_body(total_lse, w_chunk):
+        logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk)
+        logits_c = softcap * jnp.tanh(logits_c / softcap)
+        return jnp.logaddexp(total_lse, jax.nn.logsumexp(logits_c, axis=-1)), None
+    total_lse, _ = jax.lax.scan(
+        lse_body, jnp.full((B, T), -jnp.inf, dtype=jnp.float32), lm_chunks)
+
+    # Pass 2: gradients
     scale = g / (B * T)
-    d_hidden = jnp.zeros_like(hidden)
-    d_lm_head = jnp.zeros_like(lm_head)
-    for c in range(num_chunks):
-        v_start = c * chunk_size
-        w_chunk = lm_head[:, v_start:v_start + chunk_size]
+    def grad_body(d_hidden, data):
+        w_chunk, v_start = data
         logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk)
         logits_c = softcap * jnp.tanh(logits_c / softcap)
         probs_c = jnp.exp(logits_c - total_lse[..., None])
@@ -73,8 +78,12 @@ def _bwd(num_chunks, residuals, g):
         softcap_deriv = 1.0 - (logits_c / softcap) ** 2
         d_raw_c = d_logits_c * softcap_deriv
         d_hidden = d_hidden + jnp.einsum('btc,dc->btd', d_raw_c, w_chunk)
-        d_lm_head = d_lm_head.at[:, v_start:v_start + chunk_size].set(
-            jnp.einsum('btd,btc->dc', hidden, d_raw_c))
+        d_lm_chunk = jnp.einsum('btd,btc->dc', hidden, d_raw_c)
+        return d_hidden, d_lm_chunk
+
+    d_hidden, d_lm_chunks = jax.lax.scan(
+        grad_body, jnp.zeros_like(hidden), (lm_chunks, v_starts))
+    d_lm_head = d_lm_chunks.transpose(1, 0, 2).reshape(D, V)
     return d_hidden, d_lm_head, jnp.zeros_like(labels)
 
 loss_chunked.defvjp(_fwd, _bwd)
@@ -105,7 +114,6 @@ for name, g_test in [("Chunked (2)", g_c2), ("Chunked (4)", g_c4)]:
     d_w_err = jnp.max(jnp.abs(g_ref[1] - g_test[1]))
     print(f"{name} grad: d_hidden max_err={d_h_err:.2e}, d_lm_head max_err={d_w_err:.2e}")
 
-# Verdict
 max_err = max(
     jnp.max(jnp.abs(g_ref[0] - g_c2[0])),
     jnp.max(jnp.abs(g_ref[1] - g_c2[1])),
