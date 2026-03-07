@@ -17,7 +17,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/08_tpu_ablations.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 08 — TPU Ablation Lab (rev 38)
+# # 08 — TPU Ablation Lab (rev 39)
 #
 # Companion notebook for
 # [LLM pretraining on TPU v6e with a $50 budget](https://vorushin.github.io/blog/llm-pretraining-tpu-v6e-50usd).
@@ -39,9 +39,9 @@
 # | Total params | 163.6M |
 # | Non-embed params | 130.0M |
 # | Tokens/step | 131,072 (64 × 2048) |
-# | Step time (splash) | ~302ms (16 microbatches) |
-# | Throughput | ~435k tok/s |
-# | MFU | ~46.5% |
+# | Step time (splash) | ~275ms (16 microbatches) |
+# | Throughput | ~477k tok/s |
+# | MFU | ~50.9% |
 # | Hero run (20 tok/param) | ~2.6B tokens, ~19.8k steps, ~1.7h |
 #
 # ### Setup: Colab Secrets
@@ -84,7 +84,7 @@ import optax
 # TPU v6e-1 constants
 PEAK_TFLOPS = 918          # bf16 peak compute per chip
 
-REVISION = 38
+REVISION = 39
 
 print(f"JAX version : {jax.__version__}")
 print(f"Devices     : {jax.devices()}")
@@ -379,7 +379,7 @@ class Config:
     softcap: float = 15.0
     logit_dtype: str = 'bf16'       # 'bf16' or 'fp32' — bf16 is ~4% faster
     splash_block_size: int = 1024
-    num_lm_head_chunks: int = 8
+    num_lm_head_chunks: int = 2
     batch_size: int = 64
     microbatch_size: int = 4    # gradient accumulation when < batch_size
 
@@ -550,66 +550,39 @@ def _logit_dtype(config):
     return jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
 
 
-# Chunked LM head loss, reduces HMB usage by the last matmul (hidden_dim -> vocab_dim).
-# Extracted from maxtext.
+# Vocab-dimension chunked LM head loss — splits lm_head weight along V,
+# never materializing the full (B, T, V) logit tensor.
+# Loss accumulated via logaddexp across chunks for numerical stability.
 
 
-def _logits_from_chunk(h_chunk, lm_head, config):
-    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
-                        preferred_element_type=_logit_dtype(config))
-    return config.softcap * jnp.tanh(logits / config.softcap)
-
-
-@ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def chunked_lm_head_loss(hidden, lm_head, labels, config):
+    """Vocab-dim chunked cross-entropy. Inputs are pre-shifted (x=tokens[:,:-1], y=tokens[:,1:])."""
     B, T, D = hidden.shape
+    V = config.vocab_size
     N = config.num_lm_head_chunks
-    S = B * T // N
-    hidden_chunks = hidden.reshape(N, S, D)
-    labels_chunks = labels.reshape(N, S)
+    chunk_size = V // N
+    logit_dtype = jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
 
-    def fwd_body(_, data):
-        h_chunk, l_chunk = data
-        return None, jnp.sum(
-            optax.softmax_cross_entropy_with_integer_labels(
-                _logits_from_chunk(h_chunk, lm_head, config), l_chunk))
+    total_lse = jnp.full((B, T), -jnp.inf, dtype=jnp.float32)
+    target_logits = jnp.zeros((B, T), dtype=jnp.float32)
 
-    _, chunk_losses = jax.lax.scan(fwd_body, None, (hidden_chunks, labels_chunks))
-    return jnp.sum(chunk_losses) / (B * T)
+    for c in range(N):
+        v_start = c * chunk_size
+        v_end = v_start + chunk_size
+        w_chunk = lm_head[:, v_start:v_end]
+        logits_c = jnp.einsum('btd,dc->btc', hidden, w_chunk,
+                              preferred_element_type=logit_dtype)
+        logits_c = config.softcap * jnp.tanh(logits_c / config.softcap)
+        total_lse = jnp.logaddexp(total_lse,
+                                  jax.nn.logsumexp(logits_c, axis=-1))
+        chunk_targets = labels - v_start
+        in_chunk = (chunk_targets >= 0) & (chunk_targets < chunk_size)
+        safe_targets = jnp.where(in_chunk, chunk_targets, 0)
+        gathered = jnp.take_along_axis(
+            logits_c, safe_targets[..., None], axis=-1)[..., 0]
+        target_logits = target_logits + jnp.where(in_chunk, gathered, 0.0)
 
-
-def _chunked_loss_fwd(hidden, lm_head, labels, config):
-    loss = chunked_lm_head_loss(hidden, lm_head, labels, config)
-    return loss, (hidden, lm_head, labels)
-
-
-def _chunked_loss_bwd(config, residuals, g):
-    hidden, lm_head, labels = residuals
-    B, T, D = hidden.shape
-    N = config.num_lm_head_chunks
-    S = B * T // N
-    hidden_chunks = hidden.reshape(N, S, D)
-    labels_chunks = labels.reshape(N, S)
-
-    def bwd_body(d_lm_head_acc, data):
-        h_chunk, l_chunk = data
-
-        def chunk_loss(h, w):
-            return jnp.sum(
-                optax.softmax_cross_entropy_with_integer_labels(
-                    _logits_from_chunk(h, w, config), l_chunk))
-
-        _, vjp_fn = jax.vjp(chunk_loss, h_chunk, lm_head)
-        d_h, d_w = vjp_fn(g / (B * T))
-        return d_lm_head_acc + d_w, d_h
-
-    d_lm_head_init = jnp.zeros_like(lm_head)
-    d_lm_head, d_hidden_chunks = jax.lax.scan(
-        bwd_body, d_lm_head_init, (hidden_chunks, labels_chunks))
-    return d_hidden_chunks.reshape(B, T, D), d_lm_head, jnp.zeros_like(labels)
-
-
-chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
+    return -jnp.mean(target_logits - total_lse)
 
 
 def make_train_step(optimizer):
