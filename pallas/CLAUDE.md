@@ -36,7 +36,7 @@ B=4 (microbatch), T=2048, D=1024, N=4, K=1, H=256, F=3072, L=8, V=32768
 
 | Metric | Current | Best found |
 |--------|---------|------------|
-| Full step | 290ms, 48.3% MFU | ~285ms, 49.2% MFU |
+| Full step | 290ms, 48.3% MFU | **275ms, 50.9% MFU** |
 | Per layer fwd+bwd | 1.35ms, 64.2% MFU | (already optimal) |
 | lm_head+loss fwd+bwd | 5.21ms (batch-chunked 8) | 3.40ms (vocab-chunked 2), 52.7% MFU |
 
@@ -57,7 +57,32 @@ The current `num_lm_head_chunks=8` chunks along the **batch dimension** (B×T), 
 
 Options: (a) remove chunking entirely (simplest, +0.8% MFU), or (b) switch to vocab-dim 2 chunks (best perf, +0.9% MFU, slight loss difference from logaddexp accumulation).
 
-### 2. Keep current defaults — they're already optimal
+### 2. Accumulate gradients inside the microbatch scan
+**Impact: ~6ms/step (+1.0% MFU)**
+
+Current code collects all 16 microbatch gradients into a `(16, ...)` array, then does `jax.tree.map(lambda g: jnp.mean(g, axis=0), grads)` post-hoc. This costs 5.84ms.
+
+Instead, accumulate inside the scan body:
+```python
+def body(carry, tok):
+    p, g_acc = carry
+    loss, grads = jax.value_and_grad(loss_fn, argnums=1)(cfg, p, tok)
+    g_acc = jax.tree.map(lambda a, g: a + g, g_acc, grads)
+    return (p, g_acc), loss
+```
+Then divide by `n_mb` once at the end. This avoids materializing the `(16, ...)` grad tensor.
+
+### 3. Combined: both optimizations stack
+**Impact: 275ms, 50.9% MFU (was 290ms, 48.3%)**
+
+| Approach | Step time | MFU |
+|----------|-----------|-----|
+| A: Baseline (current 08) | 290ms | 48.3% |
+| B: Accum grads only | 284ms | 49.3% |
+| C: Vocab-dim 2 chunks only | 285ms | 49.2% |
+| **D: Both combined** | **275ms** | **50.9%** |
+
+### 4. Keep current defaults — they're already optimal
 - `splash_block_size=1024` — best among 256/512/1024/2048
 - `microbatch_size=4, num_microbatches=16` — best among mb=2/4/8/16
 - `logit_dtype='bf16'` — already fastest
@@ -122,6 +147,24 @@ w_chunk = lm_head[:, v_start:v_end]  # (D, V/N), logits are (B,T,V/N)
 | 8 chunks | 4.00ms | 44.8% |
 
 Vocab-dim 2 chunks is the winner. Note: slight loss difference (2.3e-2) vs non-chunked due to logaddexp accumulation — numerically equivalent for training.
+
+### lax.scan for layers — DON'T
+
+Using `lax.scan` over stacked layer params instead of a Python `for` loop is **47% slower** (425ms/33% vs 290ms/48.3%). Same principle as Pallas: it blocks XLA's cross-layer optimization. Always use Python loops for layers.
+
+### Step time gap analysis
+
+Where the full step time goes (290ms baseline):
+
+| Component | Per-mb | × 16 | Total |
+|-----------|--------|------|-------|
+| 8 layers fwd+bwd | 10.8ms | 16 | 172.8ms |
+| lm_head+loss fwd+bwd | ~4.9ms | 16 | ~78ms |
+| Embedding + norms | ~0.6ms | 16 | ~9.6ms |
+| Grad averaging | — | — | 5.8ms |
+| Scan + other overhead | — | — | ~24ms |
+
+Embedding (0.63ms fwd+bwd) and RMSNorm (0.25ms) are memory-bound — not optimizable via MXU. RoPE precompute is 0.20ms per microbatch (recomputed 16 times but cheap). The main actionable items were grad averaging (5.8ms) and lm_head chunking overhead.
 
 ### Step breakdown (per microbatch)
 
