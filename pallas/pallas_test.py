@@ -41,7 +41,8 @@ def _rmsnorm_linear_kernel(x_ref, w_ref, out_ref):
     d = x.shape[-1]
     rms = jnp.sum(x * x, axis=-1, keepdims=True) / d
     x_norm = (x * jax.lax.rsqrt(rms + 1e-6)).astype(jnp.bfloat16)
-    out_ref[...] = jnp.dot(x_norm, w_ref[...])
+    out_ref[...] = jnp.dot(x_norm, w_ref[...],
+                           preferred_element_type=jnp.float32).astype(jnp.bfloat16)
 
 
 def rmsnorm_linear(x, w, *, block_m=128, block_n=128, interpret=False):
@@ -76,8 +77,9 @@ def test_rmsnorm_linear():
     x = jax.random.normal(k1, (M, D), dtype=jnp.bfloat16)
     w = jax.random.normal(k2, (D, F), dtype=jnp.bfloat16)
 
-    # Reference: float32 norm -> bf16 -> matmul (matches kernel behavior)
-    ref = rms_norm(x.astype(jnp.float32)).astype(jnp.bfloat16) @ w
+    # Reference: float32 norm -> bf16 -> matmul with f32 accumulator (matches kernel/TPU)
+    x_norm = rms_norm(x.astype(jnp.float32)).astype(jnp.bfloat16)
+    ref = jnp.dot(x_norm, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
 
     # Fused kernel (block_m=16 divides M=64, block_n=128 divides F=384)
     fused = rmsnorm_linear(x, w, block_m=16, block_n=128, interpret=True)

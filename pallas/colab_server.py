@@ -24,6 +24,7 @@
 
 # %%
 # !pip install -q --ignore-installed flask pyngrok
+# !pip install -qU "jax[tpu]"  # align libtpu with JAX (fixes Mosaic IR version mismatch)
 
 # %%
 import functools as ft, io, json, os, secrets, sys, time, traceback, threading
