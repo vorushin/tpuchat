@@ -322,6 +322,7 @@ def exec_code():
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     EXEC_NAMESPACE.pop('__result__', None)
+    ALL_RESULTS.clear()  # prevent memory accumulation across requests
 
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = stdout_buf, stderr_buf
