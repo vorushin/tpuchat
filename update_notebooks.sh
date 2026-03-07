@@ -48,4 +48,10 @@ for py_file in [0-9]*.py; do
     jupytext --to ipynb --update "$py_file"
 done
 
+# Pallas notebooks
+if [ -f pallas/colab_server.py ]; then
+    echo "Converting pallas/colab_server.py -> pallas/colab_server.ipynb"
+    jupytext --to ipynb --update pallas/colab_server.py
+fi
+
 echo "Done."

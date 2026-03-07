@@ -83,6 +83,13 @@ Single-letter notation from [How to Scale Your Model](https://jax-ml.github.io/s
 | E | Number of experts | `n_experts` |
 | k | Active experts per token | `n_active_experts` |
 
+## Pallas kernel development (pallas/)
+
+- `pallas/pallas_test.py` — local CPU correctness tests (Pallas interpret mode)
+- `pallas/colab_server.py` — jupytext notebook, open in Colab to start code execution server
+- `pallas/colab_client.py` — send code to Colab TPU, get results
+- Connection: save `URL|TOKEN` from Colab server output to `pallas/.colab_connection`
+
 ## Key conventions
 
 - **No requirements.txt** — dependencies installed via `!pip install` cells in notebooks (jax[tpu], optax, tiktoken, pyarrow, huggingface_hub, etc.)
