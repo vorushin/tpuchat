@@ -105,7 +105,7 @@ Individual projections look terrible, but XLA fuses them into the full layer at 
 ## Pallas/TPU Technical Notes
 
 - `pltpu.CompilerParams` (not `TPUCompilerParams`) in JAX 0.9.x
-- TPU MXU only does bf16 inputs → f32 accumulator (`preferred_element_type=jnp.float32`)
+- Pallas `jnp.dot` with bf16 inputs requires `preferred_element_type=jnp.float32` — Mosaic compiler constraint (`tpu.matmul` op requires 32-bit accumulator), matches MXU's native bf16→f32 accumulation mode
 - VMEM limit ~32MB — block sizes must fit all tiles
 - `dimension_semantics=['parallel','parallel']` enables Mosaic pipelining
 - Pallas kernels need `@jax.custom_vjp` to support `jax.grad` (no auto-diff)
