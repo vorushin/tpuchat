@@ -27,30 +27,52 @@ Maximize MXU utilization in the tpuchat training loop on TPU v6e.
 | HBM bandwidth | 1600 GB/s |
 | MXU | 256x256 systolic array |
 | VMEM | ~32 MB per core |
-| Arithmetic intensity | 574 FLOPs/byte |
 
 ## Model dimensions (08_tpu_ablations Config)
 
 B=4 (microbatch), T=2048, D=1024, N=4, K=1, H=256, F=3072, L=8, V=32768
 
-## Baseline Performance
+## Baseline & Optimized Performance
 
-Full training step: **290ms, 48.3% MFU** (splash attention, 16x4 microbatches, batch=64)
+| Metric | Current | Best found |
+|--------|---------|------------|
+| Full step | 290ms, 48.3% MFU | ~285ms, 49.2% MFU |
+| Per layer fwd+bwd | 1.35ms, 64.2% MFU | (already optimal) |
+| lm_head+loss fwd+bwd | 5.21ms (batch-chunked 8) | 3.40ms (vocab-chunked 2), 52.7% MFU |
 
-### Step breakdown (per microbatch, 19ms total)
+## Actionable Recommendations
 
-| Component | Time | % of step | MFU% |
-|-----------|------|-----------|------|
-| Forward (8 layers) | ~5.8ms | 32% | 41.1% |
-| Backward (8 layers) | ~9.3ms | 51% | — |
-| lm_head+loss fwd+bwd | ~3.96ms | 21% | 45.3% |
-| Optimizer (once/step) | 2.67ms | <1% | n/a |
+### 1. Fix lm_head chunking — switch from batch-dim to vocab-dim
+**Impact: ~5ms/step (+0.9% MFU)**
 
-Per-layer fwd+bwd: 1.35ms at **64.2% MFU** (splash_bs=1024)
+The current `num_lm_head_chunks=8` chunks along the **batch dimension** (B×T), not the vocabulary dimension. Each chunk still materializes (S, V) logits where V=32768 is untouched — this defeats the purpose of chunking. The `lax.scan` overhead makes it strictly worse than no chunking.
+
+**Better approach: vocab-dimension chunking** (standard, used by LiGER kernel etc.) splits the lm_head weight `(D, V)` into chunks along V. Each chunk computes `(B, T, V/N)` logits — never materializing the full `(B, T, V)` tensor. Loss is accumulated via `logaddexp` across chunks.
+
+| Approach | lm_head fwd+bwd | MFU% | Full step | MFU% |
+|----------|-----------------|------|-----------|------|
+| Batch-dim 8 chunks (current) | 5.21ms | 34.5% | 295ms | 47.5% |
+| No chunking | 3.11ms | 57.7% | 290ms | 48.3% |
+| **Vocab-dim 2 chunks** | **3.40ms** | **52.7%** | **285ms** | **49.2%** |
+
+Options: (a) remove chunking entirely (simplest, +0.8% MFU), or (b) switch to vocab-dim 2 chunks (best perf, +0.9% MFU, slight loss difference from logaddexp accumulation).
+
+### 2. Keep current defaults — they're already optimal
+- `splash_block_size=1024` — best among 256/512/1024/2048
+- `microbatch_size=4, num_microbatches=16` — best among mb=2/4/8/16
+- `logit_dtype='bf16'` — already fastest
 
 ## Key Findings
 
-### 1. Splash attention block sizes
+### XLA is very good — don't fight it
+
+1. **Pallas kernels HURT in full layers**: Our fused RMSNorm+Linear Pallas kernel beats XLA for isolated ops (25.5% vs 22.8% MFU) but is **2x slower** in a full layer (32.9% vs 64.1% MFU). Pallas kernels act as opaque barriers that block XLA's global graph optimization.
+
+2. **XLA already fuses shared-input matmuls**: Manually packing QKV into one matmul or gate+up into one matmul provides zero benefit. XLA detects the shared input and fuses automatically.
+
+3. **Rule: Only use Pallas for things XLA fundamentally can't do** — custom attention patterns, novel memory access patterns. Don't replace standard ops.
+
+### Splash attention block sizes
 
 | Block size | Layer fwd+bwd | MFU% |
 |-----------|---------------|------|
@@ -59,9 +81,7 @@ Per-layer fwd+bwd: 1.35ms at **64.2% MFU** (splash_bs=1024)
 | **1024** | **1.35ms** | **64.2%** |
 | 2048 | 1.42ms | 61.5% |
 
-splash_bs=1024 (current default) is optimal.
-
-### 2. Microbatch size sweep (total batch=64)
+### Microbatch size sweep (total batch=64)
 
 | Config | Step time | MFU% |
 |--------|-----------|------|
@@ -70,24 +90,49 @@ splash_bs=1024 (current default) is optimal.
 | mb=8 x 8 | 303ms | 46.3% |
 | mb=16 x 4 | 329ms | 42.6% |
 
-mb=4 (current default) is optimal. Larger microbatches increase memory pressure.
+### lm_head chunking: batch-dim vs vocab-dim
 
-### 3. XLA already fuses shared-input matmuls
+The current 08_tpu_ablations.py chunks along **batch** (B×T), not **vocab** (V). This is the wrong dimension — V=32768 is the large axis that should be chunked to avoid materializing huge logit tensors.
 
-Manually fusing QKV or gate+up into single matmuls provides NO benefit — XLA already does this. The gate+up fusion actually *hurt* (0.31ms → 0.44ms) because the (D, 2F=6144) output width doesn't tile as well.
+**Batch-dim chunking (current 08 code — wrong approach):**
+```python
+hidden.reshape(N, S, D)  # S = B*T/N tokens, each gets full (S,V) logits
+```
 
-### 4. Pallas kernels HURT inside full layers
+| Chunks | Isolated fwd+bwd | MFU% |
+|--------|-------------------|------|
+| **no chunking** | **3.11ms** | **57.7%** |
+| 1 (scan overhead) | 4.10ms | 43.9% |
+| 2 | 4.93ms | 36.4% |
+| 8 (current) | 5.21ms | 34.5% |
 
-| Variant | Layer fwd+bwd | MFU% |
-|---------|---------------|------|
-| **Baseline (XLA)** | **1.36ms** | **64.1%** |
-| Fused Pallas norm+proj | 2.65ms | 32.9% |
+Batch-dim chunking is strictly slower than no chunking. The `lax.scan` adds overhead with no memory benefit on the V dimension.
 
-Pallas kernels act as **opaque barriers** that break XLA's global optimization. XLA can fuse norms, matmuls, activations, and residuals across the entire layer computation graph. A Pallas kernel inserts a boundary that prevents this fusion. The isolated rmsnorm+linear kernel beats XLA (25.5% vs 22.8% MFU), but embedded in a full layer it's 2x slower.
+**Vocab-dim chunking (standard approach — recommended):**
+```python
+w_chunk = lm_head[:, v_start:v_end]  # (D, V/N), logits are (B,T,V/N)
+# Accumulate loss via logaddexp across chunks
+```
 
-**Rule: Only use Pallas for operations XLA fundamentally can't optimize** (e.g., custom attention patterns, novel memory access patterns). Don't replace standard ops that XLA handles well.
+| Chunks | Isolated fwd+bwd | MFU% |
+|--------|-------------------|------|
+| no chunking | 3.97ms | 45.2% |
+| **2 chunks** | **3.40ms** | **52.7%** |
+| 4 chunks | 3.46ms | 52.0% |
+| 8 chunks | 4.00ms | 44.8% |
 
-### 5. Individual component MFU
+Vocab-dim 2 chunks is the winner. Note: slight loss difference (2.3e-2) vs non-chunked due to logaddexp accumulation — numerically equivalent for training.
+
+### Step breakdown (per microbatch)
+
+| Component | Time | MFU% |
+|-----------|------|------|
+| Forward (8 layers) | ~5.8ms | 41.1% |
+| Backward (8 layers) | ~9.3ms | — |
+| lm_head+loss fwd+bwd | ~3.1ms | 57.7% |
+| Optimizer (once/step) | 2.67ms | n/a |
+
+### Individual component MFU
 
 | Component | Wall ms | MFU% |
 |-----------|---------|------|
