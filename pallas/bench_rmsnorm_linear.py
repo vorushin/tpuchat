@@ -1,5 +1,6 @@
 # Fused RMSNorm + Linear — TPU benchmark
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 def _rmsnorm_linear_kernel(x_ref, w_ref, out_ref):
     x = x_ref[...].astype(jnp.float32)
@@ -9,7 +10,7 @@ def _rmsnorm_linear_kernel(x_ref, w_ref, out_ref):
     out_ref[...] = jnp.dot(x_norm, w_ref[...],
                            preferred_element_type=jnp.float32).astype(jnp.bfloat16)
 
-def rmsnorm_linear(x, w, *, block_m=128, block_n=256):
+def rmsnorm_linear(x, w, *, block_m=1024, block_n=3072):
     M, D = x.shape
     _, N = w.shape
     return pl.pallas_call(
@@ -21,6 +22,9 @@ def rmsnorm_linear(x, w, *, block_m=128, block_n=256):
             pl.BlockSpec((D, block_n), lambda i, j: (0, j)),
         ],
         out_specs=pl.BlockSpec((block_m, block_n), lambda i, j: (i, j)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=['parallel', 'parallel'],
+        ),
     )(x, w)
 
 # Test shapes matching one microbatch attention projection
@@ -42,11 +46,12 @@ hbm = (M * D + D * F + M * F) * 2  # read x, read W, write out (bf16)
 print("--- Unfused (rms_norm then matmul) ---")
 benchmark(unfused, x, W, flop_count=flops, hbm_bytes=hbm, label="unfused rms_norm+linear")
 
-print("\n--- Fused Pallas kernel ---")
+print("\n--- Fused Pallas kernel (1024x3072) ---")
 benchmark(fused_jit, x, W, flop_count=flops, hbm_bytes=hbm, label="fused rms_norm+linear")
 
 # Correctness check
 ref = unfused(x, W)
 fused = fused_jit(x, W)
 abs_err = jnp.max(jnp.abs(ref - fused)).item()
-print(f"\nCorrectness: max abs error = {abs_err:.2e}")
+mean_err = jnp.mean(jnp.abs(ref - fused)).item()
+print(f"\nCorrectness: max abs err={abs_err:.2e}, mean abs err={mean_err:.2e}")
