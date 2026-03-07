@@ -190,6 +190,21 @@ Embedding (0.63ms fwd+bwd) and RMSNorm (0.25ms) are memory-bound — not optimiz
 
 Individual projections look terrible, but XLA fuses them into the full layer at 64% MFU.
 
+## Unsolved: vocab-dim chunking host OOM
+
+Vocab-dim 2 chunks gives the best MFU (275ms/50.9% combined with accum grads), and gradient correctness is verified (max error 4.47e-08). But it crashes with host RAM exhaustion during XLA compilation when used inside the full training step (`make_train_step` with microbatch scan + optimizer).
+
+Attempted fixes that all still OOM:
+1. No custom_vjp (plain autodiff through Python for loop) — OOM
+2. custom_vjp + Python for loop — OOM
+3. custom_vjp + lax.scan for all chunk loops — OOM
+
+The issue is likely the interaction between: microbatch `lax.scan` (16 iters) × `value_and_grad` × `custom_vjp` × vocab chunk `lax.scan` (2 iters) × optimizer. The combined XLA graph is too large for the host compiler's memory budget.
+
+The isolated benchmarks (bench_combined.py) work fine because they compile simpler functions without the optimizer.
+
+**Status**: Reverted to batch-dim chunking. Revisit when JAX/XLA compiler improves or when we can test with more host RAM.
+
 ## Pallas/TPU Technical Notes
 
 - `pltpu.CompilerParams` (not `TPUCompilerParams`) in JAX 0.9.x
