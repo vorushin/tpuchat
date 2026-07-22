@@ -14,7 +14,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/11_gpu_jax.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 11 — GPU Lab: JAX on NVIDIA G4 (rev 4)
+# # 11 — GPU Lab: JAX on NVIDIA G4 (rev 5)
 #
 # JAX side of the JAX-vs-PyTorch pretraining comparison on a single Colab **G4**
 # GPU (NVIDIA RTX PRO 6000 Blackwell Server Edition, 96 GB, sm_120). Mirror
@@ -91,7 +91,7 @@ GPU_PEAK_TFLOPS_QUOTED = 960   # Colab's quoted bf16 figure — likely sparse; S
 HBM_BW_GBS = 1600              # ~1.6 TB/s GDDR7
 MEASURED_PEAK_TFLOPS = None    # set by Section A (matmul calibration)
 
-REVISION = 4
+REVISION = 5
 
 # Persistent compile cache speeds up the exec-iterate loop on a warm runtime
 try:
@@ -480,7 +480,6 @@ class Config:
     mlp_dim: int = 3072             # 3072 for glu, 4096 for plain
     softcap: float = 15.0
     logit_dtype: str = 'bf16'       # 'bf16' or 'fp32' — fp32 is ~33% slower on G4
-    num_lm_head_chunks: int = 1     # chunking exists for 32 GB TPUs; on 96 GB it costs ~7% step time
     batch_size: int = 64
     microbatch_size: int = 64       # == batch_size → no gradient accumulation
 
@@ -683,73 +682,63 @@ def count_non_embed_params(params):
     return count_params(params) - params.wte.size
 
 # %%
-# === Chunked LM head loss, train/eval/predict steps, optimizer ===
+# === LM head loss (fused manual bwd), train/eval/predict steps, optimizer ===
 
 def _logit_dtype(config):
     return jnp.float32 if config.logit_dtype == 'fp32' else jnp.bfloat16
 
 
-# Chunked LM head loss, reduces HBM usage by the last matmul (hidden_dim -> vocab_dim).
-# Extracted from maxtext. On the 96 GB G4 chunking is unnecessary and the scan
-# costs ~7% step time (517ms @ 8 chunks vs 481ms @ 1) — default is 1 chunk.
-
-
-def _logits_from_chunk(h_chunk, lm_head, config):
-    logits = jnp.einsum('td,dv->tv', h_chunk, lm_head,
-                        preferred_element_type=_logit_dtype(config))
-    return config.softcap * jnp.tanh(logits / config.softcap)
+# LM head + softcap + CE with a hand-written backward. XLA's autodiff runs the
+# log_softmax/CE backward as several memory-bound passes over the (B*T, V)
+# logits (8.6 GB bf16 at B=64); saving the logsumexp from the forward lets the
+# backward be ONE fused elementwise pass — (softmax − onehot) · dsoftcap — plus
+# the two lm_head matmuls. This is the XLA-side answer to Inductor's fused
+# triton CE reduction in 12_gpu_torch.
+# Measured on G4, full train step: 517ms (maxtext 8-chunk scan, for 32 GB TPUs)
+# → 481ms (unchunked autodiff) → 460ms (this). Gradients match autodiff to
+# <5e-5. Loss/lse are computed in fp32 from bf16 logits (slightly more
+# accurate than optax's bf16 log_softmax; values differ by ~0.01).
 
 
 @ft.partial(jax.custom_vjp, nondiff_argnums=(3,))
-def chunked_lm_head_loss(hidden, lm_head, labels, config):
+def lm_head_loss(hidden, lm_head, labels, config):
+    loss, _ = _lm_head_loss_fwd(hidden, lm_head, labels, config)
+    return loss
+
+
+def _lm_head_loss_fwd(hidden, lm_head, labels, config):
     B, T, D = hidden.shape
-    N = config.num_lm_head_chunks
-    S = B * T // N
-    hidden_chunks = hidden.reshape(N, S, D)
-    labels_chunks = labels.reshape(N, S)
-
-    def fwd_body(_, data):
-        h_chunk, l_chunk = data
-        return None, jnp.sum(
-            optax.softmax_cross_entropy_with_integer_labels(
-                _logits_from_chunk(h_chunk, lm_head, config), l_chunk))
-
-    _, chunk_losses = jax.lax.scan(fwd_body, None, (hidden_chunks, labels_chunks))
-    return jnp.sum(chunk_losses) / (B * T)
+    h = hidden.reshape(B * T, D)
+    l = labels.reshape(B * T)
+    z = jnp.einsum('sd,dv->sv', h, lm_head,
+                   preferred_element_type=_logit_dtype(config))
+    z = config.softcap * jnp.tanh(z / config.softcap)
+    zf = z.astype(jnp.float32)
+    lse = jax.scipy.special.logsumexp(zf, axis=-1)
+    z_label = jnp.take_along_axis(zf, l[:, None], axis=-1)[:, 0]
+    loss = jnp.mean(lse - z_label)
+    return loss, (hidden, lm_head, z, lse, labels)
 
 
-def _chunked_loss_fwd(hidden, lm_head, labels, config):
-    loss = chunked_lm_head_loss(hidden, lm_head, labels, config)
-    return loss, (hidden, lm_head, labels)
-
-
-def _chunked_loss_bwd(config, residuals, g):
-    hidden, lm_head, labels = residuals
+def _lm_head_loss_bwd(config, residuals, g):
+    hidden, lm_head, z, lse, labels = residuals
     B, T, D = hidden.shape
-    N = config.num_lm_head_chunks
-    S = B * T // N
-    hidden_chunks = hidden.reshape(N, S, D)
-    labels_chunks = labels.reshape(N, S)
-
-    def bwd_body(d_lm_head_acc, data):
-        h_chunk, l_chunk = data
-
-        def chunk_loss(h, w):
-            return jnp.sum(
-                optax.softmax_cross_entropy_with_integer_labels(
-                    _logits_from_chunk(h, w, config), l_chunk))
-
-        _, vjp_fn = jax.vjp(chunk_loss, h_chunk, lm_head)
-        d_h, d_w = vjp_fn(g / (B * T))
-        return d_lm_head_acc + d_w, d_h
-
-    d_lm_head_init = jnp.zeros_like(lm_head)
-    d_lm_head, d_hidden_chunks = jax.lax.scan(
-        bwd_body, d_lm_head_init, (hidden_chunks, labels_chunks))
-    return d_hidden_chunks.reshape(B, T, D), d_lm_head, jnp.zeros_like(labels)
+    S = B * T
+    V = lm_head.shape[1]
+    h = hidden.reshape(S, D)
+    l = labels.reshape(S)
+    zf = z.astype(jnp.float32)
+    p = jnp.exp(zf - lse[:, None])                   # softmax from saved lse
+    onehot = (jnp.arange(V)[None, :] == l[:, None])  # lazy iota-compare, fuses
+    dz = p - onehot.astype(jnp.float32)
+    dsoftcap = 1.0 - (zf / config.softcap) ** 2      # d(softcap·tanh(u/softcap))/du
+    du = (dz * dsoftcap * (g / S)).astype(jnp.bfloat16)
+    d_h = jnp.einsum('sv,dv->sd', du, lm_head)
+    d_w = jnp.einsum('sd,sv->dv', h, du)
+    return d_h.reshape(B, T, D), d_w, jnp.zeros_like(labels)
 
 
-chunked_lm_head_loss.defvjp(_chunked_loss_fwd, _chunked_loss_bwd)
+lm_head_loss.defvjp(_lm_head_loss_fwd, _lm_head_loss_bwd)
 
 
 def make_optimizer(config, num_steps):
@@ -773,7 +762,7 @@ def make_optimizer(config, num_steps):
 
 def loss_fn(config, params, x, y):
     hidden = model_forward(config, params, x)
-    return chunked_lm_head_loss(hidden, params.lm_head, y, config)
+    return lm_head_loss(hidden, params.lm_head, y, config)
 
 
 def make_train_step(optimizer, donate=True):

@@ -32,6 +32,13 @@ Val loss trajectories match within run-to-run noise (JAX/torch @100: 7.053/6.988
 @200: 6.491/6.503, @300: 6.375/6.434) — both implementations train correctly and
 equivalently; this is purely a systems comparison.
 
+**Post-publication update (same day):** a hand-written CE backward (see
+"Round 2" below) brought JAX's isolated train step from 480.6 to **460.5 ms**
+(71.3% MFU-measured), cutting the compute gap to torch roughly in half. It
+ships in `11_gpu_jax.py` rev 5. The table above reflects the last completed
+*clean end-to-end* runs (rev 3/4 code); the rev-5 end-to-end validation run
+was interrupted by a Colab VM preemption and has not been re-run yet.
+
 ## Finding 0: Colab's "960 BF16 TFLOPs" is a sparse figure
 
 NVIDIA's tensor-core dense rate is the 2:4-sparsity figure ÷ 2, so the quoted
@@ -102,6 +109,37 @@ adds a little more.
 **Fairness note:** every accepted change was attempted on the other side —
 chunking (JAX gains, torch indifferent), flags (JAX-only concept, no-op),
 compile mode (torch-only concept).
+
+## Round 2: closing the CE gap with a hand-written backward (JAX)
+
+Since the entire JAX deficit sits in the lm_head+CE region, a second experiment
+swept CE formulations (all gradient-checked against autodiff to <5e-5 before
+timing; full train step, chunks=1 baseline 478.6 ms):
+
+| Formulation | train step | Δ |
+|---|---|---|
+| custom_vjp scan, N=1 (rev 3/4 default) | 478.6 ms | baseline |
+| plain optax CE, pure autodiff | 479.4 ms | ±0 |
+| logsumexp reformulation, pure autodiff | 514.1 ms | **+36 ms — worse** |
+| **manual bwd, saved-lse (rev 5 default)** | **460.5 ms** | **−18 ms** |
+| manual bwd, recompute-logits | 460.6 ms | −18 ms |
+
+The winning variant saves the forward's logsumexp and writes the backward
+explicitly as one fusible elementwise pass — `(softmax − onehot) · dsoftcap`,
+with the one-hot expressed as a lazy iota-compare instead of a scatter — plus
+the two lm_head matmuls. XLA fuses that; what it cannot do is *discover* it
+from `jax.vjp` through the composite loss (the pure-autodiff logsumexp variant
+being 36 ms *slower* shows the win is the manual backward, not the
+formulation). This stays inside idiomatic JAX (`custom_vjp`, the same pattern
+the TPU notebooks already use) — no Pallas kernel needed.
+
+Score after round 2 (isolated train step): **JAX 460.5 ms vs torch 440.1 ms**
+— a 4.6% torch lead, down from 9%. The remaining ~20 ms is the still-unfused
+tail of the CE elementwise chain; a Pallas Mosaic-GPU kernel matching
+Inductor's single-pass triton reduction is the plausible path to parity or
+better (JAX's per-layer compute is already faster), at meaningfully higher
+effort and sm_120-maturity risk. The other outstanding lever is the input
+pipeline (subprocess tokenizer, worth ~22 ms/step net to JAX end-to-end).
 
 ## Input pipeline: a real-world dispatch difference
 
