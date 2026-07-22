@@ -1,0 +1,351 @@
+{
+  "framework": "jax",
+  "notebook": "11_gpu_jax",
+  "revision": 3,
+  "timestamp": "2026-07-22T17:20:14.502066+00:00",
+  "env": {
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 580.82.07, 97887 MiB",
+    "vram_gb": 96,
+    "framework_version": "0.7.2",
+    "python": "3.12.13",
+    "attn_impl": "cudnn",
+    "compile_mode": null,
+    "xla_flags": "--xla_gpu_enable_latency_hiding_scheduler=true",
+    "notes": []
+  },
+  "config": {
+    "attn_impl": "cudnn",
+    "mlp_type": "glu",
+    "qk_norm": true,
+    "n_embd": 1024,
+    "n_layer": 8,
+    "seq_len": 2048,
+    "vocab_size": 32768,
+    "n_head": 8,
+    "n_kv_head": 2,
+    "head_dim": 128,
+    "mlp_dim": 3072,
+    "softcap": 15.0,
+    "logit_dtype": "bf16",
+    "num_lm_head_chunks": 1,
+    "batch_size": 64,
+    "microbatch_size": 64,
+    "learning_rate": 0.0001,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-08,
+    "weight_decay": 0.1,
+    "warmup_ratio": 0.02,
+    "warmdown_ratio": 0.5,
+    "final_lr_frac": 0.0,
+    "eval_steps": 10,
+    "param_seed": 42
+  },
+  "flops": {
+    "fwd_flops": 42880953483264,
+    "step_flops": 128642860449792,
+    "flops_per_token": 981467136
+  },
+  "calibration": {
+    "quoted_peak_tflops": 960,
+    "measured_peak_tflops": 393.1,
+    "matmuls": [
+      {
+        "shape": [
+          2048,
+          2048,
+          2048
+        ],
+        "dtype": "bf16",
+        "tflops": 147.6
+      },
+      {
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "dtype": "bf16",
+        "tflops": 323.6
+      },
+      {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "dtype": "bf16",
+        "tflops": 393.1
+      },
+      {
+        "shape": [
+          16384,
+          16384,
+          16384
+        ],
+        "dtype": "bf16",
+        "tflops": 390.8
+      },
+      {
+        "shape": [
+          131072,
+          3072,
+          1024
+        ],
+        "dtype": "bf16",
+        "tflops": 362.0
+      },
+      {
+        "shape": [
+          131072,
+          32768,
+          1024
+        ],
+        "dtype": "bf16",
+        "tflops": 376.2
+      }
+    ]
+  },
+  "components": [
+    {
+      "label": "attention fwd",
+      "wall_ms": 1.881,
+      "tflops": 584.6,
+      "mfu_quoted_pct": 60.9,
+      "mfu_measured_pct": 148.74
+    },
+    {
+      "label": "attention fwd+bwd",
+      "wall_ms": 9.122,
+      "tflops": 361.6,
+      "mfu_quoted_pct": 37.67,
+      "mfu_measured_pct": 91.99
+    },
+    {
+      "label": "layer fwd",
+      "wall_ms": 13.844,
+      "tflops": 307.8,
+      "mfu_quoted_pct": 32.06,
+      "mfu_measured_pct": 78.3
+    },
+    {
+      "label": "layer fwd+bwd",
+      "wall_ms": 42.753,
+      "tflops": 299.0,
+      "mfu_quoted_pct": 31.14,
+      "mfu_measured_pct": 76.06
+    },
+    {
+      "label": "model fwd",
+      "wall_ms": 110.324,
+      "tflops": 309.0,
+      "mfu_quoted_pct": 32.18,
+      "mfu_measured_pct": 78.6
+    },
+    {
+      "label": "model fwd+bwd (loss+grads)",
+      "wall_ms": 478.036,
+      "tflops": 269.1,
+      "mfu_quoted_pct": 28.03,
+      "mfu_measured_pct": 68.46
+    },
+    {
+      "label": "optimizer step",
+      "wall_ms": 2.534,
+      "tflops": 0.0,
+      "mfu_quoted_pct": 0.0,
+      "mfu_measured_pct": 0.0
+    },
+    {
+      "label": "train step",
+      "wall_ms": 480.626,
+      "tflops": 267.7,
+      "mfu_quoted_pct": 27.88,
+      "mfu_measured_pct": 68.09
+    }
+  ],
+  "training": {
+    "num_steps": 300,
+    "tokens_per_step": 131072,
+    "compile_s": 5.05,
+    "tok_per_sec": 254495,
+    "step_ms_median": 517.09,
+    "mfu_quoted_pct": 26.02,
+    "mfu_measured_pct": 63.55,
+    "tok_s_series": [
+      {
+        "step": 0,
+        "tok_s": 25957
+      },
+      {
+        "step": 50,
+        "tok_s": 242049
+      },
+      {
+        "step": 100,
+        "tok_s": 255382
+      },
+      {
+        "step": 150,
+        "tok_s": 253693
+      },
+      {
+        "step": 200,
+        "tok_s": 251893
+      },
+      {
+        "step": 250,
+        "tok_s": 251809
+      }
+    ],
+    "val_losses": [
+      {
+        "step": 0,
+        "loss": 10.375
+      },
+      {
+        "step": 100,
+        "loss": 7.053125
+      },
+      {
+        "step": 200,
+        "loss": 6.490625
+      },
+      {
+        "step": 300,
+        "loss": 6.375
+      }
+    ],
+    "final_train_loss_ema": 6.3867
+  },
+  "profile": {
+    "top_kernels": [
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_nt_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_nt_align8::Params)",
+        "total_ms": 281.886,
+        "pct_of_captured": 11.3
+      },
+      {
+        "name": "cudnn_generated_fort_native_sdpa_sm80_flash_bprop_wmma_f16_knob_26_64x64x128_1x4x1_cga1x1x1_kernel0_0",
+        "total_ms": 189.114,
+        "pct_of_captured": 7.58
+      },
+      {
+        "name": "gemm_fusion_dot_12",
+        "total_ms": 168.559,
+        "pct_of_captured": 6.76
+      },
+      {
+        "name": "gemm_fusion_dot_59",
+        "total_ms": 166.686,
+        "pct_of_captured": 6.68
+      },
+      {
+        "name": "gemm_fusion_dot_general_6",
+        "total_ms": 109.989,
+        "pct_of_captured": 4.41
+      },
+      {
+        "name": "gemm_fusion_dot_general_4",
+        "total_ms": 109.276,
+        "pct_of_captured": 4.38
+      },
+      {
+        "name": "gemm_fusion_dot_201",
+        "total_ms": 108.532,
+        "pct_of_captured": 4.35
+      },
+      {
+        "name": "loop_add_fusion",
+        "total_ms": 86.474,
+        "pct_of_captured": 3.47
+      },
+      {
+        "name": "loop_add_fusion_2",
+        "total_ms": 85.642,
+        "pct_of_captured": 3.43
+      },
+      {
+        "name": "gemm_fusion_dot_57",
+        "total_ms": 85.496,
+        "pct_of_captured": 3.43
+      },
+      {
+        "name": "gemm_fusion_dot_13",
+        "total_ms": 81.413,
+        "pct_of_captured": 3.26
+      },
+      {
+        "name": "input_scatter_fusion",
+        "total_ms": 72.279,
+        "pct_of_captured": 2.9
+      },
+      {
+        "name": "cudnn_generated_fort_native_sdpa_sm120_flash_fprop_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0",
+        "total_ms": 65.88,
+        "pct_of_captured": 2.64
+      },
+      {
+        "name": "loop_multiply_fusion_33",
+        "total_ms": 64.887,
+        "pct_of_captured": 2.6
+      },
+      {
+        "name": "loop_multiply_fusion_7",
+        "total_ms": 64.828,
+        "pct_of_captured": 2.6
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_nt_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_nt_align8::Params)",
+        "total_ms": 64.051,
+        "pct_of_captured": 2.57
+      },
+      {
+        "name": "loop_multiply_fusion_8",
+        "total_ms": 58.25,
+        "pct_of_captured": 2.34
+      },
+      {
+        "name": "gemm_fusion_dot_63",
+        "total_ms": 54.898,
+        "pct_of_captured": 2.2
+      },
+      {
+        "name": "gemm_fusion_dot_168",
+        "total_ms": 54.594,
+        "pct_of_captured": 2.19
+      },
+      {
+        "name": "input_add_reduce_fusion_14",
+        "total_ms": 39.878,
+        "pct_of_captured": 1.6
+      },
+      {
+        "name": "loop_add_fusion_22",
+        "total_ms": 36.898,
+        "pct_of_captured": 1.48
+      },
+      {
+        "name": "void cudnn::fusion::rearrange_n_convert_dq<true>(void const*, void*, void*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void const*, void*, void*, bool, cudnnDataType_t)",
+        "total_ms": 35.966,
+        "pct_of_captured": 1.44
+      },
+      {
+        "name": "loop_add_fusion_23",
+        "total_ms": 34.851,
+        "pct_of_captured": 1.4
+      },
+      {
+        "name": "void cudnn::fusion::compute_dot_do_o_specialized<true, 128>(void const*, void const*, void*, void*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, void const*, void const*, void const*, void const*, void const*, bool, void const*, void*, void const*, int, int, int, int, int, int, int, int, int)",
+        "total_ms": 30.054,
+        "pct_of_captured": 1.2
+      },
+      {
+        "name": "loop_multiply_fusion_10",
+        "total_ms": 29.533,
+        "pct_of_captured": 1.18
+      }
+    ],
+    "trace_file": "trace_jax.tar.gz"
+  }
+}

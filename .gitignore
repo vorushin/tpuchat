@@ -6,3 +6,6 @@ __pycache__
 scaling-book/
 .notebook_hashes
 pallas/.colab_connection
+gpu/.secrets.json
+gpu/results/*.tar.gz
+gpu/scratch/

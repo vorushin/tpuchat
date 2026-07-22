@@ -42,6 +42,11 @@ All notebooks use `google.colab.userdata` for authentication (no interactive pro
 | `05_tpu_perf.py` | TPU v6e performance benchmarks (MXU%, HBM bandwidth) |
 | `08_tpu_ablations.py` | Ablation lab — quick training, wandb sweep, hero run with HF upload |
 | `09_moe.py` | MoE training lab — 8 experts, top-2 routing, capacity-based dispatch, wandb sweep, hero run |
+| `11_gpu_jax.py` | JAX GPU benchmark — Colab G4 (RTX PRO 6000 Blackwell), cuDNN flash attention, mirrors 12 |
+| `12_gpu_torch.py` | PyTorch GPU benchmark — same model/config as 11, torch.compile + SDPA + fused AdamW |
+| `gpu/run_bench.sh` | Colab CLI driver for 11/12 — setup/jax/torch/snippet/fetch/stop |
+| `gpu/compare.py` | Joins two `gpu/results/metrics_*.json` into markdown comparison tables |
+| `gpu/REPORT.md` | JAX-vs-PyTorch G4 comparison writeup |
 | `LOG.md` | Chronological dev log — append with `Agent:` prefix after significant work |
 | `update_notebooks.sh` | `jupytext --to ipynb` + auto-increment REVISION for changed notebooks |
 
@@ -82,6 +87,28 @@ Single-letter notation from [How to Scale Your Model](https://jax-ml.github.io/s
 | V | Vocabulary size | `vocab_size` |
 | E | Number of experts | `n_experts` |
 | k | Active experts per token | `n_active_experts` |
+
+## GPU benchmarking via Colab CLI (gpu/)
+
+Notebooks 11/12 run on Colab's G4 GPU runtime, driven from the local machine by
+the Google Colab CLI (`uv tool install google-colab-cli`). Key facts:
+
+- **CLI auth** is a one-time interactive OAuth (`colab sessions` in a real
+  terminal). `colab auth` is unrelated (VM-side GCP creds).
+- `gpu/run_bench.sh {setup|jax|torch|snippet FILE|fetch jax|torch|status|log|stop}`
+  wraps the session plumbing. One long-lived `gpu-bench` session is reused so
+  data + compile caches stay warm; **always `stop` when idle** (G4 bills above
+  A100 rates).
+- `colab exec` runs the jupytext `.py` directly — GPU notebooks must stay
+  **magic-free** (pure Python cells; pip via conditional `subprocess`).
+- Kernel state persists across `exec` calls. If the websocket drops mid-run
+  ("Connection was lost"), the kernel keeps executing — probe globals with a
+  snippet, then exec only the remaining cells. Use `--timeout 3600` for
+  anything with long silent stretches (XLA/Inductor compiles).
+- `google.colab.userdata` does NOT work under `colab exec` (times out) — the
+  notebooks fall back env var → `/content/secrets.json` → anonymous.
+- Results land in `gpu/results/metrics_{jax,torch}.json` (committed) and
+  trace tarballs (gitignored); diff with `uv run python gpu/compare.py ...`.
 
 ## Pallas kernel development (pallas/)
 

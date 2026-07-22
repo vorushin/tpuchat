@@ -1,0 +1,352 @@
+{
+  "framework": "torch",
+  "notebook": "12_gpu_torch",
+  "revision": 3,
+  "timestamp": "2026-07-22T17:26:33.498679+00:00",
+  "env": {
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 580.82.07, 97887 MiB",
+    "vram_gb": 96,
+    "framework_version": "2.11.0+cu128",
+    "python": "3.12.13",
+    "attn_impl": "sdpa_cudnn",
+    "compile_mode": "default",
+    "xla_flags": null,
+    "notes": []
+  },
+  "config": {
+    "attn_impl": "sdpa_cudnn",
+    "compile_mode": "default",
+    "mlp_type": "glu",
+    "qk_norm": true,
+    "n_embd": 1024,
+    "n_layer": 8,
+    "seq_len": 2048,
+    "vocab_size": 32768,
+    "n_head": 8,
+    "n_kv_head": 2,
+    "head_dim": 128,
+    "mlp_dim": 3072,
+    "softcap": 15.0,
+    "logit_dtype": "bf16",
+    "num_lm_head_chunks": 1,
+    "batch_size": 64,
+    "microbatch_size": 64,
+    "learning_rate": 0.0001,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-08,
+    "weight_decay": 0.1,
+    "warmup_ratio": 0.02,
+    "warmdown_ratio": 0.5,
+    "final_lr_frac": 0.0,
+    "eval_steps": 10,
+    "param_seed": 42
+  },
+  "flops": {
+    "fwd_flops": 42880953483264,
+    "step_flops": 128642860449792,
+    "flops_per_token": 981467136
+  },
+  "calibration": {
+    "quoted_peak_tflops": 960,
+    "measured_peak_tflops": 392.3,
+    "matmuls": [
+      {
+        "shape": [
+          2048,
+          2048,
+          2048
+        ],
+        "dtype": "bf16",
+        "tflops": 221.1
+      },
+      {
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "dtype": "bf16",
+        "tflops": 365.0
+      },
+      {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "dtype": "bf16",
+        "tflops": 390.8
+      },
+      {
+        "shape": [
+          16384,
+          16384,
+          16384
+        ],
+        "dtype": "bf16",
+        "tflops": 392.3
+      },
+      {
+        "shape": [
+          131072,
+          3072,
+          1024
+        ],
+        "dtype": "bf16",
+        "tflops": 363.9
+      },
+      {
+        "shape": [
+          131072,
+          32768,
+          1024
+        ],
+        "dtype": "bf16",
+        "tflops": 373.8
+      }
+    ]
+  },
+  "components": [
+    {
+      "label": "attention fwd",
+      "wall_ms": 1.85,
+      "tflops": 594.4,
+      "mfu_quoted_pct": 61.92,
+      "mfu_measured_pct": 151.52
+    },
+    {
+      "label": "attention fwd+bwd",
+      "wall_ms": 10.028,
+      "tflops": 328.9,
+      "mfu_quoted_pct": 34.26,
+      "mfu_measured_pct": 83.85
+    },
+    {
+      "label": "layer fwd",
+      "wall_ms": 13.761,
+      "tflops": 309.6,
+      "mfu_quoted_pct": 32.25,
+      "mfu_measured_pct": 78.92
+    },
+    {
+      "label": "layer fwd+bwd",
+      "wall_ms": 45.203,
+      "tflops": 282.8,
+      "mfu_quoted_pct": 29.45,
+      "mfu_measured_pct": 72.08
+    },
+    {
+      "label": "model fwd",
+      "wall_ms": 110.182,
+      "tflops": 309.4,
+      "mfu_quoted_pct": 32.22,
+      "mfu_measured_pct": 78.85
+    },
+    {
+      "label": "model fwd+bwd (loss+grads)",
+      "wall_ms": 433.53,
+      "tflops": 296.7,
+      "mfu_quoted_pct": 30.91,
+      "mfu_measured_pct": 75.64
+    },
+    {
+      "label": "optimizer step",
+      "wall_ms": 1.715,
+      "tflops": 0.0,
+      "mfu_quoted_pct": 0.0,
+      "mfu_measured_pct": 0.0
+    },
+    {
+      "label": "train step",
+      "wall_ms": 440.081,
+      "tflops": 292.3,
+      "mfu_quoted_pct": 30.45,
+      "mfu_measured_pct": 74.51
+    }
+  ],
+  "training": {
+    "num_steps": 300,
+    "tokens_per_step": 131072,
+    "compile_s": 0.44,
+    "tok_per_sec": 292028,
+    "step_ms_median": 450.94,
+    "mfu_quoted_pct": 29.86,
+    "mfu_measured_pct": 73.06,
+    "tok_s_series": [
+      {
+        "step": 0,
+        "tok_s": 300263
+      },
+      {
+        "step": 50,
+        "tok_s": 294050
+      },
+      {
+        "step": 100,
+        "tok_s": 291231
+      },
+      {
+        "step": 150,
+        "tok_s": 290654
+      },
+      {
+        "step": 200,
+        "tok_s": 290467
+      },
+      {
+        "step": 250,
+        "tok_s": 290414
+      }
+    ],
+    "val_losses": [
+      {
+        "step": 0,
+        "loss": 10.375
+      },
+      {
+        "step": 100,
+        "loss": 6.9875
+      },
+      {
+        "step": 200,
+        "loss": 6.503125
+      },
+      {
+        "step": 300,
+        "loss": 6.434375
+      }
+    ],
+    "final_train_loss_ema": 6.4349
+  },
+  "profile": {
+    "top_kernels": [
+      {
+        "name": "aten::mm",
+        "total_ms": 1372.406,
+        "pct_of_captured": 30.91
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_nn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_nn_align8::Params)",
+        "total_ms": 438.641,
+        "pct_of_captured": 9.88
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_nt_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_nt_align8::Params)",
+        "total_ms": 399.861,
+        "pct_of_captured": 9.0
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8::Params)",
+        "total_ms": 311.642,
+        "pct_of_captured": 7.02
+      },
+      {
+        "name": "aten::_cudnn_attention_backward",
+        "total_ms": 290.373,
+        "pct_of_captured": 6.54
+      },
+      {
+        "name": "cudnn_generated_fort_native_sdpa_sm80_flash_bprop_wmma_f16_knob_26_64x64x128_1x4x1_cga1x1x1_kernel0_0",
+        "total_ms": 191.032,
+        "pct_of_captured": 4.3
+      },
+      {
+        "name": "triton_poi_fused_bmm_mul_permute_silu_silu_backward_squeeze_view_2",
+        "total_ms": 108.339,
+        "pct_of_captured": 2.44
+      },
+      {
+        "name": "triton_poi_fused_bmm_mul_permute_silu_silu_backward_squeeze_view_2",
+        "total_ms": 108.339,
+        "pct_of_captured": 2.44
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8::Params)",
+        "total_ms": 104.735,
+        "pct_of_captured": 2.36
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_nt_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_nt_align8::Params)",
+        "total_ms": 67.661,
+        "pct_of_captured": 1.52
+      },
+      {
+        "name": "aten::_cudnn_attention_forward",
+        "total_ms": 66.829,
+        "pct_of_captured": 1.5
+      },
+      {
+        "name": "cudnn_generated_fort_native_sdpa_sm120_flash_fprop_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0",
+        "total_ms": 66.829,
+        "pct_of_captured": 1.5
+      },
+      {
+        "name": "triton_poi_fused_bmm_mul_permute_silu_view_6",
+        "total_ms": 64.854,
+        "pct_of_captured": 1.46
+      },
+      {
+        "name": "triton_poi_fused_bmm_mul_permute_silu_view_6",
+        "total_ms": 64.854,
+        "pct_of_captured": 1.46
+      },
+      {
+        "name": "triton_red_fused__log_softmax__log_softmax_backward_data__to_copy_arange_bmm_div_eq_expand_mul_nll_loss_backward_nll_loss_forward_permute_scalar_tensor_select_sub_tanh_tanh_backward_view_where_0",
+        "total_ms": 58.261,
+        "pct_of_captured": 1.31
+      },
+      {
+        "name": "triton_red_fused__log_softmax__log_softmax_backward_data__to_copy_arange_bmm_div_eq_expand_mul_nll_loss_backward_nll_loss_forward_permute_scalar_tensor_select_sub_tanh_tanh_backward_view_where_0",
+        "total_ms": 58.261,
+        "pct_of_captured": 1.31
+      },
+      {
+        "name": "triton_per_fused_add_bmm_mean_mul_permute_rsqrt_view_7",
+        "total_ms": 52.915,
+        "pct_of_captured": 1.19
+      },
+      {
+        "name": "triton_per_fused_add_bmm_mean_mul_permute_rsqrt_view_7",
+        "total_ms": 52.915,
+        "pct_of_captured": 1.19
+      },
+      {
+        "name": "triton_per_fused_add_bmm_div_expand_mul_pow_squeeze_sum_view_7",
+        "total_ms": 37.983,
+        "pct_of_captured": 0.86
+      },
+      {
+        "name": "triton_per_fused_add_bmm_div_expand_mul_pow_squeeze_sum_view_7",
+        "total_ms": 37.983,
+        "pct_of_captured": 0.86
+      },
+      {
+        "name": "void cudnn::fusion::rearrange_n_convert_dq<true>(void const*, void*, void*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void const*, void*, void*, bool, cudnnDataType_t)",
+        "total_ms": 36.045,
+        "pct_of_captured": 0.81
+      },
+      {
+        "name": "triton_per_fused_add_bmm_div_expand_mul_pow_squeeze_sum_view_3",
+        "total_ms": 35.758,
+        "pct_of_captured": 0.81
+      },
+      {
+        "name": "triton_per_fused_add_bmm_div_expand_mul_pow_squeeze_sum_view_3",
+        "total_ms": 35.758,
+        "pct_of_captured": 0.81
+      },
+      {
+        "name": "void cudnn::fusion::compute_dot_do_o_specialized<true, 128>(void const*, void const*, void*, void*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, void const*, void const*, void const*, void const*, void const*, bool, void const*, void*, void const*, int, int, int, int, int, int, int, int, int)",
+        "total_ms": 30.202,
+        "pct_of_captured": 0.68
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8::Params)",
+        "total_ms": 28.309,
+        "pct_of_captured": 0.64
+      }
+    ],
+    "trace_file": "trace_torch.tar.gz"
+  }
+}
