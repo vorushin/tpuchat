@@ -14,7 +14,7 @@
 # %% [markdown]
 # <a href="https://colab.research.google.com/github/vorushin/tpuchat/blob/master/12_gpu_torch.ipynb?flush_caches=true" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 #
-# # 12 — GPU Lab: PyTorch on NVIDIA G4 (rev 3)
+# # 12 — GPU Lab: PyTorch on NVIDIA G4 (rev 4)
 #
 # PyTorch side of the JAX-vs-PyTorch pretraining comparison on a single Colab
 # **G4** GPU (NVIDIA RTX PRO 6000 Blackwell Server Edition, 96 GB, sm_120).
@@ -102,7 +102,7 @@ GPU_PEAK_TFLOPS_QUOTED = 960   # Colab's quoted bf16 figure — likely sparse; S
 HBM_BW_GBS = 1600              # ~1.6 TB/s GDDR7
 MEASURED_PEAK_TFLOPS = None    # set by Section A (matmul calibration)
 
-REVISION = 3
+REVISION = 4
 
 # TF32 for any stray fp32 matmuls (mirrors XLA's default on the JAX side)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -442,10 +442,10 @@ for (M, N, K, lbl) in [(131072, 3072, 1024, 'matmul BTxDxF (mlp up)'),
                                 'tflops': r['tflops']})
 
 MEASURED_PEAK_TFLOPS = max(c['tflops'] for c in CALIBRATION_RESULTS)
-print(f'\nQuoted peak  : {GPU_PEAK_TFLOPS_QUOTED} TFLOP/s (Colab announcement)')
-print(f'Measured peak: {MEASURED_PEAK_TFLOPS:.0f} TFLOP/s (best dense bf16 matmul)')
-print(f'Ratio        : {MEASURED_PEAK_TFLOPS / GPU_PEAK_TFLOPS_QUOTED:.2f} '
-      f'(≈0.5 would mean the quoted figure is sparse)')
+print(f'\nQuoted peak : {GPU_PEAK_TFLOPS_QUOTED} TFLOP/s (Colab announcement — 2:4 sparse figure)')
+print(f'Dense peak  : {GPU_PEAK_TFLOPS_QUOTED / 2:.0f} TFLOP/s (theoretical = sparse / 2)')
+print(f'Measured    : {MEASURED_PEAK_TFLOPS:.0f} TFLOP/s (best dense bf16 matmul = '
+      f'{MEASURED_PEAK_TFLOPS / (GPU_PEAK_TFLOPS_QUOTED / 2) * 100:.0f}% of theoretical dense)')
 
 # %% [markdown]
 # ## Model

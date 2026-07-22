@@ -22,8 +22,9 @@ torch.compile + SDPA (cuDNN backend) + fused AdamW.
 | tok/s | 254,495 | 292,028 | **1.15x** |
 | median step | 517.1 ms | 450.9 ms | 0.87x |
 | isolated train step (Section B) | 480.6 ms | 440.1 ms | 0.92x |
-| MFU (vs measured 392 TFLOP/s dense peak) | 63.5% | 73.1% | 1.15x |
-| MFU (vs quoted 960 TFLOP/s) | 26.0% | 29.9% | |
+| MFU (vs 392 TFLOP/s measured-achievable) | 63.5% | 73.1% | 1.15x |
+| MFU (vs 480 TFLOP/s theoretical dense = 960/2) | 52.0% | 59.8% | 1.15x |
+| MFU (vs quoted sparse 960 TFLOP/s) | 26.0% | 29.9% | |
 | warmup (first step, warm compile caches) | 5.0 s | 0.4 s | |
 | val loss @ step 300 | **6.375** | 6.434 | (RNG noise) |
 
@@ -33,11 +34,16 @@ equivalently; this is purely a systems comparison.
 
 ## Finding 0: Colab's "960 BF16 TFLOPs" is a sparse figure
 
-Large dense bf16 matmuls top out at **392 TFLOP/s** in both frameworks
-(16384³: JAX 390.6, torch 392.8; both stacks route to cuBLAS/cutlass). That is
-0.41× the quoted number — consistent with 960 being the 2:4-sparsity marketing
-figure for GB202. All MFU numbers here use the measured dense peak; against it,
-both frameworks run this model at a healthy 63-73%.
+NVIDIA's tensor-core dense rate is the 2:4-sparsity figure ÷ 2, so the quoted
+960 implies a **480 TFLOP/s theoretical dense** peak. Large dense bf16 matmuls
+top out at **392 TFLOP/s** in both frameworks (16384³: JAX 390.6, torch 392.8;
+both route to cuBLAS/cutlass) — i.e. cuBLAS achieves ~82% of theoretical on
+the best shapes, a typical efficiency. The peak ladder is therefore:
+**960 sparse (marketing) → 480 theoretical dense → 392 achievable**.
+Model-level MFU here is reported against the 392 achievable (what a perfect
+model implementation could actually reach — 63-73% for these runs) with the
+480-based numbers alongside for cross-accelerator comparison, since TPU MFU
+convention uses the theoretical peak.
 
 ## Where the 40 ms compute gap comes from (component benchmarks)
 
@@ -126,11 +132,12 @@ scope here): move tokenization to a subprocess. This is why the end-to-end gap
 ## Context: vs the TPU v6e baseline
 
 The TPU run of the same-FLOPs model (`08_tpu_ablations.py`): ~435k tok/s at
-46.5% MFU of a 918 TFLOP/s peak (~302 ms/step with 16×4 grad accumulation).
-The G4 delivers 254-292k tok/s at 63-73% of its real 392 TFLOP/s peak. In other
-words: **the GPU software stacks are more efficient relative to their silicon,
-but the v6e simply has ~2.3× the dense bf16 compute** and wins on absolute
-throughput for this workload.
+46.5% MFU of the v6e's **theoretical** 918 TFLOP/s peak (~302 ms/step with 16×4
+grad accumulation). Like-for-like (theoretical peak in both denominators), the
+G4 runs at 52.0% (JAX) / 59.8% (torch) of its 480 TFLOP/s dense peak. In other
+words: **the GPU software stacks are somewhat more efficient relative to their
+silicon, but the v6e has ~1.9× the theoretical dense bf16 compute** and wins on
+absolute throughput (435k vs 292k tok/s, 1.5×) for this workload.
 
 ## Caveats
 
